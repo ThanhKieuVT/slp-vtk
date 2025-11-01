@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from transformers import BertModel
 from .flow_matching import FlowMatchingBlock, FlowMatchingScheduler, FlowMatchingLoss
 
+
 class HierarchicalFlowMatcher(nn.Module):
     """
     Complete manual sign generation system
@@ -23,7 +24,7 @@ class HierarchicalFlowMatcher(nn.Module):
     def __init__(
         self,
         text_encoder_name='bert-base-german-cased',
-        hidden_dim=512,
+        hidden_dim=1024,  # ✅ giữ 1024 để có model mạnh hơn
         num_flow_layers=6,
         num_heads=8,
         dropout=0.1,
@@ -31,52 +32,53 @@ class HierarchicalFlowMatcher(nn.Module):
     ):
         super().__init__()
         
-        # Text encoder (shared across all levels)
+        # --- TEXT ENCODER ---
         self.text_encoder = BertModel.from_pretrained(text_encoder_name)
-        text_dim = self.text_encoder.config.hidden_size  # 768
+        text_dim = self.text_encoder.config.hidden_size  # 768 (BERT output)
+        
+        # ✅ Linear projection: 768 → 1024 (đảm bảo khớp với hidden_dim)
+        self.text_proj = nn.Linear(text_dim, hidden_dim)
         
         if freeze_text_encoder:
             for param in self.text_encoder.parameters():
                 param.requires_grad = False
             print("Text encoder frozen")
         
-        # Flow scheduler
+        # --- FLOW SCHEDULER ---
         self.scheduler = FlowMatchingScheduler()
         
-        # Level 1: Coarse Flow (Body trajectory)
+        # --- FLOW LEVELS ---
         self.coarse_flow = FlowMatchingBlock(
             data_dim=66,
-            condition_dim=text_dim,
+            condition_dim=hidden_dim,  # ✅ dùng hidden_dim sau khi đã proj
             hidden_dim=hidden_dim,
             num_layers=num_flow_layers,
             num_heads=num_heads,
             dropout=dropout
         )
         
-        # Level 2: Medium Flow (Arm movements)
         self.medium_flow = FlowMatchingBlock(
             data_dim=16,
-            condition_dim=text_dim,  # Only text (no coarse dependency for now)
+            condition_dim=hidden_dim,
             hidden_dim=hidden_dim,
             num_layers=num_flow_layers,
             num_heads=num_heads,
             dropout=dropout
         )
         
-        # Level 3: Fine Flow (Hand articulation)
         self.fine_flow = FlowMatchingBlock(
             data_dim=68,
-            condition_dim=text_dim,  # Only text
+            condition_dim=hidden_dim,
             hidden_dim=hidden_dim,
-            num_layers=num_flow_layers + 2,  # More layers for detail
+            num_layers=num_flow_layers + 2,
             num_heads=num_heads,
             dropout=dropout
         )
         
-        # Loss functions
+        # --- LOSS ---
         self.loss_fn = FlowMatchingLoss()
         
-        # Count parameters
+        # --- PARAM COUNT ---
         total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"HierarchicalFlowMatcher: {total_params/1e6:.1f}M trainable parameters")
     
@@ -89,32 +91,24 @@ class HierarchicalFlowMatcher(nn.Module):
             attention_mask: [B, L] mask
         
         Returns:
-            [B, L, 768] text features
+            [B, L, 1024] text features (projected)
         """
         outputs = self.text_encoder(
             input_ids=text_tokens,
             attention_mask=attention_mask
         )
-        return outputs.last_hidden_state
+        text_features = outputs.last_hidden_state  # [B, L, 768]
+        text_features = self.text_proj(text_features)  # ✅ map 768 → 1024
+        return text_features
     
     def forward(self, batch, mode='train', num_inference_steps=20):
         """
         Forward pass
-        
-        Args:
-            batch: dict with data
-            mode: 'train' or 'inference'
-            num_inference_steps: ODE integration steps (inference only)
-        
-        Returns:
-            If train: dict with losses
-            If inference: dict with generated poses
         """
-        # Encode text
         text_features = self.encode_text(
             batch['text_tokens'],
             batch['attention_mask']
-        )  # [B, L, 768]
+        )  # [B, L, 1024]
         
         if mode == 'train':
             return self._train_forward(batch, text_features)
@@ -129,104 +123,75 @@ class HierarchicalFlowMatcher(nn.Module):
         # Sample timesteps
         t = self.scheduler.sample_timesteps(B, device)
         
-        # Create padding mask
+        # Mask padding
         T_max = batch['manual_coarse'].shape[1]
         seq_lengths = batch['seq_lengths']
         mask = torch.arange(T_max, device=device)[None, :] >= seq_lengths[:, None]
-        # mask: True = padding, False = valid
         
         losses = {}
         
         # --- Level 1: Coarse (Body) ---
-        x_0_coarse = batch['manual_coarse']  # [B, T, 66]
+        x_0_coarse = batch['manual_coarse']
         x_t_coarse, v_gt_coarse, _ = self.scheduler.add_noise(x_0_coarse, t)
         
         v_pred_coarse = self.coarse_flow(
-            x_t_coarse,
-            t,
-            text_features,
-            mask=mask
+            x_t_coarse, t, text_features, mask=mask
         )
-        
         losses['coarse'] = self.loss_fn(v_pred_coarse, v_gt_coarse, ~mask)
         
         # --- Level 2: Medium (Arms) ---
-        x_0_medium = batch['manual_medium']  # [B, T, 16]
+        x_0_medium = batch['manual_medium']
         x_t_medium, v_gt_medium, _ = self.scheduler.add_noise(x_0_medium, t)
         
         v_pred_medium = self.medium_flow(
-            x_t_medium,
-            t,
-            text_features,
-            mask=mask
+            x_t_medium, t, text_features, mask=mask
         )
-        
         losses['medium'] = self.loss_fn(v_pred_medium, v_gt_medium, ~mask)
         
         # --- Level 3: Fine (Hands) ---
-        x_0_fine = batch['manual_fine']  # [B, T, 68]
+        x_0_fine = batch['manual_fine']
         x_t_fine, v_gt_fine, _ = self.scheduler.add_noise(x_0_fine, t)
         
         v_pred_fine = self.fine_flow(
-            x_t_fine,
-            t,
-            text_features,
-            mask=mask
+            x_t_fine, t, text_features, mask=mask
         )
-        
         losses['fine'] = self.loss_fn(v_pred_fine, v_gt_fine, ~mask)
         
-        # Total loss (weighted)
+        # --- Total loss ---
         losses['total'] = (
             1.0 * losses['coarse'] +
             1.0 * losses['medium'] +
-            1.5 * losses['fine']  # Hands are more important!
+            1.5 * losses['fine']
         )
-        
         return losses
     
     @torch.no_grad()
     def _inference_forward(self, batch, text_features, num_steps=20):
-        """
-        Inference: Generate poses from noise via ODE integration
-        
-        Args:
-            num_steps: Number of Euler integration steps
-        
-        Returns:
-            Generated pose sequences
-        """
+        """Inference: Generate poses from noise via ODE integration"""
         device = text_features.device
         B, L, _ = text_features.shape
-        T = batch.get('target_length', 50)  # Target sequence length
+        T = batch.get('target_length', 50)
         
-        # Start from noise
         x_coarse = torch.randn(B, T, 66, device=device)
         x_medium = torch.randn(B, T, 16, device=device)
         x_fine = torch.randn(B, T, 68, device=device)
         
-        # Integration
         dt = 1.0 / num_steps
         
         for step in range(num_steps):
             t_val = step / num_steps
             t = torch.full((B,), t_val, device=device)
             
-            # Generate coarse
             v_coarse = self.coarse_flow(x_coarse, t, text_features)
             x_coarse = x_coarse + dt * v_coarse
             
-            # Generate medium
             v_medium = self.medium_flow(x_medium, t, text_features)
             x_medium = x_medium + dt * v_medium
             
-            # Generate fine
             v_fine = self.fine_flow(x_fine, t, text_features)
             x_fine = x_fine + dt * v_fine
         
-        # Combine all levels
         full_pose = torch.cat([x_coarse, x_medium, x_fine], dim=-1)
-        # [B, T, 150]
         
         return {
             'pose_sequence': full_pose,
