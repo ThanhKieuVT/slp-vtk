@@ -1,5 +1,5 @@
 """
-Train NMM flow models with resume + best checkpoint saving (Optimized)
+Train Manual Flow model with resume + best checkpoint saving (Optimized)
 """
 import os
 import glob
@@ -13,7 +13,6 @@ import sys
 
 sys.path.append('..')
 
-from models.nmm_generator import NMMFlowGenerator
 from models.hierarchical_flow import HierarchicalFlowMatcher
 from data.phoenix_dataset import PhoenixFlowDataset, collate_fn
 
@@ -21,7 +20,7 @@ from data.phoenix_dataset import PhoenixFlowDataset, collate_fn
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_root', type=str, default='../data/RWTH/processed_data/final')
-    parser.add_argument('--output_dir', type=str, default='./checkpoints/nmm_flow')
+    parser.add_argument('--output_dir', type=str, default='./checkpoints/manual_flow')
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--num_epochs', type=int, default=40)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
@@ -29,15 +28,12 @@ def parse_args():
     parser.add_argument('--save_every', type=int, default=5)
     parser.add_argument('--eval_every', type=int, default=1)
     parser.add_argument('--resume_from', type=str, default=None)
-    parser.add_argument('--share_text_encoder', type=str, default=None)
-    parser.add_argument('--freeze_text_encoder', action='store_true')
     parser.add_argument('--wandb_project', type=str, default='slp-hierarchical-flow')
-    parser.add_argument('--wandb_run_name', type=str, default='nmm_flow')
+    parser.add_argument('--wandb_run_name', type=str, default='manual_flow')
     return parser.parse_args()
 
 
 def find_latest_checkpoint(output_dir):
-    """Tự động tìm checkpoint mới nhất."""
     ckpts = sorted(glob.glob(os.path.join(output_dir, 'checkpoint_epoch_*.pt')))
     return ckpts[-1] if ckpts else None
 
@@ -60,21 +56,8 @@ def train():
                             collate_fn=collate_fn, num_workers=args.num_workers)
 
     # === Model ===
-    print("Building model...")
-    shared_text_encoder = None
-    if args.share_text_encoder:
-        print(f"🔗 Sharing text encoder from {args.share_text_encoder}")
-        manual_ckpt = torch.load(args.share_text_encoder, map_location='cpu')
-        manual_model = HierarchicalFlowMatcher()
-        manual_model.load_state_dict(manual_ckpt['model'])
-        shared_text_encoder = manual_model.text_encoder
-        print("✅ Shared text encoder loaded")
-
-    model = NMMFlowGenerator(
-        freeze_text_encoder=args.freeze_text_encoder,
-        share_text_encoder=shared_text_encoder
-    )
-
+    print("Building HierarchicalFlowMatcher...")
+    model = HierarchicalFlowMatcher()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
 
@@ -88,7 +71,6 @@ def train():
     # === Resume logic ===
     start_epoch, best_val_loss = 0, float('inf')
     resume_path = args.resume_from or find_latest_checkpoint(args.output_dir) or ckpt_best
-
     if resume_path and os.path.exists(resume_path):
         print(f"🔁 Resuming from: {resume_path}")
         ckpt = torch.load(resume_path, map_location='cpu')
@@ -105,7 +87,6 @@ def train():
     for epoch in range(start_epoch, args.num_epochs):
         model.train()
         train_loss_total = 0.0
-
         progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs}",
                         disable=not accelerator.is_local_main_process)
 
