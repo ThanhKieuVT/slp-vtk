@@ -33,9 +33,25 @@ def parse_args():
     return parser.parse_args()
 
 
+# =================================================================
+# === ĐÃ SỬA LỖI SẮP XẾP (BUG FIX) ===
+# =================================================================
 def find_latest_checkpoint(output_dir):
-    ckpts = sorted(glob.glob(os.path.join(output_dir, 'checkpoint_epoch_*.pt')))
-    return ckpts[-1] if ckpts else None
+    """
+    Finds the latest checkpoint (highest epoch number) in the output directory.
+    Sorts numerically, not alphabetically (e.g., 10 > 5).
+    """
+    ckpts = glob.glob(os.path.join(output_dir, 'checkpoint_epoch_*.pt'))
+    if not ckpts:
+        return None
+    
+    # Sắp xếp dựa trên SỐ epoch (int) thay vì tên file (string)
+    # Tách số từ tên file: '.../checkpoint_epoch_10.pt' -> 10
+    ckpts.sort(key=lambda f: int(f.split('_')[-1].split('.')[0]))
+    
+    # Trả về file cuối cùng (có epoch lớn nhất)
+    return ckpts[-1]
+# =================================================================
 
 
 def train():
