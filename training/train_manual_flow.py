@@ -10,7 +10,8 @@ from tqdm import tqdm
 import wandb
 import argparse
 import sys
-
+from torch.utils.data import Subset
+import numpy as np
 sys.path.append('..')
 
 from models.hierarchical_flow import HierarchicalFlowMatcher
@@ -63,14 +64,35 @@ def train():
         wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=vars(args))
 
     # === Dataset ===
+    #print("Loading datasets...")
+    #train_dataset = PhoenixFlowDataset(split='train', data_root=args.data_root, augment=True)
+    #dev_dataset = PhoenixFlowDataset(split='dev', data_root=args.data_root)
+    #train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                            #  collate_fn=collate_fn, num_workers=args.num_workers)
+    #dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=False,
+    #                        collate_fn=collate_fn, num_workers=args.num_workers)
+# === Dataset ===
     print("Loading datasets...")
-    train_dataset = PhoenixFlowDataset(split='train', data_root=args.data_root, augment=True)
+    # 1. Load full data nhưng đổi tên biến
+    train_dataset_full = PhoenixFlowDataset(split='train', data_root=args.data_root, augment=True) 
     dev_dataset = PhoenixFlowDataset(split='dev', data_root=args.data_root)
+
+    # === (THÊM MỚI) TẠO SUBSET ĐỂ CHẠY THỬ ===
+    # Chị có thể đổi số 0.1 (10%) thành số khác, ví dụ 0.2 (20%)
+    subset_percentage = 0.1 
+    
+    num_train_samples = int(len(train_dataset_full) * subset_percentage)
+    print(f"--- ⚠️  ĐANG CHẠY TEST TRÊN SUBSET ---")
+    print(f"--- Chỉ sử dụng {num_train_samples} / {len(train_dataset_full)} mẫu training. ---")
+    
+    # Lấy ngẫu nhiên các index để train
+    indices = np.random.permutation(len(train_dataset_full))[:num_train_samples]
+    # Tạo dataset con
+    train_dataset = Subset(train_dataset_full, indices)
+    # ==========================================
+
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                               collate_fn=collate_fn, num_workers=args.num_workers)
-    dev_loader = DataLoader(dev_dataset, batch_size=args.batch_size, shuffle=False,
-                            collate_fn=collate_fn, num_workers=args.num_workers)
-
     # === Model ===
     print("Building HierarchicalFlowMatcher...")
     model = HierarchicalFlowMatcher()
