@@ -1,6 +1,9 @@
 """
 Train Manual Flow model with resume + best checkpoint saving (Optimized)
 """
+
+from torch.utils.data import Subset
+import numpy as np
 import os
 import glob
 import torch
@@ -10,8 +13,6 @@ from tqdm import tqdm
 import wandb
 import argparse
 import sys
-from torch.utils.data import Subset
-import numpy as np
 sys.path.append('..')
 
 from models.hierarchical_flow import HierarchicalFlowMatcher
