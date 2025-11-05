@@ -23,7 +23,8 @@ class HierarchicalFlowMatcher(nn.Module):
     """
     def __init__(
         self,
-        text_encoder_name='bert-base-german-cased',
+        text_encoder_name='bert-base-multilingual-cased',
+        #text_encoder_name = '/Users/kieuvo/Learn/Research/SL/Implement/SignFML/slp-vtk/local_bert_model',
         hidden_dim=1024,  # ✅ giữ 1024 để có model mạnh hơn
         num_flow_layers=6,
         num_heads=8,
