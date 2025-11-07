@@ -145,8 +145,7 @@ class PoseDecoder(nn.Module):
             batch_first=True
         )
         self.coarse_decoder = nn.TransformerDecoder(coarse_layer, num_coarse_layers)
-        self.coarse_proj = nn.Linear(hidden_dim, hidden_dim // 2)
-        
+        self.coarse_proj = nn.Linear(hidden_dim, hidden_dim) # Bỏ // 2        
         # Medium decoder
         medium_layer = nn.TransformerDecoderLayer(
             d_model=hidden_dim,
@@ -157,8 +156,7 @@ class PoseDecoder(nn.Module):
             batch_first=True
         )
         self.medium_decoder = nn.TransformerDecoder(medium_layer, num_medium_layers)
-        self.medium_proj = nn.Linear(hidden_dim, hidden_dim // 2)
-        
+        self.medium_proj = nn.Linear(hidden_dim, hidden_dim) # Bỏ // 2        
         # Fine decoder
         fine_layer = nn.TransformerDecoderLayer(
             d_model=hidden_dim,
