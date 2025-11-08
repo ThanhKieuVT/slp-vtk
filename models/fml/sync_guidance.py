@@ -102,14 +102,17 @@ class SyncGuidanceHead(nn.Module):
             if valid.sum() < 2:
                 continue
             
-            manual_flat = manual_gt[i, valid].flatten()  # [T_valid * 150]
-            nmm_flat = nmm_gt[i, valid].flatten()  # [T_valid * 64]
+            # === SỬA LỖI Ở ĐÂY ===
+            # Thay vì .flatten(), dùng .mean(dim=-1) để tạo 1D signal
+            manual_signal = manual_gt[i, valid].mean(dim=-1) # [T_valid]
+            nmm_signal = nmm_gt[i, valid].mean(dim=-1)    # [T_valid]
             
-            # Normalize
-            manual_flat = (manual_flat - manual_flat.mean()) / (manual_flat.std() + 1e-6)
-            nmm_flat = (nmm_flat - nmm_flat.mean()) / (nmm_flat.std() + 1e-6)
-            
-            # Correlation
+            # Normalize (Đổi tên biến)
+            manual_flat = (manual_signal - manual_signal.mean()) / (manual_signal.std() + 1e-6)
+            nmm_flat = (nmm_signal - nmm_signal.mean()) / (nmm_signal.std() + 1e-6)
+            # === KẾT THÚC SỬA LỖI ===
+
+            # Correlation (Giờ 2 tensor đã cùng kích thước [T_valid])
             corr = (manual_flat * nmm_flat).mean()
             
             # Loss: negative correlation (maximize correlation = minimize -corr)
@@ -133,8 +136,17 @@ class SyncGuidanceHead(nn.Module):
         Returns:
             grad: [B, T, latent_dim] - gradient
         """
-        latent.requires_grad_(True)
-        loss = self.compute_loss(latent, pose_gt, mask)
-        grad = torch.autograd.grad(loss, latent, create_graph=False)[0]
+        # Cần bật grad trên latent để tính
+        latent_grad = latent.detach().requires_grad_(True)
+        
+        loss = self.compute_loss(latent_grad, pose_gt, mask)
+        
+        # Tính gradient
+        grad = torch.autograd.grad(
+            loss, 
+            latent_grad, 
+            grad_outputs=torch.ones_like(loss), # Cần cho scalar loss
+            create_graph=False
+        )[0]
+        
         return grad
-
