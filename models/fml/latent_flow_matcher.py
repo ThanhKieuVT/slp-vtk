@@ -30,7 +30,10 @@ class LatentFlowMatcher(nn.Module):
         use_sync_guidance=True,
         lambda_prior=0.1,  # Weight cho SSM prior
         gamma_guidance=0.01,  # Weight cho sync guidance
-        lambda_anneal=True  # Anneal lambda theo t
+        lambda_anneal=True,  # Anneal lambda theo t
+        # (Thêm 2 hằng số weight cho loss)
+        W_PRIOR = 0.01,
+        W_SYNC = 0.1
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -39,6 +42,9 @@ class LatentFlowMatcher(nn.Module):
         self.lambda_prior = lambda_prior
         self.gamma_guidance = gamma_guidance
         self.lambda_anneal = lambda_anneal
+        
+        self.W_PRIOR = W_PRIOR
+        self.W_SYNC = W_SYNC
         
         # Text encoder
         self.text_encoder = BertModel.from_pretrained(text_encoder_name)
@@ -83,6 +89,7 @@ class LatentFlowMatcher(nn.Module):
         # Loss functions
         self.flow_loss_fn = FlowMatchingLoss()
         self.prior_reg_fn = nn.MSELoss()
+        self.sync_loss_fn = nn.MSELoss() # Loss cho SyncHead
         
         self.dropout = nn.Dropout(dropout)
     
@@ -99,7 +106,8 @@ class LatentFlowMatcher(nn.Module):
         Ưu tiên prior ở early timesteps
         """
         if self.lambda_anneal:
-            return self.lambda_prior * (1 - t.unsqueeze(-1).unsqueeze(-1))  # [B, 1, 1]
+            # Chuyển t sang [B, 1, 1] để broadcast
+            return self.lambda_prior * (1 - t.view(-1, 1, 1))
         else:
             return self.lambda_prior
     
@@ -137,54 +145,84 @@ class LatentFlowMatcher(nn.Module):
         # Add noise to latent
         latent_t, v_gt, latent_0 = self.scheduler.add_noise(gt_latent, t)
         
-        # Predict flow velocity
-        v_flow = self.flow_block(latent_t, t, text_features, mask=mask)  # [B, T, 256]
+        # --- Bật grad cho latent_t để tính guidance ---
+        latent_t_grad = latent_t.detach().requires_grad_(True)
+
+        # --- Tính v_flow (phải chạy trên latent_t_grad) ---
+        v_flow = self.flow_block(latent_t_grad, t, text_features, mask=mask)  # [B, T, 256]
         
-        # SSM Prior velocity
+        # --- Tính v_prior (không cần grad) ---
         v_prior = None
         if self.use_ssm_prior and self.ssm_prior is not None:
-            v_prior = self.ssm_prior(latent_t, t, mask=mask)  # [B, T, 256]
+            with torch.no_grad():
+                v_prior = self.ssm_prior(latent_t.detach(), t, mask=mask)  # [B, T, 256]
         
-        # Combine velocities
+        # --- Combine velocities (chưa có guidance) ---
         lambda_t = self.get_lambda_t(t)  # [B, 1, 1]
         
         if v_prior is not None:
-            v_pred = v_flow + lambda_t * v_prior
+            v_pred_no_guidance = v_flow + lambda_t * v_prior
         else:
-            v_pred = v_flow
+            v_pred_no_guidance = v_flow
         
-        # Sync guidance gradient (nếu có)
+        v_pred = v_pred_no_guidance # Mặc định
+        sync_loss_train = torch.tensor(0.0, device=device)
+
+        # --- Tính SyncHead Loss & Guidance (nếu có) ---
         if self.use_sync_guidance and self.sync_head is not None and pose_gt is not None:
-            # Compute gradient
-            with torch.enable_grad():
-                latent_t_grad = latent_t.detach().requires_grad_(True)
-                sync_loss = self.sync_head.compute_loss(latent_t_grad, pose_gt, mask)
-                sync_grad = torch.autograd.grad(sync_loss, latent_t_grad, create_graph=False)[0]
             
-            # Apply guidance: v = v - γ * ∇_z L_sync
-            v_pred = v_pred - self.gamma_guidance * sync_grad
+            # 1. Tính Sync Score (dùng cho cả loss và guidance)
+            # (Phải chạy trên latent_t_grad để có grad path)
+            sync_score_pred = self.sync_head(latent_t_grad, mask) # [B, T]
+
+            # 2. Tính Sync Loss (để train SyncHead)
+            with torch.no_grad():
+                # (compute_loss dùng pose_gt, không liên quan đến latent_t_grad)
+                sync_loss_target = self.sync_head.compute_loss(latent_t.detach(), pose_gt, mask) # [B]
+            
+            # (Loss là MSE giữa score dự đoán (lấy trung bình T) và score thật (target là -corr))
+            # Cần mask_sum để tính mean cho đúng
+            masked_score_pred = sync_score_pred * mask.float()
+            pred_mean = masked_score_pred.sum(dim=1) / mask.sum(dim=1).clamp(min=1) # [B]
+            
+            sync_loss_train = self.sync_loss_fn(pred_mean, sync_loss_target.detach())
+            
+            # 3. Tính Guidance Gradient
+            # (Guidance loss là -score, vì ta muốn *tối đa hóa* score)
+            # (Chỉ "lái" (guide) ở các frame hợp lệ)
+            guidance_loss = -(masked_score_pred.sum()) / mask.sum().clamp(min=1)
+            
+            # (Tính grad của guidance loss WRT latent_t_grad)
+            sync_grad = torch.autograd.grad(
+                guidance_loss, 
+                latent_t_grad, 
+                grad_outputs=torch.ones_like(guidance_loss), # Cần cho scalar loss
+                create_graph=False
+            )[0]
+
+            # 4. Áp dụng Guidance
+            v_pred = v_pred_no_guidance - self.gamma_guidance * sync_grad.detach()
+
         
-        # Flow matching loss
+        # --- Tính Loss cuối cùng ---
+        
+        # 1. Flow matching loss (dùng v_pred ĐÃ ĐƯỢC GUIDE)
         flow_loss = self.flow_loss_fn(v_pred, v_gt, mask=mask)
         
-        # Prior regularization loss
+        # 2. Prior regularization loss (ép v_flow giống v_prior)
         prior_loss = torch.tensor(0.0, device=device)
         if v_prior is not None:
-            prior_loss = self.prior_reg_fn(v_flow, v_prior) * 0.01  # Small weight
+            # (Dùng v_flow, KHÔNG phải v_pred, để regularize)
+            prior_loss = self.prior_reg_fn(v_flow, v_prior.detach())
         
-        # Sync loss (for monitoring)
-        sync_loss_val = torch.tensor(0.0, device=device)
-        if self.use_sync_guidance and self.sync_head is not None and pose_gt is not None:
-            with torch.no_grad():
-                sync_loss_val = self.sync_head.compute_loss(latent_t, pose_gt, mask)
-        
-        total_loss = flow_loss + prior_loss
+        # 3. Total Loss
+        total_loss = flow_loss + self.W_PRIOR * prior_loss + self.W_SYNC * sync_loss_train
         
         return {
             'total': total_loss,
             'flow': flow_loss,
             'prior': prior_loss,
-            'sync': sync_loss_val
+            'sync': sync_loss_train # (Giờ là loss thật, không phải giá trị monitor)
         }
     
     @torch.no_grad()
@@ -209,32 +247,50 @@ class LatentFlowMatcher(nn.Module):
             t_val = step / num_steps
             t = torch.full((B,), t_val, device=device)  # [B]
             
-            # Predict velocity
-            v_flow = self.flow_block(latent, t, text_features, mask=mask)
+            # --- Logic tính v_pred (giống train) ---
             
-            # SSM Prior
+            # (Bật grad cho latent để tính guidance)
+            latent_grad = latent.detach().requires_grad_(True)
+
+            v_flow = self.flow_block(latent_grad, t, text_features, mask=mask)
+            
             v_prior = None
             if self.use_ssm_prior and self.ssm_prior is not None:
-                v_prior = self.ssm_prior(latent, t, mask=mask)
+                v_prior = self.ssm_prior(latent_grad, t, mask=mask)
             
-            # Combine
             lambda_t = self.get_lambda_t(t)
             if v_prior is not None:
-                v = v_flow + lambda_t * v_prior
+                v_pred_no_guidance = v_flow + lambda_t * v_prior
             else:
-                v = v_flow
+                v_pred_no_guidance = v_flow
             
-            # Sync guidance (nếu có, chỉ ở middle steps)
+            v_pred = v_pred_no_guidance
+            
+            # --- Sync guidance (chỉ ở middle steps) ---
             if self.use_sync_guidance and self.sync_head is not None and 0.2 < t_val < 0.8:
-                # Decode để compute sync (cần decoder, sẽ pass từ outside)
-                # Tạm thời skip trong inference đơn giản
-                pass
+                
+                # Tính score dự đoán
+                sync_score_pred = self.sync_head(latent_grad, mask)
+                masked_score_pred = sync_score_pred * mask.float()
+                
+                # Guidance loss = -score (để tối đa hóa)
+                guidance_loss = -(masked_score_pred.sum()) / mask.sum().clamp(min=1)
+                
+                # Lấy grad
+                sync_grad = torch.autograd.grad(
+                    guidance_loss, 
+                    latent_grad, 
+                    grad_outputs=torch.ones_like(guidance_loss),
+                    create_graph=False
+                )[0]
+                
+                # Áp dụng guidance
+                v_pred = v_pred_no_guidance - self.gamma_guidance * sync_grad.detach()
             
             # Euler step
-            latent = latent + dt * v
+            latent = latent + dt * v_pred
             
             # Apply mask
             latent = latent * mask.unsqueeze(-1).float()
         
         return latent  # [B, T, 256]
-
