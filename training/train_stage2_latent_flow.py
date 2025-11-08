@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import SignLanguageDataset, collate_fn
-from models.autoencoder import UnifiedPoseAutoencoder
+from models.fml.autoencoder import UnifiedPoseAutoencoder
 from models.fml.latent_flow_matcher import LatentFlowMatcher
 from models.fml.consistency_distillation import ConsistencyDistillation
 
