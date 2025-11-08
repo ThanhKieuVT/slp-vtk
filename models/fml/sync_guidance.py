@@ -1,6 +1,3 @@
-"""
-Sync Guidance: Head để tối ưu correlation tay-mặt
-"""
 import torch
 import torch.nn as nn
 import numpy as np
@@ -79,7 +76,7 @@ class SyncGuidanceHead(nn.Module):
             mask: [B, T] - valid mask
         
         Returns:
-            loss: scalar
+            loss: [B] - Tensor 1D chứa loss cho mỗi sample
         """
         # Decode latent to pose (cần decoder, sẽ pass từ outside)
         # Ở đây chỉ compute correlation từ pose_gt
@@ -100,19 +97,20 @@ class SyncGuidanceHead(nn.Module):
         for i in range(B):
             valid = valid_mask[i]
             if valid.sum() < 2:
+                # === SỬA LỖI 1: Thêm tensor 0.0 để giữ shape [B] ===
+                losses.append(torch.tensor(0.0, device=latent.device))
                 continue
             
-            # === SỬA LỖI Ở ĐÂY ===
-            # Thay vì .flatten(), dùng .mean(dim=-1) để tạo 1D signal
+            # === (Phần này code gốc của chị đã đúng) ===
             manual_signal = manual_gt[i, valid].mean(dim=-1) # [T_valid]
             nmm_signal = nmm_gt[i, valid].mean(dim=-1)    # [T_valid]
             
-            # Normalize (Đổi tên biến)
+            # Normalize
             manual_flat = (manual_signal - manual_signal.mean()) / (manual_signal.std() + 1e-6)
             nmm_flat = (nmm_signal - nmm_signal.mean()) / (nmm_signal.std() + 1e-6)
             # === KẾT THÚC SỬA LỖI ===
 
-            # Correlation (Giờ 2 tensor đã cùng kích thước [T_valid])
+            # Correlation
             corr = (manual_flat * nmm_flat).mean()
             
             # Loss: negative correlation (maximize correlation = minimize -corr)
@@ -120,9 +118,12 @@ class SyncGuidanceHead(nn.Module):
             losses.append(loss)
         
         if len(losses) == 0:
-            return torch.tensor(0.0, device=latent.device)
+            # Trả về tensor rỗng hoặc tensor 0.0 tùy logic, 
+            # nhưng vì MSELoss sẽ chạy nên trả về tensor 0.0 an toàn hơn
+            return torch.tensor(0.0, device=latent.device) 
         
-        return torch.stack(losses).mean()
+        # === SỬA LỖI 2: Bỏ .mean() để trả về shape [B] ===
+        return torch.stack(losses)
     
     def compute_gradient(self, latent, pose_gt, mask=None):
         """
@@ -139,8 +140,12 @@ class SyncGuidanceHead(nn.Module):
         # Cần bật grad trên latent để tính
         latent_grad = latent.detach().requires_grad_(True)
         
-        loss = self.compute_loss(latent_grad, pose_gt, mask)
+        # compute_loss giờ trả về [B]
+        loss_per_sample = self.compute_loss(latent_grad, pose_gt, mask)
         
+        # Mean để lấy scalar loss
+        loss = loss_per_sample.mean()
+
         # Tính gradient
         grad = torch.autograd.grad(
             loss, 

@@ -143,33 +143,46 @@ class LatentFlowMatcher(nn.Module):
         
         # --- Sync Guidance ---
         if self.use_sync_guidance and self.sync_head is not None and pose_gt is not None:
-            # Predict score
-            sync_score_pred = self.sync_head(latent_t_grad, mask)
             
-            # Compute target loss (không grad)
+            # === BẮT ĐẦU SỬA LỖI ===
+            
+            # --- PATH 1: Tính sync_loss_train (cho total_loss.backward()) ---
+            # Chạy forward lần 1, grad sẽ đi ngược từ total_loss
+            sync_score_pred_loss = self.sync_head(latent_t_grad, mask)
+            
             with torch.no_grad():
+                # compute_loss giờ trả về shape [B]
                 sync_loss_target = self.sync_head.compute_loss(latent_t.detach(), pose_gt, mask)
             
-            masked_score_pred = sync_score_pred * mask.float()
-            per_frame_sum = masked_score_pred.sum(dim=1)
+            masked_score_pred_loss = sync_score_pred_loss * mask.float()
+            per_frame_sum_loss = masked_score_pred_loss.sum(dim=1)
             frame_counts = mask.sum(dim=1).clamp(min=1).float()
-            pred_mean = per_frame_sum / frame_counts
+            pred_mean = per_frame_sum_loss / frame_counts # Shape [B]
             
+            # Loss này sẽ là một phần của total_loss
+            # MSELoss so sánh (pred_mean [B]) và (sync_loss_target [B])
             sync_loss_train = self.sync_loss_fn(pred_mean, sync_loss_target.detach())
             
-            # Compute guidance gradient
-            per_sample_score = masked_score_pred.sum(dim=1) / frame_counts
-            guidance_loss = - per_sample_score.mean()
+            # --- PATH 2: Tính guidance_loss và sync_grad (cho autograd.grad) ---
+            # Chạy forward lần 2, grad chỉ dùng để tính sync_grad
+            # Điều này tạo ra một bộ đệm (buffer) riêng cho lượt backward này
+            sync_score_pred_grad = self.sync_head(latent_t_grad, mask)
+
+            masked_score_pred_grad = sync_score_pred_grad * mask.float()
+            per_sample_score_grad = masked_score_pred_grad.sum(dim=1) / frame_counts # Shape [B]
+            guidance_loss = - per_sample_score_grad.mean() # Mean -> scalar
             
             sync_grad = torch.autograd.grad(
                 guidance_loss,
                 latent_t_grad,
                 create_graph=False,
-                retain_graph=True
+                retain_graph=True  # Vẫn cần True vì flow_loss cũng cần backprop qua latent_t_grad
             )[0]
             
             # Apply guidance
             v_pred = v_pred_no_guidance - self.gamma_guidance * sync_grad.detach()
+            
+            # === KẾT THÚC SỬA LỖI ===
         
         # --- Losses ---
         flow_loss = self.flow_loss_fn(v_pred, v_gt, mask=mask)
