@@ -95,6 +95,8 @@ def validate(flow_matcher, encoder, decoder, dataloader, device):
     total_loss = 0.0
     num_batches = 0
     
+    # === BẮT ĐẦU SỬA LỖI ===
+    # Vẫn giữ no_grad() cho phần lớn vòng lặp
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Validating"):
             poses = batch['poses'].to(device)
@@ -110,20 +112,23 @@ def validate(flow_matcher, encoder, decoder, dataloader, device):
                 'target_length': seq_lengths
             }
             
-            # Encode GT
+            # Encode GT (vẫn trong no_grad)
             gt_latent = encoder(poses, mask=pose_mask)
             
-            # Flow Matching
-            losses = flow_matcher(
-                batch_dict,
-                gt_latent=gt_latent,
-                pose_gt=poses,
-                mode='train'
-            )
+            # Tạm thời bật lại grad chỉ để gọi flow_matcher
+            # vì nó cần chạy autograd.grad bên trong
+            with torch.enable_grad():
+                losses = flow_matcher(
+                    batch_dict,
+                    gt_latent=gt_latent,
+                    pose_gt=poses,
+                    mode='train' # Vẫn dùng mode='train' để tính loss
+                )
             
             total_loss += losses['total'].item()
             num_batches += 1
-    
+    # === KẾT THÚC SỬA LỖI ===
+            
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     return avg_loss
 
@@ -348,4 +353,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
