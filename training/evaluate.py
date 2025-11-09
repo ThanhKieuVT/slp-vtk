@@ -459,7 +459,7 @@ def main():
                         help='Số layers trong FlowMatchingBlock')
     parser.add_argument('--num_prior_layers', type=int, default=4,
                         help='Số layers trong SimpleSSMPrior')
-    parser.add_grant('--num_heads', type=int, default=8,
+    parser.add_argument('--num_heads', type=int, default=8,
                         help='Số heads trong attention')
     parser.add_argument('--dropout', type=float, default=0.1,
                         help='Dropout rate')
