@@ -250,13 +250,14 @@ def evaluate_model(
                 'target_length': seq_lengths
             }
             
-            # Gọi hàm forward với mode='inference'
-            predicted_latent = predictor(
-                batch_dict,
-                gt_latent=None, # Không cần GT latent khi inference
-                mode='inference',
-                num_inference_steps=num_inference_steps
-            )
+            # Bật lại grad chỉ để chạy predictor (cho sync guidance)
+            with torch.enable_grad():
+                predicted_latent = predictor(
+                    batch_dict,
+                    gt_latent=None, # Không cần GT latent khi inference
+                    mode='inference',
+                    num_inference_steps=num_inference_steps
+                )
             # --- KẾT THÚC THAY ĐỔI 5 ---
             
             predicted_pose = decoder(predicted_latent, mask=pose_mask)
