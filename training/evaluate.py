@@ -125,6 +125,15 @@ def tokenize_text(text):
 def compute_sync_quality(pose_pred, pose_gt, mask=None):
     """
     Tính sync quality giữa tay (manual) và mặt (NMM)
+    
+    Args:
+        pose_pred: [T, 214] - predicted pose
+        pose_gt: [T, 214] - ground truth pose
+        mask: [T] - mask cho valid frames
+    
+    Returns:
+        correlation: float - Pearson correlation
+        lag: int - lag tối ưu (frames)
     """
     if mask is not None:
         pose_pred = pose_pred[mask]
@@ -142,59 +151,62 @@ def compute_sync_quality(pose_pred, pose_gt, mask=None):
     nmm_pred = pose_pred[:, 150:]  # [T, 64]
     nmm_gt = pose_gt[:, 150:]
     
-    # Flatten để có 1D signal
+    # Flatten để có 1D signal (Chỉ dùng cho corr bên dưới)
     manual_pred_flat = manual_pred.flatten()
     manual_gt_flat = manual_gt.flatten()
     nmm_pred_flat = nmm_pred.flatten()
     nmm_gt_flat = nmm_gt.flatten()
     
     # Compute correlation cho manual
-    manual_corr = np.corrcoef(manual_pred_flat, manual_gt_flat)[0, 1]
-    if np.isnan(manual_corr):
-        manual_corr = 0.0
+    manual_corr = 0.0
+    if len(manual_pred_flat) == len(manual_gt_flat) and len(manual_pred_flat) > 1:
+        manual_corr = np.corrcoef(manual_pred_flat, manual_gt_flat)[0, 1]
+        if np.isnan(manual_corr):
+            manual_corr = 0.0
     
     # Compute correlation cho NMM
-    nmm_corr = np.corrcoef(nmm_pred_flat, nmm_gt_flat)[0, 1]
-    if np.isnan(nmm_corr):
-        nmm_corr = 0.0
+    nmm_corr = 0.0
+    if len(nmm_pred_flat) == len(nmm_gt_flat) and len(nmm_pred_flat) > 1:
+        nmm_corr = np.corrcoef(nmm_pred_flat, nmm_gt_flat)[0, 1]
+        if np.isnan(nmm_corr):
+            nmm_corr = 0.0
+
+    # --- SỬA LỖI: Tính cross-correlation để tìm lag ---
+    # Logic cũ (flattened) bị sai.
+    # Tạo 1D motion signal cho tay và mặt (ví dụ: dùng mean trên các features)
     
-    # ... (phần code cross-correlation giữ nguyên) ...
-    max_lag = min(10, T // 4)
-    best_corr = -1.0
+    manual_signal = np.mean(manual_pred, axis=1) # Shape (T,)
+    nmm_signal = np.mean(nmm_pred, axis=1) # Shape (T,)
+
+    # Normalize (zero-mean) để np.correlate hoạt động như cross-correlation
+    manual_signal_norm = manual_signal - np.mean(manual_signal)
+    nmm_signal_norm = nmm_signal - np.mean(nmm_signal)
+    
     best_lag = 0
-    
-    for lag in range(-max_lag, max_lag + 1):
-        corr = np.nan # Khởi tạo là nan
-        if lag == 0:
-            if len(manual_pred_flat) > 0 and len(nmm_pred_flat) > 0:
-                min_len = min(len(manual_pred_flat), len(nmm_pred_flat))
-                if min_len > 1: # Cần ít nhất 2 điểm để tính corr
-                    corr = np.corrcoef(
-                        manual_pred_flat[:min_len],
-                        nmm_pred_flat[:min_len]
-                    )[0, 1]
-        elif lag > 0:
-            if len(manual_pred_flat) > lag:
-                min_len = min(len(manual_pred_flat) - lag, len(nmm_pred_flat))
-                if min_len > 1:
-                    corr = np.corrcoef(
-                        manual_pred_flat[lag:lag+min_len],
-                        nmm_pred_flat[:min_len]
-                    )[0, 1]
-        else:
-            lag_abs = abs(lag)
-            if len(manual_pred_flat) > lag_abs:
-                min_len = min(len(manual_pred_flat) - lag_abs, len(nmm_pred_flat))
-                if min_len > 1:
-                    corr = np.corrcoef(
-                        manual_pred_flat[:min_len],
-                        nmm_pred_flat[lag_abs:lag_abs+min_len]
-                    )[0, 1]
+    try:
+        # Kiểm tra xem tín hiệu có phải là hằng số không (tránh lỗi chia cho 0)
+        if np.std(manual_signal_norm) > 1e-6 and np.std(nmm_signal_norm) > 1e-6:
+            # Tính cross-correlation
+            cross_corr = np.correlate(manual_signal_norm, nmm_signal_norm, mode='full')
+            
+            # Tìm lag
+            # 'full' mode trả về 2*T - 1 giá trị
+            # Vị trí 0 lag (trung tâm) là ở index (T - 1)
+            max_lag_index = np.argmax(cross_corr)
+            best_lag = max_lag_index - (T - 1)
+            
+            # Giới hạn lag (giống max_lag cũ)
+            max_lag_allowed = min(10, T // 4)
+            if abs(best_lag) > max_lag_allowed:
+                 best_lag = 0
         
-        if not np.isnan(corr) and corr > best_corr:
-            best_corr = corr
-            best_lag = lag
+    except ValueError:
+        # Xảy ra nếu có lỗi, ví dụ signal toàn NaN
+        best_lag = 0
+        
+    # --- KẾT THÚC SỬA LỖI ---
     
+    # Combined correlation
     final_corr = (manual_corr + nmm_corr) / 2.0
     
     return final_corr, abs(best_lag)
