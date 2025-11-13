@@ -63,20 +63,25 @@ def inference_fast(
         'target_length': target_length
     }
     
+    # === SỬA LỖI: BẮT ĐẦU ===
+    
+    # KHÔNG bọc flow_matcher trong no_grad()
+    # vì Sync Guidance (bên trong model) cần tính grad
+    latent = flow_matcher(
+        batch_dict,
+        gt_latent=None,
+        mode='inference',
+        num_inference_steps=num_steps
+    )  # [1, T, 256]
+    
+    # Chỉ bọc decoder trong no_grad()
     with torch.no_grad():
-        # Predict latent với fast sampling
-        latent = flow_matcher(
-            batch_dict,
-            gt_latent=None,
-            mode='inference',
-            num_inference_steps=num_steps
-        )  # [1, T, 256]
-        
-        # Decode to pose
         pose = decoder(latent, mask=None)  # [1, T, 214]
-        
-        # Convert to numpy
-        pose = pose.squeeze(0).cpu().numpy()  # [T, 214]
+    
+    # === SỬA LỖI: KẾT THÚC ===
+
+    # Convert to numpy
+    pose = pose.squeeze(0).cpu().numpy()  # [T, 214]
     
     latency = time.time() - start_time
     
