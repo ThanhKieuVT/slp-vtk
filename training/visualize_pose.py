@@ -7,18 +7,20 @@ import matplotlib.animation as animation
 from matplotlib.lines import Line2D
 
 # --- BẢN ĐỒ KẾT NỐI (SKELETON MAP) ---
-# Đây là bản đồ kết nối cho định dạng 75-keypoint phổ biến
-# (Giả định: 0-24 là BODY_25, 25-45 là Tay Trái, 46-66 là Tay Phải, 67-74 là 8 điểm Mặt)
+# Giả định mới dựa trên 75-keypoints (Thân trên + Tay + Mặt)
+# GIẢ ĐỊNH CHỈ SỐ (INDEX ASSUMPTION):
+# 0-24: 25 điểm Mặt (Face-25)
+# 25: Nose
+# 26: Neck
+# 27-28: Shoulders (L, R)
+# 29-30: Elbows (L, R)
+# 31-32: Wrists (L, R)
+# 33-53: Tay Trái (21 điểm)
+# 54-74: Tay Phải (21 điểm)
+# --- (TỔNG = 75 ĐIỂM "MANUAL") ---
+# 75-94: 20 điểm Miệng (từ NMMs)
 
-# 1. Kết nối cho 25 điểm thân (BODY_25)
-BODY_25_CONNECTIONS = [
-    (15, 17), (16, 18), (0, 15), (0, 16), (0, 1), (1, 2), (2, 3), 
-    (3, 4), (1, 5), (5, 6), (6, 7), (1, 8), (8, 9), (9, 10), 
-    (10, 11), (11, 22), (11, 24), (22, 23), (8, 12), (12, 13), 
-    (13, 14), (14, 19), (14, 21), (19, 20)
-]
-
-# 2. Kết nối cho 21 điểm bàn tay (dùng chung cho cả 2 tay)
+# 1. Kết nối 21 điểm bàn tay (dùng chung)
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),         # Ngón cái
     (0, 5), (5, 6), (6, 7), (7, 8),         # Ngón trỏ
@@ -27,51 +29,71 @@ HAND_CONNECTIONS = [
     (0, 17), (17, 18), (18, 19), (19, 20)   # Ngón út
 ]
 
-# 3. Kết nối cho 8 điểm mặt (giả định)
-# (Thường là lông mày, mắt, mũi. Tùy vào định dạng của bạn)
-FACE_8_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), # Lông mày trái?
-    (4, 5), (5, 6), (6, 7)  # Lông mày phải?
+# 2. Kết nối Thân trên (8 điểm)
+# (Nose, Neck, LShoulder, RShoulder, LElbow, RElbow, LWrist, RWrist)
+# Indices: 25   26     27         28        29       30       31       32
+UPPER_BODY_CONNECTIONS = [
+    (25, 26), # Nose -> Neck
+    (26, 27), # Neck -> LShoulder
+    (26, 28), # Neck -> RShoulder
+    (27, 29), # LShoulder -> LElbow
+    (28, 30), # RShoulder -> RElbow
+    (29, 31), # LElbow -> LWrist
+    (30, 32)  # RElbow -> RWrist
 ]
 
-# 4. Kết nối cho 20 điểm miệng (từ NMMs)
-# Giả định: 0-11 là môi ngoài, 12-19 là môi trong
+# 3. Kết nối Mặt (25 điểm) - Giả định OpenPose-25 Face
+FACE_25_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), # Lông mày
+    (7, 8), (8, 9), (9, 10), (10, 11), (11, 12), # Lông mày
+    (13, 14), (14, 15), (15, 16), # Mũi
+    (17, 18), (18, 19), (19, 20), (20, 21), # Mắt
+    (21, 22), (22, 23), (23, 24), (24, 17)  # Mắt
+]
+
+# 4. Kết nối 20 điểm miệng (từ NMMs)
 MOUTH_OUTER_LIP = list(zip(range(0, 11), range(1, 12))) + [(11, 0)]
 MOUTH_INNER_LIP = list(zip(range(12, 19), range(13, 20))) + [(19, 12)]
 MOUTH_CONNECTIONS_20 = MOUTH_OUTER_LIP + MOUTH_INNER_LIP
 
 # --- TỔNG HỢP BẢN ĐỒ KẾT NỐI ---
-# Chúng ta cần thêm "offset" (phần bù) cho các chỉ số (index)
+ALL_CONNECTIONS = []
 
-# 1. Thân (0-24)
-SKELETON_CONNECTIONS_75 = [
-    {'indices': (start, end), 'offset': 0, 'color': 'gray', 'lw': 2}
-    for (start, end) in BODY_25_CONNECTIONS
-]
+# 1. Thân trên (Indices 25-32)
+ALL_CONNECTIONS.extend([
+    {'indices': (start, end), 'offset': 0, 'color': 'gray', 'lw': 3}
+    for (start, end) in UPPER_BODY_CONNECTIONS
+])
 
-# 2. Tay Trái (25-45)
-SKELETON_CONNECTIONS_75.extend([
-    {'indices': (start, end), 'offset': 25, 'color': 'blue', 'lw': 1.5}
+# 2. Mặt (Indices 0-24)
+ALL_CONNECTIONS.extend([
+    {'indices': (start, end), 'offset': 0, 'color': 'purple', 'lw': 1}
+    for (start, end) in FACE_25_CONNECTIONS
+])
+
+# 3. Tay Trái (Indices 33-53)
+ALL_CONNECTIONS.extend([
+    {'indices': (start, end), 'offset': 33, 'color': 'blue', 'lw': 1.5}
     for (start, end) in HAND_CONNECTIONS
 ])
 
-# 3. Tay Phải (46-66)
-SKELETON_CONNECTIONS_75.extend([
-    {'indices': (start, end), 'offset': 46, 'color': 'green', 'lw': 1.5}
+# 4. Tay Phải (Indices 54-74)
+ALL_CONNECTIONS.extend([
+    {'indices': (start, end), 'offset': 54, 'color': 'green', 'lw': 1.5}
     for (start, end) in HAND_CONNECTIONS
 ])
 
-# 4. 8 điểm mặt (67-74)
-SKELETON_CONNECTIONS_75.extend([
-    {'indices': (start, end), 'offset': 67, 'color': 'purple', 'lw': 1}
-    for (start, end) in FACE_8_CONNECTIONS
+# 5. Miệng (Indices 75-94)
+ALL_CONNECTIONS.extend([
+    {'indices': (start, end), 'offset': 75, 'color': 'red', 'lw': 1}
+    for (start, end) in MOUTH_CONNECTIONS_20
 ])
 
 
 def load_and_prepare_pose(pose_214):
     """
     Tách pose 214D thành 95 keypoints (x, y) để vẽ
-    Bao gồm: 75 manual (tay, thân) + 20 mouth
+    Bao gồm: 75 manual (tay, thân, mặt) + 20 mouth (từ NMMs)
    
     """
     # 1. Manual keypoints (75 kps)
@@ -80,11 +102,12 @@ def load_and_prepare_pose(pose_214):
     
     # 2. Mouth keypoints (20 kps)
     # Vị trí mouth_flat (40D) là từ 174
-    mouth_40 = pose_214[:, 174:]
+    # (aus[17] + head[3] + gaze[4] = 24) -> 150 + 24 = 174
+    mouth_40 = pose_214[:, 174:] #
     mouth_kps = mouth_40.reshape(-1, 20, 2)
     
     # 3. Kết hợp lại
-    # [T, 95, 2] (75 điểm đầu là skeleton, 20 điểm sau là miệng)
+    # [T, 95, 2] (75 điểm đầu là manual, 20 điểm sau là miệng NMM)
     all_kps = np.concatenate([manual_kps, mouth_kps], axis=1) 
     
     return all_kps
@@ -112,33 +135,26 @@ def animate_poses(gt_path, recon_path, output_video):
         ax.set_xticks([])
         ax.set_yticks([])
         
-        # Lấy min/max từ GT
-        min_vals = np.min(kps_gt.reshape(-1, 2), axis=0)
-        max_vals = np.max(kps_gt.reshape(-1, 2), axis=0)
-        padding = 0.1 * (max_vals - min_vals)
+        # Lấy min/max từ GT (chỉ 75 điểm manual)
+        min_vals = np.min(kps_gt[:, :75].reshape(-1, 2), axis=0)
+        max_vals = np.max(kps_gt[:, :75].reshape(-1, 2), axis=0)
+        padding_factor = 0.2 # Tăng padding
+        padding = padding_factor * (max_vals - min_vals)
         ax.set_xlim(min_vals[0] - padding[0], max_vals[0] + padding[0])
         ax.set_ylim(max_vals[1] + padding[1], min_vals[1] - padding[1])
         
         # Tạo các đối tượng Line2D rỗng
         lines = []
-        
-        # 1. Vẽ skeleton (75 điểm)
-        for item in SKELETON_CONNECTIONS_75:
+        for item in ALL_CONNECTIONS:
             (start, end) = item['indices']
             offset = item['offset']
-            line = Line2D([], [], color=item['color'], lw=item['lw'], alpha=0.7)
+            line = Line2D([], [], color=item['color'], lw=item['lw'], alpha=0.8)
             ax.add_line(line)
             lines.append({'line': line, 'start': start + offset, 'end': end + offset})
-        
-        # 2. Vẽ miệng (20 điểm) - offset = 75
-        for (start, end) in MOUTH_CONNECTIONS_20:
-            line = Line2D([], [], color='red', lw=1, alpha=0.8)
-            ax.add_line(line)
-            lines.append({'line': line, 'start': start + 75, 'end': end + 75})
             
-        # Thêm các điểm (scatter) để thấy rõ các khớp (chỉ vẽ 75 điểm skeleton)
-        scatter = ax.scatter([], [], s=5, c='black', alpha=0.5)
-        lines.append({'scatter': scatter, 'num_points': 75})
+        # Thêm các điểm (scatter) để thấy rõ các khớp (vẽ tất cả 95 điểm)
+        scatter = ax.scatter([], [], s=3, c='black', alpha=0.5)
+        lines.append({'scatter': scatter, 'num_points': 95})
 
         return lines # Trả về list các đối tượng
     
@@ -201,7 +217,7 @@ if __name__ == '__main__':
                         help='Đường dẫn đến file .npy của Ground Truth (từ check_autoencoder.py)')
     parser.add_argument('--recon_path', type=str, required=True,
                         help='Đường dẫn đến file .npy của Reconstructed (từ check_autoencoder.py)')
-    parser.add_argument('--output_video', type=str, default='pose_comparison_skeleton.mp4',
+    parser.add.argument('--output_video', type=str, default='pose_comparison_skeleton.mp4',
                         help='Tên file video output (mp4)')
     
     args = parser.parse_args()
