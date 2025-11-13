@@ -7,16 +7,10 @@ import matplotlib.animation as animation
 from matplotlib.lines import Line2D
 
 # --- BẢN ĐỒ KẾT NỐI (SKELETON MAP) ---
-# Giả định mới dựa trên 75-keypoints (Thân trên + Tay + Mặt)
-# GIẢ ĐỊNH CHỈ SỐ (INDEX ASSUMPTION):
-# 0-24: 25 điểm Mặt (Face-25)
-# 25: Nose
-# 26: Neck
-# 27-28: Shoulders (L, R)
-# 29-30: Elbows (L, R)
-# 31-32: Wrists (L, R)
-# 33-53: Tay Trái (21 điểm)
-# 54-74: Tay Phải (21 điểm)
+# Dựa trên file 1_extract_all_features.py
+# 0-32: MediaPipe Holistic Pose (33 điểm)
+# 33-53: MediaPipe Left Hand (21 điểm)
+# 54-74: MediaPipe Right Hand (21 điểm)
 # --- (TỔNG = 75 ĐIỂM "MANUAL") ---
 # 75-94: 20 điểm Miệng (từ NMMs)
 
@@ -29,29 +23,22 @@ HAND_CONNECTIONS = [
     (0, 17), (17, 18), (18, 19), (19, 20)   # Ngón út
 ]
 
-# 2. Kết nối Thân trên (8 điểm)
-# (Nose, Neck, LShoulder, RShoulder, LElbow, RElbow, LWrist, RWrist)
-# Indices: 25   26     27         28        29       30       31       32
-UPPER_BODY_CONNECTIONS = [
-    (25, 26), # Nose -> Neck
-    (26, 27), # Neck -> LShoulder
-    (26, 28), # Neck -> RShoulder
-    (27, 29), # LShoulder -> LElbow
-    (28, 30), # RShoulder -> RElbow
-    (29, 31), # LElbow -> LWrist
-    (30, 32)  # RElbow -> RWrist
+# 2. Kết nối Thân + Mặt (Holistic Pose 33 điểm - BỎ QUA CHÂN)
+# Đây là các kết nối cho phần thân trên và mặt
+# Chỉ số (index) tham chiếu đến MediaPipe
+POSE_CONNECTIONS_UPPER_BODY = [
+    # Mặt
+    (0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8),
+    (9, 10), 
+    # Thân
+    (11, 12), (12, 14), (14, 16), (11, 13), (13, 15),
+    (11, 23), (12, 24), (23, 24),
+    # Kết nối tay từ thân (quan trọng)
+    (12, 11) # Vai
 ]
 
-# 3. Kết nối Mặt (25 điểm) - Giả định OpenPose-25 Face
-FACE_25_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), # Lông mày
-    (7, 8), (8, 9), (9, 10), (10, 11), (11, 12), # Lông mày
-    (13, 14), (14, 15), (15, 16), # Mũi
-    (17, 18), (18, 19), (19, 20), (20, 21), # Mắt
-    (21, 22), (22, 23), (23, 24), (24, 17)  # Mắt
-]
-
-# 4. Kết nối 20 điểm miệng (từ NMMs)
+# 3. Kết nối 20 điểm miệng (từ NMMs)
+# Lấy từ hàm _extract_mouth (indices 61, 146, 91, ...)
 MOUTH_OUTER_LIP = list(zip(range(0, 11), range(1, 12))) + [(11, 0)]
 MOUTH_INNER_LIP = list(zip(range(12, 19), range(13, 20))) + [(19, 12)]
 MOUTH_CONNECTIONS_20 = MOUTH_OUTER_LIP + MOUTH_INNER_LIP
@@ -59,31 +46,31 @@ MOUTH_CONNECTIONS_20 = MOUTH_OUTER_LIP + MOUTH_INNER_LIP
 # --- TỔNG HỢP BẢN ĐỒ KẾT NỐI ---
 ALL_CONNECTIONS = []
 
-# 1. Thân trên (Indices 25-32)
+# 1. Thân + Mặt (Indices 0-32)
 ALL_CONNECTIONS.extend([
-    {'indices': (start, end), 'offset': 0, 'color': 'gray', 'lw': 3}
-    for (start, end) in UPPER_BODY_CONNECTIONS
+    {'indices': (start, end), 'offset': 0, 'color': 'gray', 'lw': 2}
+    for (start, end) in POSE_CONNECTIONS_UPPER_BODY
 ])
 
-# 2. Mặt (Indices 0-24)
-ALL_CONNECTIONS.extend([
-    {'indices': (start, end), 'offset': 0, 'color': 'purple', 'lw': 1}
-    for (start, end) in FACE_25_CONNECTIONS
-])
-
-# 3. Tay Trái (Indices 33-53)
+# 2. Tay Trái (Indices 33-53)
 ALL_CONNECTIONS.extend([
     {'indices': (start, end), 'offset': 33, 'color': 'blue', 'lw': 1.5}
     for (start, end) in HAND_CONNECTIONS
 ])
+# Nối cổ tay (Wrist) của Thân (điểm 15) với cổ tay Tay Trái (điểm 0)
+ALL_CONNECTIONS.append({'indices': (15, 0), 'offset': (0, 33), 'color': 'blue', 'lw': 2})
 
-# 4. Tay Phải (Indices 54-74)
+
+# 3. Tay Phải (Indices 54-74)
 ALL_CONNECTIONS.extend([
     {'indices': (start, end), 'offset': 54, 'color': 'green', 'lw': 1.5}
     for (start, end) in HAND_CONNECTIONS
 ])
+# Nối cổ tay (Wrist) của Thân (điểm 16) với cổ tay Tay Phải (điểm 0)
+ALL_CONNECTIONS.append({'indices': (16, 0), 'offset': (0, 54), 'color': 'green', 'lw': 2})
 
-# 5. Miệng (Indices 75-94)
+
+# 4. Miệng (Indices 75-94)
 ALL_CONNECTIONS.extend([
     {'indices': (start, end), 'offset': 75, 'color': 'red', 'lw': 1}
     for (start, end) in MOUTH_CONNECTIONS_20
@@ -138,10 +125,17 @@ def animate_poses(gt_path, recon_path, output_video):
         # Lấy min/max từ GT (chỉ 75 điểm manual)
         min_vals = np.min(kps_gt[:, :75].reshape(-1, 2), axis=0)
         max_vals = np.max(kps_gt[:, :75].reshape(-1, 2), axis=0)
-        padding_factor = 0.2 # Tăng padding
+        padding_factor = 0.2
         padding = padding_factor * (max_vals - min_vals)
-        ax.set_xlim(min_vals[0] - padding[0], max_vals[0] + padding[0])
-        ax.set_ylim(max_vals[1] + padding[1], min_vals[1] - padding[1])
+        
+        # Lọc các điểm (0,0) có thể làm hỏng min/max
+        valid_kps = kps_gt[:, :75][kps_gt[:, :75].any(axis=2)]
+        if valid_kps.shape[0] > 0:
+             min_vals = np.min(valid_kps, axis=0)
+             max_vals = np.max(valid_kps, axis=0)
+             padding = padding_factor * (max_vals - min_vals)
+             ax.set_xlim(min_vals[0] - padding[0], max_vals[0] + padding[0])
+             ax.set_ylim(max_vals[1] + padding[1], min_vals[1] - padding[1])
         
         # Tạo các đối tượng Line2D rỗng
         lines = []
@@ -150,10 +144,19 @@ def animate_poses(gt_path, recon_path, output_video):
             offset = item['offset']
             line = Line2D([], [], color=item['color'], lw=item['lw'], alpha=0.8)
             ax.add_line(line)
-            lines.append({'line': line, 'start': start + offset, 'end': end + offset})
             
-        # Thêm các điểm (scatter) để thấy rõ các khớp (vẽ tất cả 95 điểm)
-        scatter = ax.scatter([], [], s=3, c='black', alpha=0.5)
+            # Xử lý offset đặc biệt (nối Thân với Tay)
+            if isinstance(offset, (tuple, list)):
+                start_offset = offset[0]
+                end_offset = offset[1]
+            else:
+                start_offset = offset
+                end_offset = offset
+                
+            lines.append({'line': line, 'start': start + start_offset, 'end': end + end_offset})
+            
+        # Thêm các điểm (scatter) (vẽ tất cả 95 điểm)
+        scatter = ax.scatter([], [], s=2, c='black', alpha=0.4)
         lines.append({'scatter': scatter, 'num_points': 95})
 
         return lines # Trả về list các đối tượng
@@ -174,14 +177,23 @@ def animate_poses(gt_path, recon_path, output_video):
             if 'line' in item:
                 idx_start = item['start']
                 idx_end = item['end']
-                item['line'].set_data(
-                    [kps_gt_frame[idx_start, 0], kps_gt_frame[idx_end, 0]],
-                    [kps_gt_frame[idx_start, 1], kps_gt_frame[idx_end, 1]]
-                )
+                
+                # Chỉ vẽ nếu cả 2 điểm không phải là (0,0)
+                if np.all(kps_gt_frame[idx_start]) and np.all(kps_gt_frame[idx_end]):
+                    item['line'].set_data(
+                        [kps_gt_frame[idx_start, 0], kps_gt_frame[idx_end, 0]],
+                        [kps_gt_frame[idx_start, 1], kps_gt_frame[idx_end, 1]]
+                    )
+                else:
+                    item['line'].set_data([], []) # Ẩn đường nối
+
                 all_changed_artists.append(item['line'])
+                
             elif 'scatter' in item:
                 num_points = item['num_points']
-                item['scatter'].set_offsets(kps_gt_frame[:num_points])
+                # Chỉ vẽ các điểm không phải (0,0)
+                valid_points = kps_gt_frame[:num_points][kps_gt_frame[:num_points].any(axis=1)]
+                item['scatter'].set_offsets(valid_points)
                 all_changed_artists.append(item['scatter'])
 
         # Cập nhật cho ax2 (Recon)
@@ -189,14 +201,22 @@ def animate_poses(gt_path, recon_path, output_video):
             if 'line' in item:
                 idx_start = item['start']
                 idx_end = item['end']
-                item['line'].set_data(
-                    [kps_recon_frame[idx_start, 0], kps_recon_frame[idx_end, 0]],
-                    [kps_recon_frame[idx_start, 1], kps_recon_frame[idx_end, 1]]
-                )
+
+                # Chỉ vẽ nếu cả 2 điểm không phải là (0,0)
+                if np.all(kps_recon_frame[idx_start]) and np.all(kps_recon_frame[idx_end]):
+                    item['line'].set_data(
+                        [kps_recon_frame[idx_start, 0], kps_recon_frame[idx_end, 0]],
+                        [kps_recon_frame[idx_start, 1], kps_recon_frame[idx_end, 1]]
+                    )
+                else:
+                    item['line'].set_data([], []) # Ẩn đường nối
+                
                 all_changed_artists.append(item['line'])
             elif 'scatter' in item:
                 num_points = item['num_points']
-                item['scatter'].set_offsets(kps_recon_frame[:num_points])
+                # Chỉ vẽ các điểm không phải (0,0)
+                valid_points = kps_recon_frame[:num_points][kps_recon_frame[:num_points].any(axis=1)]
+                item['scatter'].set_offsets(valid_points)
                 all_changed_artists.append(item['scatter'])
 
         fig.suptitle(f'Frame {frame} / {T}')
@@ -215,10 +235,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Trực quan hóa so sánh Pose')
     parser.add_argument('--gt_path', type=str, required=True,
                         help='Đường dẫn đến file .npy của Ground Truth (từ check_autoencoder.py)')
-    parser.add_argument('--recon_path', type=str, required=True,
+    parser.add_argument('--recon_path', type_str, required=True,
                         help='Đường dẫn đến file .npy của Reconstructed (từ check_autoencoder.py)')
-    
-    # --- DÒNG NÀY ĐÃ SỬA LỖI (parser.add_argument) ---
     parser.add_argument('--output_video', type=str, default='pose_comparison_skeleton.mp4',
                         help='Tên file video output (mp4)')
     
