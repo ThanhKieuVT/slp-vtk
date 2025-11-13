@@ -23,15 +23,13 @@ HAND_CONNECTIONS = [
     (0, 17), (17, 18), (18, 19), (19, 20)   # Ngón út
 ]
 
-# 2. Kết nối Thân + Mặt (Holistic Pose 33 điểm - BỎ QUA CHÂN)
-# Chỉ số (index) tham chiếu đến MediaPipe
+# 2. Kết nối Thân + Mặt (Holistic Pose 33 điểm - BỎ QUA CHÂN/HÔNG)
 POSE_CONNECTIONS_UPPER_BODY = [
     # Mặt
     (0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8),
     (9, 10), 
-    # Thân
+    # Thân (FIX: Đã BỎ CÁC KẾT NỐI HÔNG 23, 24)
     (11, 12), (12, 14), (14, 16), (11, 13), (13, 15),
-    (11, 23), (12, 24), (23, 24),
     (12, 11) # Vai
 ]
 
@@ -42,65 +40,45 @@ MOUTH_CONNECTIONS_20 = MOUTH_OUTER_LIP + MOUTH_INNER_LIP
 
 # --- TỔNG HỢP BẢN ĐỒ KẾT NỐI ---
 ALL_CONNECTIONS = []
-
-# 1. Thân + Mặt (Indices 0-32)
 ALL_CONNECTIONS.extend([
     {'indices': (start, end), 'offset': 0, 'color': 'gray', 'lw': 2}
     for (start, end) in POSE_CONNECTIONS_UPPER_BODY
 ])
-
-# 2. Tay Trái (Indices 33-53)
 ALL_CONNECTIONS.extend([
     {'indices': (start, end), 'offset': 33, 'color': 'blue', 'lw': 1.5}
     for (start, end) in HAND_CONNECTIONS
 ])
-# Nối cổ tay (Wrist) của Thân (điểm 15) với cổ tay Tay Trái (điểm 0)
 ALL_CONNECTIONS.append({'indices': (15, 0), 'offset': (0, 33), 'color': 'blue', 'lw': 2})
-
-
-# 3. Tay Phải (Indices 54-74)
 ALL_CONNECTIONS.extend([
     {'indices': (start, end), 'offset': 54, 'color': 'green', 'lw': 1.5}
     for (start, end) in HAND_CONNECTIONS
 ])
-# Nối cổ tay (Wrist) của Thân (điểm 16) với cổ tay Tay Phải (điểm 0)
 ALL_CONNECTIONS.append({'indices': (16, 0), 'offset': (0, 54), 'color': 'green', 'lw': 2})
-
-
-# 4. Miệng (Indices 75-94)
 ALL_CONNECTIONS.extend([
     {'indices': (start, end), 'offset': 75, 'color': 'red', 'lw': 1}
     for (start, end) in MOUTH_CONNECTIONS_20
 ])
 
-# --- (FIX 2) DANH SÁCH CÁC ĐIỂM CẦN VẼ (BỎ CHÂN) ---
-# Bỏ qua các index 23-32 (chân) và 25-26 (hông)
-# (Thực ra 23-32 là chân/hông của Holistic)
+# --- (FIX 2) DANH SÁCH CÁC ĐIỂM CẦN VẼ (BỎ CHÂN/HÔNG 23-32) ---
 MANUAL_UPPER_BODY_IDXS = list(range(23)) # 0-22 (Mặt + Thân trên)
 LEFT_HAND_IDXS = list(range(33, 54)) # 33-53
 RIGHT_HAND_IDXS = list(range(54, 75)) # 54-74
 MOUTH_IDXS = list(range(75, 95)) # 75-94
 PLOT_IDXS = MANUAL_UPPER_BODY_IDXS + LEFT_HAND_IDXS + RIGHT_HAND_IDXS + MOUTH_IDXS
 
+# (FIX 1) NGƯỠNG ĐỂ XEM LÀ ĐIỂM HỢP LỆ (thay vì 1e-6)
+VALID_POINT_THRESHOLD = 0.01
 
 def load_and_prepare_pose(pose_214):
     """
     Tách pose 214D thành 95 keypoints (x, y) để vẽ
-    Bao gồm: 75 manual (tay, thân, mặt) + 20 mouth (từ NMMs)
    
     """
-    # 1. Manual keypoints (75 kps)
     manual_150 = pose_214[:, :150]
     manual_kps = manual_150.reshape(-1, 75, 2)
-    
-    # 2. Mouth keypoints (20 kps)
-    # Vị trí mouth_flat (40D) là từ 174
     mouth_40 = pose_214[:, 174:] #
     mouth_kps = mouth_40.reshape(-1, 20, 2)
-    
-    # 3. Kết hợp lại
     all_kps = np.concatenate([manual_kps, mouth_kps], axis=1) # [T, 95, 2]
-    
     return all_kps
 
 def animate_poses(gt_path, recon_path, output_video):
@@ -126,14 +104,22 @@ def animate_poses(gt_path, recon_path, output_video):
         ax.set_xticks([])
         ax.set_yticks([])
         
-        # Lấy min/max từ GT (chỉ 75 điểm manual)
-        valid_kps = kps_gt[:, :75][kps_gt[:, :75].any(axis=2)]
+        # (FIX 2: Cắt gọn chiều cao)
+        # Lấy min/max chỉ từ các điểm được vẽ (PLOT_IDXS)
+        plot_points_gt = kps_gt[:, PLOT_IDXS]
+        # Lọc ra các điểm hợp lệ (lớn hơn ngưỡng)
+        valid_kps = plot_points_gt[np.sum(np.abs(plot_points_gt), axis=2) > VALID_POINT_THRESHOLD]
+
         if valid_kps.shape[0] > 0:
              min_vals = np.min(valid_kps, axis=0)
              max_vals = np.max(valid_kps, axis=0)
              padding = 0.2 * (max_vals - min_vals)
+             padding[padding < 0.1] = 0.1 # Đảm bảo padding tối thiểu
              ax.set_xlim(min_vals[0] - padding[0], max_vals[0] + padding[0])
              ax.set_ylim(max_vals[1] + padding[1], min_vals[1] - padding[1])
+        else:
+             ax.set_xlim(-0.5, 0.5)
+             ax.set_ylim(0.5, -0.5)
         
         # Tạo các đối tượng Line2D rỗng
         lines = []
@@ -142,17 +128,13 @@ def animate_poses(gt_path, recon_path, output_video):
             offset = item['offset']
             line = Line2D([], [], color=item['color'], lw=item['lw'], alpha=0.8)
             ax.add_line(line)
-            
             if isinstance(offset, (tuple, list)):
                 start_offset, end_offset = offset[0], offset[1]
             else:
                 start_offset, end_offset = offset, offset
-                
             lines.append({'line': line, 'start': start + start_offset, 'end': end + end_offset})
             
-        # Thêm các điểm (scatter) 
         scatter = ax.scatter([], [], s=2, c='black', alpha=0.4)
-        # (FIX 2) Gán PLOT_IDXS vào scatter
         lines.append({'scatter': scatter, 'plot_indices': PLOT_IDXS})
 
         return lines
@@ -164,7 +146,7 @@ def animate_poses(gt_path, recon_path, output_video):
 
     def update(frame):
         kps_gt_frame = kps_gt[frame]
-        kps_recon_frame = kps_recon[frame]
+        kps_recon_frame = kps_recon_frame[frame]
         
         all_changed_artists = []
         
@@ -174,23 +156,20 @@ def animate_poses(gt_path, recon_path, output_video):
                 idx_start = item['start']
                 idx_end = item['end']
                 
-                # (FIX 1) Chỉ vẽ nếu cả 2 điểm > 0 (không phải (0,0))
-                if np.sum(np.abs(kps_gt_frame[idx_start])) > 1e-6 and np.sum(np.abs(kps_gt_frame[idx_end])) > 1e-6:
+                # (FIX 1) Chỉ vẽ nếu cả 2 điểm lớn hơn ngưỡng
+                if np.sum(np.abs(kps_gt_frame[idx_start])) > VALID_POINT_THRESHOLD and np.sum(np.abs(kps_gt_frame[idx_end])) > VALID_POINT_THRESHOLD:
                     item['line'].set_data(
                         [kps_gt_frame[idx_start, 0], kps_gt_frame[idx_end, 0]],
                         [kps_gt_frame[idx_start, 1], kps_gt_frame[idx_end, 1]]
                     )
                 else:
-                    item['line'].set_data([], []) # Ẩn đường nối
+                    item['line'].set_data([], [])
                 all_changed_artists.append(item['line'])
                 
             elif 'scatter' in item:
-                # (FIX 2) Chỉ lấy các điểm trong PLOT_IDXS
                 plot_indices = item['plot_indices']
                 points_to_plot = kps_gt_frame[plot_indices]
-                
-                # Chỉ vẽ các điểm không phải (0,0)
-                valid_points = points_to_plot[np.sum(np.abs(points_to_plot), axis=1) > 1e-6]
+                valid_points = points_to_plot[np.sum(np.abs(points_to_plot), axis=1) > VALID_POINT_THRESHOLD]
                 item['scatter'].set_offsets(valid_points)
                 all_changed_artists.append(item['scatter'])
 
@@ -200,8 +179,8 @@ def animate_poses(gt_path, recon_path, output_video):
                 idx_start = item['start']
                 idx_end = item['end']
 
-                # (FIX 1) Chỉ vẽ nếu cả 2 điểm > 0
-                if np.sum(np.abs(kps_recon_frame[idx_start])) > 1e-6 and np.sum(np.abs(kps_recon_frame[idx_end])) > 1e-6:
+                # (FIX 1) Chỉ vẽ nếu cả 2 điểm lớn hơn ngưỡng
+                if np.sum(np.abs(kps_recon_frame[idx_start])) > VALID_POINT_THRESHOLD and np.sum(np.abs(kps_recon_frame[idx_end])) > VALID_POINT_THRESHOLD:
                     item['line'].set_data(
                         [kps_recon_frame[idx_start, 0], kps_recon_frame[idx_end, 0]],
                         [kps_recon_frame[idx_start, 1], kps_recon_frame[idx_end, 1]]
@@ -211,12 +190,9 @@ def animate_poses(gt_path, recon_path, output_video):
                 all_changed_artists.append(item['line'])
                 
             elif 'scatter' in item:
-                # (FIX 2) Chỉ lấy các điểm trong PLOT_IDXS
                 plot_indices = item['plot_indices']
                 points_to_plot = kps_recon_frame[plot_indices]
-                
-                # Chỉ vẽ các điểm không phải (0,0)
-                valid_points = points_to_plot[np.sum(np.abs(points_to_plot), axis=1) > 1e-6]
+                valid_points = points_to_plot[np.sum(np.abs(points_to_plot), axis=1) > VALID_POINT_THRESHOLD]
                 item['scatter'].set_offsets(valid_points)
                 all_changed_artists.append(item['scatter'])
 
