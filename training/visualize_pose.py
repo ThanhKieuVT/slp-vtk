@@ -98,15 +98,16 @@ def animate_poses(gt_path, recon_path, output_video):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
     
     def setup_ax(ax, title):
-        ax.set_title(title)
+        ax.set_title(title) # Giữ lại title
         ax.invert_yaxis()
         ax.set_aspect('equal')
+        
+        # Tắt các vạch chia (ticks)
         ax.set_xticks([])
         ax.set_yticks([])
         
-        # Lấy min/max chỉ từ các điểm được vẽ (PLOT_IDXS)
+        # (FIX 2: Cắt gọn chiều cao)
         plot_points_gt = kps_gt[:, PLOT_IDXS]
-        # Lọc ra các điểm hợp lệ (lớn hơn ngưỡng)
         valid_kps = plot_points_gt[np.sum(np.abs(plot_points_gt), axis=2) > VALID_POINT_THRESHOLD]
 
         if valid_kps.shape[0] > 0:
@@ -119,6 +120,12 @@ def animate_poses(gt_path, recon_path, output_video):
         else:
              ax.set_xlim(-0.5, 0.5)
              ax.set_ylim(0.5, -0.5)
+             
+        # *** (FIX MỚI) YÊU CẦU CỦA BẠN: Bật lại khung (spines) một cách rõ ràng ***
+        ax.spines['top'].set_visible(True)
+        ax.spines['bottom'].set_visible(True)
+        ax.spines['left'].set_visible(True)
+        ax.spines['right'].set_visible(True)
         
         # Tạo các đối tượng Line2D rỗng
         lines = []
@@ -144,10 +151,9 @@ def animate_poses(gt_path, recon_path, output_video):
     fig.suptitle(f'Frame 0 / {T}')
 
     def update(frame):
-        # --- (ĐÂY LÀ DÒNG SỬA LỖI) ---
+        # (FIX LỖI UnboundLocalError TỪ LẦN TRƯỚC)
         kps_gt_frame = kps_gt[frame]
-        kps_recon_frame = kps_recon[frame] # Sửa từ kps_recon_frame[frame]
-        # --- (HẾT SỬA LỖI) ---
+        kps_recon_frame = kps_recon[frame] 
         
         all_changed_artists = []
         
