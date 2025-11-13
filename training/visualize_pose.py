@@ -59,14 +59,14 @@ ALL_CONNECTIONS.extend([
     for (start, end) in MOUTH_CONNECTIONS_20
 ])
 
-# --- (FIX 2) DANH SÁCH CÁC ĐIỂM CẦN VẼ (BỎ CHÂN/HÔNG 23-32) ---
+# --- DANH SÁCH CÁC ĐIỂM CẦN VẼ (BỎ CHÂN/HÔNG 23-32) ---
 MANUAL_UPPER_BODY_IDXS = list(range(23)) # 0-22 (Mặt + Thân trên)
 LEFT_HAND_IDXS = list(range(33, 54)) # 33-53
 RIGHT_HAND_IDXS = list(range(54, 75)) # 54-74
 MOUTH_IDXS = list(range(75, 95)) # 75-94
 PLOT_IDXS = MANUAL_UPPER_BODY_IDXS + LEFT_HAND_IDXS + RIGHT_HAND_IDXS + MOUTH_IDXS
 
-# (FIX 1) NGƯỠNG ĐỂ XEM LÀ ĐIỂM HỢP LỆ (thay vì 1e-6)
+# NGƯỠNG ĐỂ XEM LÀ ĐIỂM HỢP LỆ
 VALID_POINT_THRESHOLD = 0.01
 
 def load_and_prepare_pose(pose_214):
@@ -104,7 +104,6 @@ def animate_poses(gt_path, recon_path, output_video):
         ax.set_xticks([])
         ax.set_yticks([])
         
-        # (FIX 2: Cắt gọn chiều cao)
         # Lấy min/max chỉ từ các điểm được vẽ (PLOT_IDXS)
         plot_points_gt = kps_gt[:, PLOT_IDXS]
         # Lọc ra các điểm hợp lệ (lớn hơn ngưỡng)
@@ -145,8 +144,10 @@ def animate_poses(gt_path, recon_path, output_video):
     fig.suptitle(f'Frame 0 / {T}')
 
     def update(frame):
+        # --- (ĐÂY LÀ DÒNG SỬA LỖI) ---
         kps_gt_frame = kps_gt[frame]
-        kps_recon_frame = kps_recon_frame[frame]
+        kps_recon_frame = kps_recon[frame] # Sửa từ kps_recon_frame[frame]
+        # --- (HẾT SỬA LỖI) ---
         
         all_changed_artists = []
         
@@ -156,7 +157,6 @@ def animate_poses(gt_path, recon_path, output_video):
                 idx_start = item['start']
                 idx_end = item['end']
                 
-                # (FIX 1) Chỉ vẽ nếu cả 2 điểm lớn hơn ngưỡng
                 if np.sum(np.abs(kps_gt_frame[idx_start])) > VALID_POINT_THRESHOLD and np.sum(np.abs(kps_gt_frame[idx_end])) > VALID_POINT_THRESHOLD:
                     item['line'].set_data(
                         [kps_gt_frame[idx_start, 0], kps_gt_frame[idx_end, 0]],
@@ -179,7 +179,6 @@ def animate_poses(gt_path, recon_path, output_video):
                 idx_start = item['start']
                 idx_end = item['end']
 
-                # (FIX 1) Chỉ vẽ nếu cả 2 điểm lớn hơn ngưỡng
                 if np.sum(np.abs(kps_recon_frame[idx_start])) > VALID_POINT_THRESHOLD and np.sum(np.abs(kps_recon_frame[idx_end])) > VALID_POINT_THRESHOLD:
                     item['line'].set_data(
                         [kps_recon_frame[idx_start, 0], kps_recon_frame[idx_end, 0]],
