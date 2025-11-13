@@ -7,32 +7,65 @@ import matplotlib.animation as animation
 from matplotlib.lines import Line2D
 
 # --- BẢN ĐỒ KẾT NỐI (SKELETON MAP) ---
+# Đây là bản đồ kết nối cho định dạng 75-keypoint phổ biến
+# (Giả định: 0-24 là BODY_25, 25-45 là Tay Trái, 46-66 là Tay Phải, 67-74 là 8 điểm Mặt)
 
-# 1. KẾT NỐI MIỆNG (20 ĐIỂM)
+# 1. Kết nối cho 25 điểm thân (BODY_25)
+BODY_25_CONNECTIONS = [
+    (15, 17), (16, 18), (0, 15), (0, 16), (0, 1), (1, 2), (2, 3), 
+    (3, 4), (1, 5), (5, 6), (6, 7), (1, 8), (8, 9), (9, 10), 
+    (10, 11), (11, 22), (11, 24), (22, 23), (8, 12), (12, 13), 
+    (13, 14), (14, 19), (14, 21), (19, 20)
+]
+
+# 2. Kết nối cho 21 điểm bàn tay (dùng chung cho cả 2 tay)
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),         # Ngón cái
+    (0, 5), (5, 6), (6, 7), (7, 8),         # Ngón trỏ
+    (0, 9), (9, 10), (10, 11), (11, 12),    # Ngón giữa
+    (0, 13), (13, 14), (14, 15), (15, 16),  # Ngón áp út
+    (0, 17), (17, 18), (18, 19), (19, 20)   # Ngón út
+]
+
+# 3. Kết nối cho 8 điểm mặt (giả định)
+# (Thường là lông mày, mắt, mũi. Tùy vào định dạng của bạn)
+FACE_8_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), # Lông mày trái?
+    (4, 5), (5, 6), (6, 7)  # Lông mày phải?
+]
+
+# 4. Kết nối cho 20 điểm miệng (từ NMMs)
 # Giả định: 0-11 là môi ngoài, 12-19 là môi trong
 MOUTH_OUTER_LIP = list(zip(range(0, 11), range(1, 12))) + [(11, 0)]
 MOUTH_INNER_LIP = list(zip(range(12, 19), range(13, 20))) + [(19, 12)]
 MOUTH_CONNECTIONS_20 = MOUTH_OUTER_LIP + MOUTH_INNER_LIP
 
-# 2. KẾT NỐI BỘ XƯƠNG (75 ĐIỂM)
-# --------------------------------------------------------------------
-# ⚠️  CẢNH BÁO: ĐÂY CHỈ LÀ PLACEHOLDER
-# Bạn PHẢI thay thế phần này bằng bản đồ kết nối (skeleton map)
-# chính xác cho 75 keypoints của bộ dữ liệu của bạn.
-# (Ví dụ: OpenPose 25 body + 21 left hand + 21 right hand = 67)
-# (Bộ dữ liệu của bạn có 75 điểm, có thể bao gồm cả các điểm trên mặt)
-#
-# Ví dụ (hoàn toàn là giả định):
-# SKELETON_CONNECTIONS_75 = [
-#     # Thân (ví dụ)
-#     (0, 1), (1, 2), (2, 3), (3, 4), (1, 5), (5, 6), (6, 7),
-#     # Tay trái (ví dụ)
-#     (25, 26), (26, 27), (27, 28), (28, 29),
-#     # ... (thêm tất cả các kết nối khác) ...
-# ]
-# --------------------------------------------------------------------
-# Để chạy thử, tôi sẽ chỉ nối 10 điểm đầu tiên
-SKELETON_CONNECTIONS_75 = list(zip(range(0, 10), range(1, 11)))
+# --- TỔNG HỢP BẢN ĐỒ KẾT NỐI ---
+# Chúng ta cần thêm "offset" (phần bù) cho các chỉ số (index)
+
+# 1. Thân (0-24)
+SKELETON_CONNECTIONS_75 = [
+    {'indices': (start, end), 'offset': 0, 'color': 'gray', 'lw': 2}
+    for (start, end) in BODY_25_CONNECTIONS
+]
+
+# 2. Tay Trái (25-45)
+SKELETON_CONNECTIONS_75.extend([
+    {'indices': (start, end), 'offset': 25, 'color': 'blue', 'lw': 1.5}
+    for (start, end) in HAND_CONNECTIONS
+])
+
+# 3. Tay Phải (46-66)
+SKELETON_CONNECTIONS_75.extend([
+    {'indices': (start, end), 'offset': 46, 'color': 'green', 'lw': 1.5}
+    for (start, end) in HAND_CONNECTIONS
+])
+
+# 4. 8 điểm mặt (67-74)
+SKELETON_CONNECTIONS_75.extend([
+    {'indices': (start, end), 'offset': 67, 'color': 'purple', 'lw': 1}
+    for (start, end) in FACE_8_CONNECTIONS
+])
 
 
 def load_and_prepare_pose(pose_214):
@@ -51,7 +84,8 @@ def load_and_prepare_pose(pose_214):
     mouth_kps = mouth_40.reshape(-1, 20, 2)
     
     # 3. Kết hợp lại
-    all_kps = np.concatenate([manual_kps, mouth_kps], axis=1) # [T, 95, 2]
+    # [T, 95, 2] (75 điểm đầu là skeleton, 20 điểm sau là miệng)
+    all_kps = np.concatenate([manual_kps, mouth_kps], axis=1) 
     
     return all_kps
 
@@ -88,21 +122,23 @@ def animate_poses(gt_path, recon_path, output_video):
         # Tạo các đối tượng Line2D rỗng
         lines = []
         
-        # 1. Vẽ skeleton (75 điểm) - offset = 0
-        for (start, end) in SKELETON_CONNECTIONS_75:
-            line = Line2D([], [], color='blue', lw=2, alpha=0.7)
+        # 1. Vẽ skeleton (75 điểm)
+        for item in SKELETON_CONNECTIONS_75:
+            (start, end) = item['indices']
+            offset = item['offset']
+            line = Line2D([], [], color=item['color'], lw=item['lw'], alpha=0.7)
             ax.add_line(line)
-            lines.append({'line': line, 'start': start, 'end': end, 'offset': 0})
+            lines.append({'line': line, 'start': start + offset, 'end': end + offset})
         
         # 2. Vẽ miệng (20 điểm) - offset = 75
         for (start, end) in MOUTH_CONNECTIONS_20:
             line = Line2D([], [], color='red', lw=1, alpha=0.8)
             ax.add_line(line)
-            lines.append({'line': line, 'start': start, 'end': end, 'offset': 75})
+            lines.append({'line': line, 'start': start + 75, 'end': end + 75})
             
-        # Thêm các điểm (scatter) để thấy rõ các khớp
-        scatter = ax.scatter([], [], s=5)
-        lines.append({'scatter': scatter})
+        # Thêm các điểm (scatter) để thấy rõ các khớp (chỉ vẽ 75 điểm skeleton)
+        scatter = ax.scatter([], [], s=5, c='black', alpha=0.5)
+        lines.append({'scatter': scatter, 'num_points': 75})
 
         return lines # Trả về list các đối tượng
     
@@ -120,29 +156,31 @@ def animate_poses(gt_path, recon_path, output_video):
         # Cập nhật cho ax1 (GT)
         for item in artists1:
             if 'line' in item:
-                idx_start = item['start'] + item['offset']
-                idx_end = item['end'] + item['offset']
+                idx_start = item['start']
+                idx_end = item['end']
                 item['line'].set_data(
                     [kps_gt_frame[idx_start, 0], kps_gt_frame[idx_end, 0]],
                     [kps_gt_frame[idx_start, 1], kps_gt_frame[idx_end, 1]]
                 )
                 all_changed_artists.append(item['line'])
             elif 'scatter' in item:
-                item['scatter'].set_offsets(kps_gt_frame)
+                num_points = item['num_points']
+                item['scatter'].set_offsets(kps_gt_frame[:num_points])
                 all_changed_artists.append(item['scatter'])
 
         # Cập nhật cho ax2 (Recon)
         for item in artists2:
             if 'line' in item:
-                idx_start = item['start'] + item['offset']
-                idx_end = item['end'] + item['offset']
+                idx_start = item['start']
+                idx_end = item['end']
                 item['line'].set_data(
                     [kps_recon_frame[idx_start, 0], kps_recon_frame[idx_end, 0]],
                     [kps_recon_frame[idx_start, 1], kps_recon_frame[idx_end, 1]]
                 )
                 all_changed_artists.append(item['line'])
             elif 'scatter' in item:
-                item['scatter'].set_offsets(kps_recon_frame)
+                num_points = item['num_points']
+                item['scatter'].set_offsets(kps_recon_frame[:num_points])
                 all_changed_artists.append(item['scatter'])
 
         fig.suptitle(f'Frame {frame} / {T}')
