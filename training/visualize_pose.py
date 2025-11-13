@@ -217,8 +217,9 @@ if __name__ == '__main__':
                         help='Đường dẫn đến file .npy của Ground Truth (từ check_autoencoder.py)')
     parser.add_argument('--recon_path', type=str, required=True,
                         help='Đường dẫn đến file .npy của Reconstructed (từ check_autoencoder.py)')
+    
+    # --- DÒNG NÀY ĐÃ SỬA LỖI (parser.add_argument) ---
     parser.add_argument('--output_video', type=str, default='pose_comparison_skeleton.mp4',
-
                         help='Tên file video output (mp4)')
     
     args = parser.parse_args()
