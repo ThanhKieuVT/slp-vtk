@@ -23,14 +23,19 @@ HAND_CONNECTIONS = [
     (0, 17), (17, 18), (18, 19), (19, 20)   # Ngón út
 ]
 
-# 2. Kết nối Thân + Mặt (Holistic Pose 33 điểm - BỎ QUA CHÂN/HÔNG)
+# 2. Kết nối Thân + Mặt (Holistic Pose 33 điểm)
+# (FIX 2: THÊM LẠI CÁC ĐƯỜNG NỐI HÔNG)
 POSE_CONNECTIONS_UPPER_BODY = [
     # Mặt
     (0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8),
     (9, 10), 
-    # Thân (FIX: Đã BỎ CÁC KẾT NỐI HÔNG 23, 24)
-    (11, 12), (12, 14), (14, 16), (11, 13), (13, 15),
-    (12, 11) # Vai
+    # Thân (Giống như ảnh bạn gửi)
+    (11, 12), # Vai-Vai
+    (11, 13), (13, 15), # Tay trái
+    (12, 14), (14, 16), # Tay phải
+    (11, 23), # Vai trái -> Hông trái
+    (12, 24), # Vai phải -> Hông phải
+    (23, 24)  # Hông-Hông
 ]
 
 # 3. Kết nối 20 điểm miệng (từ NMMs)
@@ -66,8 +71,8 @@ RIGHT_HAND_IDXS = list(range(54, 75)) # 54-74
 MOUTH_IDXS = list(range(75, 95)) # 75-94
 PLOT_IDXS = MANUAL_UPPER_BODY_IDXS + LEFT_HAND_IDXS + RIGHT_HAND_IDXS + MOUTH_IDXS
 
-# NGƯỠNG ĐỂ XEM LÀ ĐIỂM HỢP LỆ
-VALID_POINT_THRESHOLD = 0.01
+# (FIX 1) TĂNG NGƯỠNG LỌC NHIỄU
+VALID_POINT_THRESHOLD = 0.1
 
 def load_and_prepare_pose(pose_214):
     """
@@ -102,11 +107,10 @@ def animate_poses(gt_path, recon_path, output_video):
         ax.invert_yaxis()
         ax.set_aspect('equal')
         
-        # Tắt các vạch chia (ticks)
         ax.set_xticks([])
         ax.set_yticks([])
         
-        # (FIX 2: Cắt gọn chiều cao)
+        # Cắt gọn chiều cao
         plot_points_gt = kps_gt[:, PLOT_IDXS]
         valid_kps = plot_points_gt[np.sum(np.abs(plot_points_gt), axis=2) > VALID_POINT_THRESHOLD]
 
@@ -121,7 +125,7 @@ def animate_poses(gt_path, recon_path, output_video):
              ax.set_xlim(-0.5, 0.5)
              ax.set_ylim(0.5, -0.5)
              
-        # *** (FIX MỚI) YÊU CẦU CỦA BẠN: Bật lại khung (spines) một cách rõ ràng ***
+        # Bật lại khung (spines)
         ax.spines['top'].set_visible(True)
         ax.spines['bottom'].set_visible(True)
         ax.spines['left'].set_visible(True)
@@ -151,7 +155,6 @@ def animate_poses(gt_path, recon_path, output_video):
     fig.suptitle(f'Frame 0 / {T}')
 
     def update(frame):
-        # (FIX LỖI UnboundLocalError TỪ LẦN TRƯỚC)
         kps_gt_frame = kps_gt[frame]
         kps_recon_frame = kps_recon[frame] 
         
@@ -163,6 +166,7 @@ def animate_poses(gt_path, recon_path, output_video):
                 idx_start = item['start']
                 idx_end = item['end']
                 
+                # (FIX 1) Chỉ vẽ nếu cả 2 điểm lớn hơn ngưỡng
                 if np.sum(np.abs(kps_gt_frame[idx_start])) > VALID_POINT_THRESHOLD and np.sum(np.abs(kps_gt_frame[idx_end])) > VALID_POINT_THRESHOLD:
                     item['line'].set_data(
                         [kps_gt_frame[idx_start, 0], kps_gt_frame[idx_end, 0]],
@@ -185,6 +189,7 @@ def animate_poses(gt_path, recon_path, output_video):
                 idx_start = item['start']
                 idx_end = item['end']
 
+                # (FIX 1) Chỉ vẽ nếu cả 2 điểm lớn hơn ngưỡng
                 if np.sum(np.abs(kps_recon_frame[idx_start])) > VALID_POINT_THRESHOLD and np.sum(np.abs(kps_recon_frame[idx_end])) > VALID_POINT_THRESHOLD:
                     item['line'].set_data(
                         [kps_recon_frame[idx_start, 0], kps_recon_frame[idx_end, 0]],
