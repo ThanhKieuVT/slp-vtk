@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 # --- Import các model và data của chị ---
 from utils.data_loader import SignLanguageDataset, collate_fn
-from models.autoencoder import Stage1Autoencoder # (Chị phải có file này)
+from models.autoencoder import UnifiedPoseAutoencoder # (Chị phải có file này)
 from models.ldm_denoiser import LDM_TransformerDenoiser
 from models.losses import VelocityLoss
 
@@ -229,7 +229,7 @@ def main():
     print("Loading Stage 1 Autoencoder...")
     # (Chị phải có file 'models/autoencoder.py' chứa class Stage1Autoencoder)
     try:
-        autoencoder = Stage1Autoencoder(
+        autoencoder = UnifiedPoseAutoencoder(
             pose_dim=214,
             latent_dim=args.latent_dim,
             hidden_dim=args.ae_hidden_dim # Dùng dim của AE
