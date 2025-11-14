@@ -1,11 +1,10 @@
 # Tên file: models/ldm_denoiser.py
-# (Đã sửa tham số cho mCLIP)
+# === PHIÊN BẢN CHUẨN: BERT (768-dim) ===
 import torch
 import torch.nn as nn
 import math
 
 class PositionalEncoding(nn.Module):
-    """Positional encoding (sin/cos)"""
     def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
         super().__init__()
         self.dropout = nn.Dropout(p=dropout)
@@ -17,12 +16,10 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        """x shape: [SeqLen, Batch, Dim]"""
         x = x + self.pe[:x.size(0)]
         return self.dropout(x)
 
 class TimeEmbed(nn.Module):
-    """Sinusoidal time embedding"""
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
@@ -36,22 +33,17 @@ class TimeEmbed(nn.Module):
         return emb
 
 class LDM_TransformerDenoiser(nn.Module):
-    """
-    Mô hình Denoiser LDM dựa trên Transformer.
-    Kiến trúc này đã tích hợp Cross-Attention.
-    """
     def __init__(
         self,
         latent_dim=256,
-        # === SỬA LỖI 1: Sửa tham số cho mCLIP ===
-        text_embed_dim=1024, # (mCLIP-Large là 1024)
-        hidden_dim=1024,     # (Dim nội bộ = text_embed_dim)
+        # === THAY ĐỔI: Cấu hình cho BERT ===
+        text_embed_dim=768, # (BERT-base là 768)
+        hidden_dim=768,     # (Dim nội bộ = text_embed_dim)
         num_layers=6,
-        num_heads=16,        # (XLM-R Large dùng 16 heads)
+        num_heads=12,        # (BERT-base dùng 12 heads)
         dropout=0.1
     ):
         super().__init__()
-        # === SỬA LỖI 2: Thêm dòng này ===
         self.latent_dim = latent_dim 
         
         # 1. Input/Output Projections
@@ -76,7 +68,7 @@ class LDM_TransformerDenoiser(nn.Module):
             dim_feedforward=hidden_dim * 4,
             dropout=dropout,
             activation='gelu',
-            batch_first=True # Quan trọng!
+            batch_first=True
         )
         self.transformer_decoder = nn.TransformerDecoder(
             decoder_layer, 
@@ -86,27 +78,23 @@ class LDM_TransformerDenoiser(nn.Module):
     def forward(self, z_t, timesteps, text_embeddings, text_mask=None, pose_mask=None):
         """
         Args:
-            z_t: [B, T, latent_dim] - Latent pose bị nhiễu
-            timesteps: [B] - Timesteps (số nguyên)
-            text_embeddings: [B, L, text_embed_dim] - Embeddings từ mCLIP
-            text_mask: [B, L] - Mask cho text (True = ignore)
-            pose_mask: [B, T] - Mask cho pose (True = ignore)
+            z_t: [B, T, latent_dim]
+            timesteps: [B]
+            text_embeddings: [B, L, text_embed_dim] (Từ BERT)
+            text_mask: [B, L] (True = ignore)
+            pose_mask: [B, T] (True = ignore)
         """
         
         # 1. Chuẩn bị Pose Latent (tgt)
-        z_t_embed = self.input_proj(z_t) # [B, T, hidden_dim]
-        
-        # Thêm Time embedding
-        t_embed = self.time_embed(timesteps) # [B, hidden_dim]
-        z_t_embed = z_t_embed + t_embed.unsqueeze(1) # [B, T, hidden_dim]
-        
-        # Thêm Positional encoding (cần đổi sang [T, B, D])
-        z_t_embed = z_t_embed.transpose(0, 1) # [T, B, hidden_dim]
+        z_t_embed = self.input_proj(z_t)
+        t_embed = self.time_embed(timesteps)
+        z_t_embed = z_t_embed + t_embed.unsqueeze(1)
+        z_t_embed = z_t_embed.transpose(0, 1)
         z_t_embed = self.pos_encoder(z_t_embed)
-        z_t_embed = z_t_embed.transpose(0, 1) # [B, T, hidden_dim]
+        z_t_embed = z_t_embed.transpose(0, 1)
         
         # 2. Chuẩn bị Text (memory)
-        # `text_embeddings` đã sẵn sàng, shape [B, L, text_embed_dim]
+        # `text_embeddings` đã sẵn sàng
         
         # 3. Chạy qua Transformer Decoder
         output = self.transformer_decoder(
@@ -117,5 +105,5 @@ class LDM_TransformerDenoiser(nn.Module):
         )
         
         # 4. Lấy output
-        noise_pred = self.output_proj(output) # [B, T, latent_dim]
+        noise_pred = self.output_proj(output)
         return noise_pred
