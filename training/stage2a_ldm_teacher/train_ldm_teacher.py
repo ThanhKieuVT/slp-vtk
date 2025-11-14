@@ -260,8 +260,8 @@ def main():
     scheduler = CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
     
     # === SỬA LỖI 3: Sửa cảnh báo (warning) của GradScaler ===
-    # scaler = GradScaler() # (Cách cũ)
-    scaler = GradScaler(device_type='cuda' if torch.cuda.is_available() else 'cpu') # (Cách mới)
+    scaler = GradScaler() # (Cách cũ)
+    #scaler = GradScaler(device_type='cuda' if torch.cuda.is_available() else 'cpu') # (Cách mới)
     
     # === SỬA LỖI 4: Tạo null_text_embeddings 1 lần ở main ===
     print("Creating NULL text embeddings for CFG...")
