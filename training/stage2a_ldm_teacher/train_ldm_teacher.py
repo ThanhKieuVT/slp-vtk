@@ -8,8 +8,8 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.cuda.amp import GradScaler, autocast
-from tqdm import tqdm
-
+from tqdm import tqdm 
+from sentence_transformers import SentenceTransformer
 # --- Import các model và data của chị ---
 from utils.data_loader import SignLanguageDataset, collate_fn
 from models.autoencoder import UnifiedPoseAutoencoder # (Chị phải có file này)
@@ -246,11 +246,18 @@ def main():
         print("Vui lòng đảm bảo 'models/autoencoder.py' và checkpoint AE chính xác.")
         return
 
-    # === Tải mCLIP và Tokenizer ===
+    # === THAY ĐỔI: Tải mCLIP và Tokenizer ===
     print("Loading mCLIP (XLM-R) Text Encoder...")
     mclip_name = "M-CLIP/XLM-Roberta-Large-Vit-L-14"
     tokenizer = AutoTokenizer.from_pretrained(mclip_name)
-    text_encoder = AutoModel.from_pretrained(mclip_name).to(device)
+    
+    # 1. Load model bằng SentenceTransformer
+    sentence_model = SentenceTransformer(mclip_name)
+    
+    # 2. "Bóc" lấy cái model Transformer (XLM-R) bên trong
+    #    Module đầu tiên (index 0) chính là model XLM-R
+    text_encoder = sentence_model[0].auto_model.to(device)
+    
     text_encoder.eval().requires_grad_(False)
     
     # --- 2. Tải Dataloader ---
