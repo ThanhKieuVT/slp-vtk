@@ -1,5 +1,5 @@
 # Tên file: train_ldm_teacher.py
-# === PHIÊN BẢN CHUẨN: BERT (768-dim) ===
+# === PHIÊN BẢN CHUẨN: BERT (768-dim) - ĐÃ SỬA LỖI SHAPE ===
 
 import os
 import argparse
@@ -26,25 +26,18 @@ GRAD_ACCUMULATION_STEPS = 4
 W_VELOCITY_LOSS = 0.05
 
 def train_epoch(
-    ldm_model, autoencoder, text_encoder, tokenizer,
+    ldm_model, autoencoder, text_encoder,
     dataloader, optimizer, scheduler, scaler,
-    noise_scheduler, velocity_loss_fn, device, epoch
+    noise_scheduler, velocity_loss_fn, 
+    null_text_embeddings, # <<< SỬA 1: Nhận tensor từ main
+    device, epoch
 ):
     ldm_model.train()
     text_encoder.eval()
     autoencoder.eval()
     total_loss_epoch, total_base_loss_epoch, total_vel_loss_epoch = 0.0, 0.0, 0.0
     
-    null_text_input = tokenizer(
-        "", padding="max_length", 
-        max_length=tokenizer.model_max_length, 
-        truncation=True, return_tensors="pt"
-    ).to(device)
-    with torch.no_grad():
-        null_text_embeddings = text_encoder(
-            null_text_input.input_ids,
-            attention_mask=null_text_input.attention_mask
-        ).last_hidden_state
+    # === SỬA 2: Xóa bỏ 8 dòng tạo null_text_embeddings ở đây ===
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} Training")
     for i, batch in enumerate(pbar):
@@ -64,7 +57,10 @@ def train_epoch(
             ).last_hidden_state
 
         mask_cfg = torch.rand(batch_size, device=device) < CFG_PROBABILITY
-        text_embeddings[mask_cfg] = null_text_embeddings
+        
+        # === DÒNG NÀY SẼ HẾT LỖI ===
+        # Vì null_text_embeddings giờ cũng có shape [1, 64, 768]
+        text_embeddings[mask_cfg] = null_text_embeddings 
         
         noise_gt = torch.randn_like(gt_z0)
         timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, 
@@ -115,6 +111,7 @@ def validate(
     ldm_model, autoencoder, text_encoder, tokenizer,
     dataloader, noise_scheduler, velocity_loss_fn, device
 ):
+    # (Hàm validate không thay đổi)
     ldm_model.eval()
     total_loss_epoch, total_base_loss_epoch, total_vel_loss_epoch = 0, 0, 0
     pbar = tqdm(dataloader, desc="Validating")
@@ -261,7 +258,23 @@ def main():
     # --- 5. Optimizer và Hỗ trợ Training ---
     optimizer = torch.optim.AdamW(ldm_model.parameters(), lr=args.learning_rate)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
-    scaler = GradScaler()
+    
+    # === SỬA LỖI 3: Sửa cảnh báo (warning) của GradScaler ===
+    # scaler = GradScaler() # (Cách cũ)
+    scaler = GradScaler(device_type='cuda' if torch.cuda.is_available() else 'cpu') # (Cách mới)
+    
+    # === SỬA LỖI 4: Tạo null_text_embeddings 1 lần ở main ===
+    print("Creating NULL text embeddings for CFG...")
+    null_text_input = tokenizer(
+        "", padding="max_length", 
+        max_length=args.max_text_len, # <<< Dùng args.max_text_len (64)
+        truncation=True, return_tensors="pt"
+    ).to(device)
+    with torch.no_grad():
+        null_text_embeddings = text_encoder(
+            null_text_input.input_ids,
+            attention_mask=null_text_input.attention_mask
+        ).last_hidden_state # Shape [1, 64, 768]
     
     # --- 6. LOGIC RESUME ---
     start_epoch = 0
@@ -282,12 +295,16 @@ def main():
     print(f"Starting LDM Teacher training from epoch {start_epoch}...")
     for epoch in range(start_epoch, args.num_epochs):
         
+        # === SỬA LỖI 5: Truyền null_text_embeddings vào ===
         train_losses = train_epoch(
             ldm_model, autoencoder, text_encoder, tokenizer,
             train_loader, optimizer, scheduler, scaler,
-            noise_scheduler, velocity_loss_fn, device, epoch
+            noise_scheduler, velocity_loss_fn, 
+            null_text_embeddings, # <<< ĐÃ THÊM
+            device, epoch
         )
         
+        # (Hàm validate không cần CFG nên không cần truyền)
         val_losses = validate(
             ldm_model, autoencoder, text_encoder, tokenizer,
             val_loader, noise_scheduler, velocity_loss_fn, device
