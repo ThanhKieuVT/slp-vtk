@@ -1,5 +1,5 @@
 # Tên file: train_ldm_teacher.py
-# === PHIÊN BẢN CHUẨN: mCLIP (XLM-R) ===
+# === PHIÊN BẢN CHUẨN: mCLIP (XLM-R) - ĐÃ SỬA LỖI ... ===
 
 import os
 import argparse
@@ -17,7 +17,6 @@ from models.ldm_denoiser import LDM_TransformerDenoiser
 from models.losses import VelocityLoss
 
 # --- Import các thư viện SOTA ---
-# === THAY ĐỔI: Import AutoModel, AutoTokenizer ===
 from transformers import AutoModel, AutoTokenizer
 from diffusers import DDPMScheduler
 
@@ -247,7 +246,7 @@ def main():
         print("Vui lòng đảm bảo 'models/autoencoder.py' và checkpoint AE chính xác.")
         return
 
-    # === THAY ĐỔI: Tải mCLIP và Tokenizer ===
+    # === Tải mCLIP và Tokenizer ===
     print("Loading mCLIP (XLM-R) Text Encoder...")
     mclip_name = "M-CLIP/XLM-Roberta-Large-Vit-L-14"
     tokenizer = AutoTokenizer.from_pretrained(mclip_name)
@@ -319,14 +318,14 @@ def main():
     print(f"Starting LDM Teacher training from epoch {start_epoch}...")
     for epoch in range(start_epoch, args.num_epochs):
         
-        # Train
+        # === SỬA LỖI 1: Điền đầy đủ tham số ===
         train_losses = train_epoch(
             ldm_model, autoencoder, text_encoder, tokenizer,
             train_loader, optimizer, scheduler, scaler,
             noise_scheduler, velocity_loss_fn, device, epoch
         )
         
-        # Validate
+        # === SỬA LỖI 2: Điền đầy đủ tham số ===
         val_losses = validate(
             ldm_model, autoencoder, text_encoder, tokenizer,
             val_loader, noise_scheduler, velocity_loss_fn, device
@@ -339,10 +338,30 @@ def main():
         print(f"  Valid Loss: {val_losses['total']:.6f} (Base: {val_losses['base']:.6f}, Vel: {val_losses['vel']:.6f})")
         print(f"  LR: {optimizer.param_groups[0]['lr']:.2e}")
         
-        # --- LOGIC LƯU CHECKPOINT ---
+        # === SỬA LỖI 3: Điền đầy đủ dictionary ===
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': ldm_model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
-            'scaler_state_dict': scaler
+            'scaler_state_dict': scaler.state_dict(),
+            'val_loss': val_loss,
+            'best_val_loss': best_val_loss,
+            'args': args
+        }
+        
+        # Lưu latest checkpoint
+        torch.save(checkpoint, os.path.join(args.output_dir, 'latest.pt'))
+        
+        # Lưu best checkpoint
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            checkpoint['best_val_loss'] = best_val_loss
+            torch.save(checkpoint, os.path.join(args.output_dir, 'best_model.pt'))
+            print(f"  ✅ Saved new best model (Val Loss: {best_val_loss:.6f})")
+
+    print("\n✅ Training completed!")
+    print(f"Best validation loss: {best_val_loss:.6f}")
+
+if __name__ == '__main__':
+    main()
