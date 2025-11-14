@@ -1,5 +1,5 @@
 # Tên file: train_ldm_teacher.py
-# === PHIÊN BẢN CHUẨN: BERT (768-dim) - ĐÃ SỬA LỖI SHAPE ===
+# === PHIÊN BẢN CHUẨN: BERT (768-dim) - ĐÃ SỬA LỖI CUỐI CÙNG ===
 
 import os
 import argparse
@@ -7,37 +7,35 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler, autocast # <<< ĐÃ SỬA: GradScaler()
 from tqdm import tqdm
 
 # --- Import các model và data của chị ---
 from utils.data_loader import SignLanguageDataset, collate_fn
-from models.autoencoder import UnifiedPoseAutoencoder # (Đã sửa tên)
+from models.autoencoder import UnifiedPoseAutoencoder # <<< ĐÃ SỬA TÊN CLASS
 from models.ldm_denoiser import LDM_TransformerDenoiser
 from models.losses import VelocityLoss
 
 # --- Import các thư viện SOTA ---
-from transformers import BertModel, BertTokenizer # <<< DÙNG BERT
+from transformers import BertModel, BertTokenizer 
 from diffusers import DDPMScheduler
 
 # --- Cấu hình các "Bí kíp" SOTA ---
 CFG_PROBABILITY = 0.1
 GRAD_ACCUMULATION_STEPS = 4
 W_VELOCITY_LOSS = 0.05
- 
+
 def train_epoch(
     ldm_model, autoencoder, text_encoder, tokenizer,
     dataloader, optimizer, scheduler, scaler,
     noise_scheduler, velocity_loss_fn, 
-    null_text_embeddings, # <<< THÊM CÁI NÀY VÀO
+    null_text_embeddings, # <<< ĐÃ SỬA: Thêm vào định nghĩa
     device, epoch
 ):
     ldm_model.train()
     text_encoder.eval()
     autoencoder.eval()
     total_loss_epoch, total_base_loss_epoch, total_vel_loss_epoch = 0.0, 0.0, 0.0
-    
-    # === SỬA 2: Xóa bỏ 8 dòng tạo null_text_embeddings ở đây ===
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} Training")
     for i, batch in enumerate(pbar):
@@ -57,17 +55,14 @@ def train_epoch(
             ).last_hidden_state
 
         mask_cfg = torch.rand(batch_size, device=device) < CFG_PROBABILITY
-        
-        # === DÒNG NÀY SẼ HẾT LỖI ===
-        # Vì null_text_embeddings giờ cũng có shape [1, 64, 768]
-        text_embeddings[mask_cfg] = null_text_embeddings 
+        text_embeddings[mask_cfg] = null_text_embeddings # <<< FIX SHAPE
         
         noise_gt = torch.randn_like(gt_z0)
         timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, 
                                 (batch_size,), device=device).long()
         z_t = noise_scheduler.add_noise(gt_z0, noise_gt, timesteps)
         
-        with autocast(dtype=torch.float16): 
+        with autocast(dtype=torch.float16): # <<< FIX TYPERROR
             pose_padding_mask = ~pose_mask
             text_padding_mask = ~attention_mask.bool()
 
@@ -77,11 +72,18 @@ def train_epoch(
                 pose_mask=pose_padding_mask
             )
             
+            # --- TÍNH LOSS ---
             loss_base = F.l1_loss(noise_pred, noise_gt, reduction='none')
             loss_base = loss_base * pose_mask.unsqueeze(-1).float()
             loss_base = loss_base.sum() / pose_mask.sum().clamp(min=1)
             
-            pred_z0 = noise_scheduler.get_original_sample(z_t, timesteps, noise_pred)
+            # === FIX: Công thức thay thế get_original_sample ===
+            alphas_cumprod = noise_scheduler.alphas_cumprod.to(timesteps.device)
+            alpha_t = torch.sqrt(alphas_cumprod[timesteps]).view(-1, 1, 1)
+            sigma_t = torch.sqrt(1.0 - alphas_cumprod[timesteps]).view(-1, 1, 1)
+            pred_z0 = (z_t - sigma_t * noise_pred) / alpha_t
+            # === KẾT THÚC FIX ===
+            
             loss_vel = velocity_loss_fn(pred_z0, gt_z0, mask=pose_mask)
             
             total_loss = loss_base + W_VELOCITY_LOSS * loss_vel
@@ -111,7 +113,6 @@ def validate(
     ldm_model, autoencoder, text_encoder, tokenizer,
     dataloader, noise_scheduler, velocity_loss_fn, device
 ):
-    # (Hàm validate không thay đổi)
     ldm_model.eval()
     total_loss_epoch, total_base_loss_epoch, total_vel_loss_epoch = 0, 0, 0
     pbar = tqdm(dataloader, desc="Validating")
@@ -135,7 +136,7 @@ def validate(
                                     (batch_size,), device=device).long()
             z_t = noise_scheduler.add_noise(gt_z0, noise_gt, timesteps)
             
-            with autocast(device_type='cuda', dtype=torch.float16):
+            with autocast(dtype=torch.float16):
                 pose_padding_mask = ~pose_mask
                 text_padding_mask = ~attention_mask.bool()
 
@@ -149,7 +150,13 @@ def validate(
                 loss_base = loss_base * pose_mask.unsqueeze(-1).float()
                 loss_base = loss_base.sum() / pose_mask.sum().clamp(min=1)
                 
-                pred_z0 = noise_scheduler.get_original_sample(z_t, timesteps, noise_pred)
+                # === FIX: Công thức thay thế get_original_sample ===
+                alphas_cumprod = noise_scheduler.alphas_cumprod.to(timesteps.device)
+                alpha_t = torch.sqrt(alphas_cumprod[timesteps]).view(-1, 1, 1)
+                sigma_t = torch.sqrt(1.0 - alphas_cumprod[timesteps]).view(-1, 1, 1)
+                pred_z0 = (z_t - sigma_t * noise_pred) / alpha_t
+                # === KẾT THÚC FIX ===
+                
                 loss_vel = velocity_loss_fn(pred_z0, gt_z0, mask=pose_mask)
                 total_loss = loss_base + W_VELOCITY_LOSS * loss_vel
             
@@ -195,7 +202,8 @@ def main():
     # --- 1. Tải các model đã đóng băng (Frozen) ---
     print("Loading Stage 1 Autoencoder...")
     try:
-        autoencoder = UnifiedPoseAutoencoder( # <<< ĐÃ SỬA TÊN
+        from models.autoencoder import UnifiedPoseAutoencoder # <<< IMPORT ĐÚNG
+        autoencoder = UnifiedPoseAutoencoder(
             pose_dim=214,
             latent_dim=args.latent_dim,
             hidden_dim=args.ae_hidden_dim
@@ -212,13 +220,13 @@ def main():
 
     # === Tải BERT và Tokenizer ===
     print("Loading BERT Text Encoder...")
-    bert_name = "bert-base-multilingual-cased"
-    tokenizer = BertTokenizer.from_pretrained(bert_name)
-    text_encoder = BertModel.from_pretrained(bert_name).to(device)
+    from transformers import BertModel, BertTokenizer 
+    tokenizer = BertTokenizer.from_pretrained("bert-base-multilingual-cased")
+    text_encoder = BertModel.from_pretrained("bert-base-multilingual-cased").to(device)
     text_encoder.eval().requires_grad_(False)
     
     # --- 2. Tải Dataloader ---
-    print("Loading datasets...")
+    from utils.data_loader import SignLanguageDataset, collate_fn
     train_dataset = SignLanguageDataset(
         data_dir=args.data_dir, split='train', 
         max_seq_len=args.max_seq_len, max_text_len=args.max_text_len
@@ -239,42 +247,32 @@ def main():
     )
 
     # --- 3. Model chính (LDM Denoiser) ---
+    from models.ldm_denoiser import LDM_TransformerDenoiser
     print("Initializing LDM Denoiser model...")
     ldm_model = LDM_TransformerDenoiser(
         latent_dim=args.latent_dim,
         text_embed_dim=args.text_embed_dim, # 768
-        hidden_dim=args.text_embed_dim,    # 768
+        hidden_dim=args.text_embed_dim,
         num_layers=args.num_layers,
-        num_heads=12 # (BERT-base dùng 12 heads)
+        num_heads=12
     ).to(device)
     
     # --- 4. Schedulers và Loss ---
-    noise_scheduler = DDPMScheduler(
-        num_train_timesteps=1000,
-        beta_schedule='squaredcos_cap_v2'
-    )
+    from diffusers import DDPMScheduler
+    from models.losses import VelocityLoss
+    noise_scheduler = DDPMScheduler(num_train_timesteps=1000, beta_schedule='squaredcos_cap_v2')
     velocity_loss_fn = VelocityLoss(loss_type='l1').to(device)
     
     # --- 5. Optimizer và Hỗ trợ Training ---
     optimizer = torch.optim.AdamW(ldm_model.parameters(), lr=args.learning_rate)
     scheduler = CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
+    scaler = GradScaler()
     
-    # === SỬA LỖI 3: Sửa cảnh báo (warning) của GradScaler ===
-    scaler = GradScaler() # (Cách cũ)
-    #scaler = GradScaler(device_type='cuda' if torch.cuda.is_available() else 'cpu') # (Cách mới)
-    
-    # === SỬA LỖI 4: Tạo null_text_embeddings 1 lần ở main ===
+    # === SỬA LỖI: Tạo null_text_embeddings 1 lần ở main ===
     print("Creating NULL text embeddings for CFG...")
-    null_text_input = tokenizer(
-        "", padding="max_length", 
-        max_length=args.max_text_len, # <<< Dùng args.max_text_len (64)
-        truncation=True, return_tensors="pt"
-    ).to(device)
+    null_text_input = tokenizer("", padding="max_length", max_length=args.max_text_len, truncation=True, return_tensors="pt").to(device)
     with torch.no_grad():
-        null_text_embeddings = text_encoder(
-            null_text_input.input_ids,
-            attention_mask=null_text_input.attention_mask
-        ).last_hidden_state # Shape [1, 64, 768]
+        null_text_embeddings = text_encoder(null_text_input.input_ids, attention_mask=null_text_input.attention_mask).last_hidden_state
     
     # --- 6. LOGIC RESUME ---
     start_epoch = 0
@@ -295,16 +293,15 @@ def main():
     print(f"Starting LDM Teacher training from epoch {start_epoch}...")
     for epoch in range(start_epoch, args.num_epochs):
         
-        # === SỬA LỖI 5: Truyền null_text_embeddings vào ===
+        # Train
         train_losses = train_epoch(
             ldm_model, autoencoder, text_encoder, tokenizer,
             train_loader, optimizer, scheduler, scaler,
             noise_scheduler, velocity_loss_fn, 
-            null_text_embeddings, # <<< ĐÃ THÊM
+            null_text_embeddings, # <<< TRUYỀN THAM SỐ
             device, epoch
         )
         
-        # (Hàm validate không cần CFG nên không cần truyền)
         val_losses = validate(
             ldm_model, autoencoder, text_encoder, tokenizer,
             val_loader, noise_scheduler, velocity_loss_fn, device
