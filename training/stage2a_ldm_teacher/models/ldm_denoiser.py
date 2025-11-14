@@ -1,4 +1,5 @@
 # Tên file: models/ldm_denoiser.py
+# (Đã sửa tham số cho mCLIP)
 import torch
 import torch.nn as nn
 import math
@@ -42,13 +43,16 @@ class LDM_TransformerDenoiser(nn.Module):
     def __init__(
         self,
         latent_dim=256,
-        text_embed_dim=512, # Kích thước output của CLIP (ví dụ 512)
-        hidden_dim=512,
+        # === SỬA LỖI 1: Sửa tham số cho mCLIP ===
+        text_embed_dim=1024, # (mCLIP-Large là 1024)
+        hidden_dim=1024,     # (Dim nội bộ = text_embed_dim)
         num_layers=6,
-        num_heads=8,
+        num_heads=16,        # (XLM-R Large dùng 16 heads)
         dropout=0.1
     ):
         super().__init__()
+        # === SỬA LỖI 2: Thêm dòng này ===
+        self.latent_dim = latent_dim 
         
         # 1. Input/Output Projections
         self.input_proj = nn.Linear(latent_dim, hidden_dim)
@@ -66,9 +70,6 @@ class LDM_TransformerDenoiser(nn.Module):
         )
         
         # 4. Kiến trúc Transformer Decoder (có Cross-Attention)
-        # Chúng ta dùng "Decoder" layer vì nó có 2 input:
-        # - `tgt`: latent pose (từ self-attention)
-        # - `memory`: text embedding (từ cross-attention)
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
@@ -87,7 +88,7 @@ class LDM_TransformerDenoiser(nn.Module):
         Args:
             z_t: [B, T, latent_dim] - Latent pose bị nhiễu
             timesteps: [B] - Timesteps (số nguyên)
-            text_embeddings: [B, L, text_embed_dim] - Embeddings từ CLIP
+            text_embeddings: [B, L, text_embed_dim] - Embeddings từ mCLIP
             text_mask: [B, L] - Mask cho text (True = ignore)
             pose_mask: [B, T] - Mask cho pose (True = ignore)
         """
@@ -108,8 +109,6 @@ class LDM_TransformerDenoiser(nn.Module):
         # `text_embeddings` đã sẵn sàng, shape [B, L, text_embed_dim]
         
         # 3. Chạy qua Transformer Decoder
-        # `memory_key_padding_mask` là mask cho text
-        # `tgt_key_padding_mask` là mask cho pose
         output = self.transformer_decoder(
             tgt=z_t_embed,
             memory=text_embeddings,
