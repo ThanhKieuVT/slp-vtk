@@ -67,7 +67,7 @@ def train_epoch(
                                 (batch_size,), device=device).long()
         z_t = noise_scheduler.add_noise(gt_z0, noise_gt, timesteps)
         
-        with autocast(device_type='cuda', dtype=torch.float16):
+        with autocast(dtype=torch.float16): 
             pose_padding_mask = ~pose_mask
             text_padding_mask = ~attention_mask.bool()
 
