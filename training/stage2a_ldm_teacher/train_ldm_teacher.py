@@ -1,4 +1,6 @@
 # Tên file: train_ldm_teacher.py
+# === PHIÊN BẢN CHUẨN: mCLIP (XLM-R) ===
+
 import os
 import argparse
 import torch
@@ -9,14 +11,14 @@ from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 # --- Import các model và data của chị ---
-# (Giả sử chị copy/paste các file này vào đúng chỗ)
-from utils.data_loader import SignLanguageDataset, collate_fn # Tái sử dụng
-from models.autoencoder import Stage1Autoencoder # Tái sử dụng Stage 1
-from models.ldm_denoiser import LDM_TransformerDenoiser # Model MỚI
-from models.losses import VelocityLoss # Loss MỚI
+from utils.data_loader import SignLanguageDataset, collate_fn
+from models.autoencoder import Stage1Autoencoder # (Chị phải có file này)
+from models.ldm_denoiser import LDM_TransformerDenoiser
+from models.losses import VelocityLoss
 
 # --- Import các thư viện SOTA ---
-from transformers import CLIPTextModel, CLIPTokenizer
+# === THAY ĐỔI: Import AutoModel, AutoTokenizer ===
+from transformers import AutoModel, AutoTokenizer
 from diffusers import DDPMScheduler
 
 # --- Cấu hình các "Bí kíp" SOTA ---
@@ -30,51 +32,50 @@ def train_epoch(
     noise_scheduler, velocity_loss_fn, device, epoch
 ):
     ldm_model.train()
-    text_encoder.eval()  # Luôn đóng băng text encoder
-    autoencoder.eval()   # Luôn đóng băng autoencoder
+    text_encoder.eval()
+    autoencoder.eval()
     
     total_loss_epoch = 0.0
     total_base_loss_epoch = 0.0
     total_vel_loss_epoch = 0.0
     
+    # === Lấy max_len từ tokenizer mCLIP ===
+    max_len = tokenizer.model_max_length
+    
     # --- Lấy token "NULL" (empty text) cho CFG ---
     null_text_input = tokenizer(
         "", padding="max_length", 
-        max_length=tokenizer.model_max_length, 
+        max_length=max_len, 
         truncation=True, return_tensors="pt"
     ).to(device)
     with torch.no_grad():
+        # === Lấy output của mCLIP (XLM-R) ===
         null_text_embeddings = text_encoder(
             null_text_input.input_ids,
             attention_mask=null_text_input.attention_mask
-        )[0]
+        ).last_hidden_state
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch} Training")
     for i, batch in enumerate(pbar):
         
         poses = batch['poses'].to(device)
-        pose_mask = batch['pose_mask'].to(device) # [B, T]
-        text_batch = batch['text_list'] # Lấy list text
+        pose_mask = batch['pose_mask'].to(device)
+        text_tokens = batch['text_tokens'].to(device) # Lấy từ data_loader
+        attention_mask = batch['attention_mask'].to(device) # Lấy từ data_loader
         
-        # 1. Encode GT (với frozen A)
+        # 1. Encode GT (với frozen AE)
         with torch.no_grad():
-            gt_z0 = autoencoder.encode(poses, mask=pose_mask) # [B, T, D]
-        
+            gt_z0 = autoencoder.encode(poses, mask=pose_mask)
         batch_size = gt_z0.shape[0]
 
-        # 2. Encode Text (với frozen CLIP)
-        text_inputs = tokenizer(
-            text_batch, padding="max_length", 
-            max_length=tokenizer.model_max_length,
-            truncation=True, return_tensors="pt"
-        ).to(device)
+        # 2. Encode Text (với frozen mCLIP)
         with torch.no_grad():
             text_embeddings = text_encoder(
-                text_inputs.input_ids,
-                attention_mask=text_inputs.attention_mask
-            )[0] # [B, L, D_text]
+                text_tokens,
+                attention_mask=attention_mask
+            ).last_hidden_state # [B, L, D_text]
 
-        # 3. Kỹ thuật: Classifier-Free Guidance (CFG)
+        # 3. Kỹ thuật: CFG
         mask_cfg = torch.rand(batch_size, device=device) < CFG_PROBABILITY
         text_embeddings[mask_cfg] = null_text_embeddings
         
@@ -85,38 +86,26 @@ def train_epoch(
         z_t = noise_scheduler.add_noise(gt_z0, noise_gt, timesteps)
         
         # 5. Huấn luyện (AMP + Gradient Accumulation)
-        # Dùng autocast (float16)
         with autocast(device_type='cuda', dtype=torch.float16):
             
-            # Mask cho Transformer (True = ignore)
             pose_padding_mask = ~pose_mask
-            text_padding_mask = ~text_inputs.attention_mask.bool()
+            text_padding_mask = ~attention_mask.bool()
 
-            # Dự đoán nhiễu
             noise_pred = ldm_model(
-                z_t,                     # [B, T, D_latent]
-                timesteps,               # [B]
-                text_embeddings,         # [B, L, D_text]
+                z_t, timesteps, text_embeddings,
                 text_mask=text_padding_mask,
                 pose_mask=pose_padding_mask
             )
             
             # --- TÍNH LOSS ---
-            
-            # 5a. Loss cơ bản (L1) trên nhiễu
             loss_base = F.l1_loss(noise_pred, noise_gt, reduction='none')
             loss_base = loss_base * pose_mask.unsqueeze(-1).float()
             loss_base = loss_base.sum() / pose_mask.sum().clamp(min=1)
             
-            # 5b. Kỹ thuật: Velocity Loss (để mượt)
-            # Lấy z0 dự đoán (pred_z0) từ scheduler
             pred_z0 = noise_scheduler.get_original_sample(z_t, timesteps, noise_pred)
             loss_vel = velocity_loss_fn(pred_z0, gt_z0, mask=pose_mask)
             
-            # 5c. Tổng loss
             total_loss = loss_base + W_VELOCITY_LOSS * loss_vel
-            
-            # Chuẩn hóa loss cho Gradient Accumulation
             loss_to_backward = total_loss / GRAD_ACCUMULATION_STEPS
             
         # 6. Backward (AMP)
@@ -137,62 +126,169 @@ def train_epoch(
         pbar.set_postfix({
             'loss': total_loss.item(),
             'base': loss_base.item(),
-            'vel': loss_vel.item(),
-            'lr': optimizer.param_groups[0]['lr']
+            'vel': loss_vel.item()
         })
 
     avg_loss = total_loss_epoch / len(dataloader)
     avg_base = total_base_loss_epoch / len(dataloader)
     avg_vel = total_vel_loss_epoch / len(dataloader)
     
-    # Cập nhật LR Scheduler mỗi epoch
     scheduler.step()
     
     return {'total': avg_loss, 'base': avg_base, 'vel': avg_vel}
 
+def validate(
+    ldm_model, autoencoder, text_encoder, tokenizer,
+    dataloader, noise_scheduler, velocity_loss_fn, device
+):
+    ldm_model.eval()
+    total_loss_epoch, total_base_loss_epoch, total_vel_loss_epoch = 0, 0, 0
+    
+    pbar = tqdm(dataloader, desc="Validating")
+    with torch.no_grad():
+        for i, batch in enumerate(pbar):
+            poses = batch['poses'].to(device)
+            pose_mask = batch['pose_mask'].to(device)
+            text_tokens = batch['text_tokens'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            
+            gt_z0 = autoencoder.encode(poses, mask=pose_mask)
+            batch_size = gt_z0.shape[0]
 
-# (Hàm validate tương tự, nhưng không cần backward)
-# ...
+            text_embeddings = text_encoder(
+                text_tokens,
+                attention_mask=attention_mask
+            ).last_hidden_state
+
+            noise_gt = torch.randn_like(gt_z0)
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, 
+                                    (batch_size,), device=device).long()
+            z_t = noise_scheduler.add_noise(gt_z0, noise_gt, timesteps)
+            
+            with autocast(device_type='cuda', dtype=torch.float16):
+                pose_padding_mask = ~pose_mask
+                text_padding_mask = ~attention_mask.bool()
+
+                noise_pred = ldm_model(
+                    z_t, timesteps, text_embeddings,
+                    text_mask=text_padding_mask,
+                    pose_mask=pose_padding_mask
+                )
+                
+                loss_base = F.l1_loss(noise_pred, noise_gt, reduction='none')
+                loss_base = loss_base * pose_mask.unsqueeze(-1).float()
+                loss_base = loss_base.sum() / pose_mask.sum().clamp(min=1)
+                
+                pred_z0 = noise_scheduler.get_original_sample(z_t, timesteps, noise_pred)
+                loss_vel = velocity_loss_fn(pred_z0, gt_z0, mask=pose_mask)
+                
+                total_loss = loss_base + W_VELOCITY_LOSS * loss_vel
+            
+            total_loss_epoch += total_loss.item()
+            total_base_loss_epoch += loss_base.item()
+            total_vel_loss_epoch += loss_vel.item()
+
+    avg_loss = total_loss_epoch / len(dataloader)
+    avg_base = total_base_loss_epoch / len(dataloader)
+    avg_vel = total_vel_loss_epoch / len(dataloader)
+    
+    return {'total': avg_loss, 'base': avg_base, 'vel': avg_vel}
+
 
 def main():
-    parser = argparse.ArgumentParser()
-    # (Thêm các parser args của chị: --data_dir, --output_dir, v.v...)
-    parser.add...
+    parser = argparse.ArgumentParser(description="Train LDM Teacher Model (Stage 2a) - mCLIP ver.")
+    
+    # --- Paths ---
+    parser.add_argument('--data_dir', type=str, required=True, help='Thư mục processed_data/data/')
+    parser.add_argument('--output_dir', type=str, required=True, help='Thư mục lưu checkpoints')
+    parser.add_argument('--autoencoder_checkpoint', type=str, required=True, help='Đường dẫn đến Stage 1 AE')
+    parser.add_argument('--resume_from', type=str, default=None, help='Đường dẫn đến checkpoint để resume')
+
+    # --- Training Params ---
+    parser.add_argument('--batch_size', type=int, default=8, help='Batch size (giảm nếu OOM, mCLIP nặng)')
+    parser.add_argument('--num_epochs', type=int, default=200, help='Số epochs')
+    parser.add_argument('--learning_rate', type=float, default=1e-4, help='Learning rate')
+    parser.add_argument('--num_workers', type=int, default=2, help='Số workers cho DataLoader (2 cho Colab)')
+    
+    # --- Model Params ---
+    parser.add_argument('--latent_dim', type=int, default=256, help='Latent dim (phải khớp AE)')
+    parser.add_argument('--ae_hidden_dim', type=int, default=512, help='Hidden dim của Autoencoder (khớp Stage 1)')
+    parser.add_argument('--text_embed_dim', type=int, default=1024, help='Text embed dim (1024 cho mCLIP Large)')
+    
+    parser.add_argument('--num_layers', type=int, default=6, help='Số lớp Transformer')
+    parser.add_argument('--max_seq_len', type=int, default=120, help='Max sequence length (pose)')
+    parser.add_argument('--max_text_len', type=int, default=64, help='Max text length (text)')
+    
+    args = parser.parse_args()
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    os.makedirs(args.output_dir, exist_ok=True)
     
     # --- 1. Tải các model đã đóng băng (Frozen) ---
     print("Loading Stage 1 Autoencoder...")
-    autoencoder = Stage1Autoencoder(...) # (Load model của chị)
-    autoencoder.load_state_dict(torch.load(args.autoencoder_checkpoint))
-    autoencoder.to(device).eval().requires_grad_(False)
-    
-    print("Loading CLIP Text Encoder...")
-    clip_name = "openai/clip-vit-base-patch32"
-    tokenizer = CLIPTokenizer.from_pretrained(clip_name)
-    text_encoder = CLIPTextModel.from_pretrained(clip_name).to(device)
+    # (Chị phải có file 'models/autoencoder.py' chứa class Stage1Autoencoder)
+    try:
+        autoencoder = Stage1Autoencoder(
+            pose_dim=214,
+            latent_dim=args.latent_dim,
+            hidden_dim=args.ae_hidden_dim # Dùng dim của AE
+        )
+        ae_checkpoint = torch.load(args.autoencoder_checkpoint, map_location=device)
+        if 'model_state_dict' in ae_checkpoint:
+            autoencoder.load_state_dict(ae_checkpoint['model_state_dict'])
+        else:
+            autoencoder.load_state_dict(ae_checkpoint) # Thử load trực tiếp
+            
+        autoencoder.to(device).eval().requires_grad_(False)
+    except Exception as e:
+        print(f"Lỗi khi load Stage1Autoencoder: {e}")
+        print("Vui lòng đảm bảo 'models/autoencoder.py' và checkpoint AE chính xác.")
+        return
+
+    # === THAY ĐỔI: Tải mCLIP và Tokenizer ===
+    print("Loading mCLIP (XLM-R) Text Encoder...")
+    mclip_name = "M-CLIP/XLM-Roberta-Large-Vit-L-14"
+    tokenizer = AutoTokenizer.from_pretrained(mclip_name)
+    text_encoder = AutoModel.from_pretrained(mclip_name).to(device)
     text_encoder.eval().requires_grad_(False)
-    text_embed_dim = text_encoder.config.hidden_size
     
-    # --- 2. Tải Dataloader (tái sử dụng) ---
-    train_dataset = SignLanguageDataset(data_dir=args.data_dir, split='train', ...)
-    train_loader = DataLoader(train_dataset, ...)
-    # (Tương tự cho val_loader)
+    # --- 2. Tải Dataloader ---
+    print("Loading datasets...")
+    train_dataset = SignLanguageDataset(
+        data_dir=args.data_dir, split='train', 
+        max_seq_len=args.max_seq_len, max_text_len=args.max_text_len
+    )
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True
+    )
+    
+    val_dataset = SignLanguageDataset(
+        data_dir=args.data_dir, split='dev', 
+        max_seq_len=args.max_seq_len, max_text_len=args.max_text_len,
+        stats_path=os.path.join(args.data_dir, "normalization_stats.npz")
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True
+    )
 
     # --- 3. Model chính (LDM Denoiser) ---
     print("Initializing LDM Denoiser model...")
     ldm_model = LDM_TransformerDenoiser(
         latent_dim=args.latent_dim,
-        text_embed_dim=text_embed_dim,
-        hidden_dim=args.hidden_dim,
-        num_layers=6, # (Hyperparameter)
-        num_heads=8
+        text_embed_dim=args.text_embed_dim, # 1024
+        hidden_dim=args.text_embed_dim,    # 1024 (Dim nội bộ = text dim)
+        num_layers=args.num_layers,
+        num_heads=16 # (XLM-R Large dùng 16 heads, nên 16 là chuẩn nhất)
     ).to(device)
     
     # --- 4. Schedulers và Loss ---
     noise_scheduler = DDPMScheduler(
         num_train_timesteps=1000,
-        beta_schedule='squaredcos_cap_v2' # (Schedule SOTA)
+        beta_schedule='squaredcos_cap_v2'
     )
     velocity_loss_fn = VelocityLoss(loss_type='l1').to(device)
     
@@ -201,24 +297,52 @@ def main():
     scheduler = CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=1e-6)
     scaler = GradScaler()
     
-    # (Thêm logic resume checkpoint ở đây nếu cần)
+    # --- 6. LOGIC RESUME ---
+    start_epoch = 0
+    best_val_loss = float('inf')
     
-    print("Starting LDM Teacher training...")
-    for epoch in range(args.num_epochs):
+    if args.resume_from and os.path.exists(args.resume_from):
+        print(f"Loading checkpoint from {args.resume_from}")
+        checkpoint = torch.load(args.resume_from, map_location=device)
+        
+        ldm_model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        
+        start_epoch = checkpoint['epoch'] + 1
+        best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+        
+        print(f"Resumed from epoch {start_epoch}, Best Val Loss: {best_val_loss:.6f}")
+
+    # --- VÒNG LẶP HUẤN LUYỆN CHÍNH ---
+    print(f"Starting LDM Teacher training from epoch {start_epoch}...")
+    for epoch in range(start_epoch, args.num_epochs):
+        
+        # Train
         train_losses = train_epoch(
             ldm_model, autoencoder, text_encoder, tokenizer,
             train_loader, optimizer, scheduler, scaler,
             noise_scheduler, velocity_loss_fn, device, epoch
         )
         
-        print(f"\nEpoch {epoch+1}/{args.num_epochs} Summary:")
-        print(f"  Train Loss: {train_losses['total']:.6f}")
-        print(f"    Base Loss (L1): {train_losses['base']:.6f}")
-        print(f"    Vel. Loss (L1): {train_losses['vel']:.6f}")
-        
-        # (Chạy validation ở đây)
-        
-        # (Lưu checkpoint 'best_model.pt' và 'latest.pt')
+        # Validate
+        val_losses = validate(
+            ldm_model, autoencoder, text_encoder, tokenizer,
+            val_loader, noise_scheduler, velocity_loss_fn, device
+        )
+        val_loss = val_losses['total']
 
-if __name__ == '__main__':
-    main()
+        # Log
+        print(f"\n--- Epoch {epoch+1}/{args.num_epochs} Summary ---")
+        print(f"  Train Loss: {train_losses['total']:.6f} (Base: {train_losses['base']:.6f}, Vel: {train_losses['vel']:.6f})")
+        print(f"  Valid Loss: {val_losses['total']:.6f} (Base: {val_losses['base']:.6f}, Vel: {val_losses['vel']:.6f})")
+        print(f"  LR: {optimizer.param_groups[0]['lr']:.2e}")
+        
+        # --- LOGIC LƯU CHECKPOINT ---
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': ldm_model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler

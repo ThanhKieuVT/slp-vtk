@@ -1,7 +1,12 @@
 # Tên file: inference.py
+# === ĐÃ CẬP NHẬT CHO mCLIP (XLM-R) ===
+
 import torch
-from transformers import CLIPTextModel, CLIPTokenizer
+# === THAY ĐỔI 1: Bỏ CLIP ===
+# from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import AutoModel, AutoTokenizer
 from diffusers import DDPMScheduler
+from tqdm import tqdm
 
 # (Import các model của chị)
 from models.autoencoder import Stage1Autoencoder
@@ -16,27 +21,33 @@ def generate_pose(
     target_seq_len=100
 ):
     device = ldm_model.device
+    max_len = tokenizer.model_max_length
     
     # 1. Chuẩn bị Text Embeddings (Cond và Uncond)
     text_inputs = tokenizer(
-        [prompt], padding="max_length", max_length=tokenizer.model_max_length, 
+        [prompt], padding="max_length", max_length=max_len, 
         truncation=True, return_tensors="pt"
     ).to(device)
     
     uncond_inputs = tokenizer(
-        [""], padding="max_length", max_length=tokenizer.model_max_length, 
+        [""], padding="max_length", max_length=max_len, 
         truncation=True, return_tensors="pt"
     ).to(device)
     
+    # === THAY ĐỔI 2: Dùng .last_hidden_state (cho XLM-R) ===
     cond_embeddings = text_encoder(
         text_inputs.input_ids,
         attention_mask=text_inputs.attention_mask
-    )[0]
+    ).last_hidden_state
     
     uncond_embeddings = text_encoder(
         uncond_inputs.input_ids,
         attention_mask=uncond_inputs.attention_mask
-    )[0]
+    ).last_hidden_state
+
+    # Lấy attention masks cho LDM model
+    cond_text_mask = text_inputs.attention_mask
+    uncond_text_mask = uncond_inputs.attention_mask
     
     # 2. Chuẩn bị noise z_T (noise thuần)
     scheduler = DDPMScheduler(
@@ -45,32 +56,35 @@ def generate_pose(
     )
     scheduler.set_timesteps(num_inference_steps)
     
-    z_t = torch.randn((1, target_seq_len, ldm_model.latent_dim), device=device)
+    # Lấy latent_dim từ model một cách an toàn
+    latent_dim = ldm_model.latent_dim 
+    z_t = torch.randn((1, target_seq_len, latent_dim), device=device)
     
     # 3. Vòng lặp khử nhiễu (Denoising loop)
     for t in tqdm(scheduler.timesteps, desc="Sampling"):
         
         # 4. Chạy model 2 lần (Cond + Uncond)
-        
-        # Mở rộng z_t để chạy 2 mẫu song song
         latent_model_input = torch.cat([z_t] * 2)
         
-        # Mở rộng text
+        # Mở rộng text embeddings
         text_embed_input = torch.cat([uncond_embeddings, cond_embeddings])
         
-        # Mask (nếu có, ở đây ví dụ không cần)
+        # === THAY ĐỔI 3: Thêm text_mask vào LDM ===
+        text_mask_input = torch.cat([uncond_text_mask, cond_text_mask])
+        text_padding_mask = ~text_mask_input.bool() # True = ignore
         
         noise_pred = ldm_model(
             latent_model_input,
             t.repeat(2),
-            text_embed_input
+            text_embed_input,
+            text_mask=text_padding_mask,
+            pose_mask=None # Khi inference, pose_mask là None
         )
         
         # Tách kết quả
         noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
         
         # 5. Kỹ thuật: Classifier-Free Guidance (CFG)
-        # noise_pred = uncond + w * (cond - uncond)
         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
         
         # 6. Bước khử nhiễu
