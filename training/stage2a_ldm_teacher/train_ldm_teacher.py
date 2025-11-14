@@ -24,12 +24,12 @@ from diffusers import DDPMScheduler
 CFG_PROBABILITY = 0.1
 GRAD_ACCUMULATION_STEPS = 4
 W_VELOCITY_LOSS = 0.05
-
+ 
 def train_epoch(
-    ldm_model, autoencoder, text_encoder,
+    ldm_model, autoencoder, text_encoder, tokenizer,
     dataloader, optimizer, scheduler, scaler,
     noise_scheduler, velocity_loss_fn, 
-    null_text_embeddings, # <<< SỬA 1: Nhận tensor từ main
+    null_text_embeddings, # <<< THÊM CÁI NÀY VÀO
     device, epoch
 ):
     ldm_model.train()
