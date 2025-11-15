@@ -23,7 +23,7 @@ from diffusers import DDPMScheduler
 # --- Cấu hình các "Bí kíp" SOTA ---
 CFG_PROBABILITY = 0.1
 GRAD_ACCUMULATION_STEPS = 4
-W_VELOCITY_LOSS = 0.05
+W_VELOCITY_LOSS = 0.001
 
 def train_epoch(
     ldm_model, autoencoder, text_encoder, tokenizer,
