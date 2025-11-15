@@ -1,5 +1,5 @@
 # Tên file: train_ldm_teacher.py
-# === PHIÊN BẢN FINAL ULTRA-CLEAN (TRAIN + VAL RECON L1, FIX SEED) ===
+# === PHIÊN BẢN FINAL (NÂNG CẤP LÕI LÊN MAMBA) ===
 
 import os
 import argparse
@@ -12,7 +12,9 @@ from tqdm import tqdm
 
 from utils.data_loader import SignLanguageDataset, collate_fn
 from models.autoencoder import UnifiedPoseAutoencoder
-from models.ldm_denoiser import LDM_TransformerDenoiser
+# === SỬA DÒNG 1 ===
+from models.ldm_denoiser_mamba import LDM_Mamba_Denoiser # Đã đổi sang Mamba
+# ==================
 from models.losses import VelocityLoss
 from transformers import BertModel, BertTokenizer
 from diffusers import DDPMScheduler
@@ -237,8 +239,10 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True)
 
     # LDM
-    ldm_model = LDM_TransformerDenoiser(latent_dim=args.latent_dim, text_embed_dim=args.text_embed_dim,
-                                        hidden_dim=args.text_embed_dim, num_layers=args.num_layers, num_heads=12).to(device)
+    # === SỬA DÒNG 2 ===
+    ldm_model = LDM_Mamba_Denoiser(latent_dim=args.latent_dim, text_embed_dim=args.text_embed_dim,
+                                  hidden_dim=args.text_embed_dim, num_layers=args.num_layers, num_heads=12).to(device)
+    # ==================
 
     # Noise scheduler & losses
     noise_scheduler = DDPMScheduler(num_train_timesteps=1000, beta_schedule='squaredcos_cap_v2')
