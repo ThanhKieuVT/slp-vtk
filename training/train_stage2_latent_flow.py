@@ -197,7 +197,7 @@ def main():
     optimizer = torch.optim.AdamW(flow_matcher.parameters(), lr=args.learning_rate, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
     
-    # === 5. RESUME LOGIC (FIXED) ===
+    # === 5. RESUME LOGIC (SAFE FIX) ===
     start_epoch = 0
     best_val_loss = float('inf')
 
@@ -212,22 +212,37 @@ def main():
         print(f"♻️ Resuming from {args.resume_from}...")
         ckpt = torch.load(args.resume_from, map_location=device)
         
-        # Load Model & Optimizer
+        # 1. Load Model (Bắt buộc)
         flow_matcher.load_state_dict(ckpt['model_state_dict'])
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        print("✅ Loaded Model weights.")
+
+        # 2. Load Optimizer (An toàn: Có thì load, không thì thôi)
+        if 'optimizer_state_dict' in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                print("✅ Loaded Optimizer state.")
+            except Exception as e:
+                print(f"⚠️ Không thể load Optimizer (Lỗi version hoặc params). Sẽ khởi tạo mới. Lỗi: {e}")
+        else:
+            print("⚠️ Checkpoint cũ thiếu 'optimizer_state_dict'. Optimizer sẽ chạy lại từ đầu.")
         
-        # Load Scheduler (QUAN TRỌNG ĐỂ ĐÚNG LR)
+        # 3. Load Scheduler (An toàn)
         if 'scheduler_state_dict' in ckpt:
             scheduler.load_state_dict(ckpt['scheduler_state_dict'])
             
-        # Load Epoch & Best Loss (QUAN TRỌNG ĐỂ KHÔNG GHI ĐÈ BEST MODEL)
-        start_epoch = ckpt['epoch'] + 1
+        # 4. Load Epoch & Best Loss
+        # Nếu checkpoint cũ không có key 'epoch', mặc định là 0
+        if 'epoch' in ckpt:
+            start_epoch = ckpt['epoch'] + 1
+        else:
+            print("⚠️ Checkpoint không có thông tin epoch. Bắt đầu từ epoch 0.")
+
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
         latent_scale_factor = ckpt.get('latent_scale_factor', latent_scale_factor)
         
-        print(f"✅ Resumed at Epoch: {start_epoch}")
-        print(f"✅ Best Val Loss saved: {best_val_loss:.4f}")
-        print(f"✅ Scale Factor: {latent_scale_factor:.6f}")
+        print(f"⏩ Resuming at Epoch: {start_epoch}")
+        print(f"ℹ️ Current Best Val Loss: {best_val_loss:.4f}")
+        print(f"ℹ️ Scale Factor: {latent_scale_factor:.6f}")
 
     # 6. Loop
     for epoch in range(start_epoch, args.num_epochs):
