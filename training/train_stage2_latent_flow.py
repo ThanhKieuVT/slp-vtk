@@ -14,7 +14,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
-
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 # --- FIX PATH ---
 sys.path.append(os.getcwd()) 
 # ----------------
@@ -194,9 +194,15 @@ def main():
             use_sync_guidance=args.use_sync_guidance
         ).to(device)
     
-    optimizer = torch.optim.AdamW(flow_matcher.parameters(), lr=args.learning_rate, weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
-    
+    optimizer = torch.optim.AdamW(flow_matcher.parameters(), lr=args.learning_rate, weight_decay=0.005)
+    #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
+    scheduler = ReduceLROnPlateau(
+    optimizer, 
+    mode='min', 
+    factor=0.5,     # Giảm LR đi 1/2
+    patience=10,    # Nếu Val Loss không giảm sau 10 epoch
+    verbose=True
+)
     # === 5. RESUME LOGIC (SAFE FIX) ===
     start_epoch = 0
     best_val_loss = float('inf')
@@ -248,7 +254,7 @@ def main():
     for epoch in range(start_epoch, args.num_epochs):
         train_metrics, avg_train_loss = train_epoch(flow_matcher, encoder, train_loader, optimizer, device, epoch, latent_scale_factor)
         val_loss = validate(flow_matcher, encoder, val_loader, device, latent_scale_factor)
-        scheduler.step()
+        scheduler.step(val_loss)
         
         print(f"Epoch {epoch+1} | Train: {avg_train_loss:.6f} | Val: {val_loss:.6f}")
         
