@@ -197,13 +197,24 @@ def main():
             use_sync_guidance=args.use_sync_guidance
         ).to(device)
     
+    # ...
     # CHỈNH SỬA: Tăng weight_decay nhẹ để làm mượt hàm loss
-    optimizer = torch.optim.AdamW(flow_matcher.parameters(), lr=args.learning_rate, weight_decay=0.01) # Tăng nhẹ từ 0.005 lên 0.01
-    # scheduler ReduceLROnPlateau đã được thiết lập tốt
+    optimizer = torch.optim.AdamW(flow_matcher.parameters(), lr=args.learning_rate, weight_decay=0.01)
 
+    # 📌 VỊ TRÍ CHÍNH XÁC ĐỂ KHỞI TẠO SCHEDULER
+    scheduler = ReduceLROnPlateau(
+        optimizer, 
+        mode='min', 
+        factor=0.5,     # Giảm LR đi 1/2
+        patience=10,    # Nếu Val Loss không giảm sau 10 epoch
+        verbose=True
+    )
+    # 📌
+    
     # === 5. RESUME LOGIC (SAFE FIX) ===
     start_epoch = 0
     best_val_loss = float('inf')
+# ... (Phần còn lại của code resume sẽ hoạt động)
 
     # Tự động tìm latest.pt nếu không truyền resume_from
     if args.resume_from is None:
