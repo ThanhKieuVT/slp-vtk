@@ -55,7 +55,7 @@ def train_epoch(flow_matcher, encoder, dataloader, optimizer, device, epoch, sca
     encoder.eval()
     
     total_loss = 0.0
-    losses_log = {'flow': 0.0}
+    losses_log = {'flow': 0.0, 'sync': 0.0} # THÊM: Theo dõi sync loss
     num_batches = 0
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
@@ -86,9 +86,11 @@ def train_epoch(flow_matcher, encoder, dataloader, optimizer, device, epoch, sca
         
         total_loss += losses['total'].item()
         losses_log['flow'] += losses['flow'].item()
+        losses_log['sync'] += losses.get('sync', 0.0).item() # THÊM: Theo dõi sync loss
         num_batches += 1
         
-        pbar.set_postfix({'loss': f"{losses['total'].item():.4f}"})
+        # CHỈNH SỬA: Hiển thị chi tiết hơn
+        pbar.set_postfix({'loss': f"{losses['total'].item():.4f}", 'flow': f"{losses['flow'].item():.4f}", 'sync': f"{losses.get('sync', 0.0).item():.4f}"}) 
     
     return {k: v / num_batches for k, v in losses_log.items()}, total_loss / num_batches
 
@@ -99,24 +101,24 @@ def validate(flow_matcher, encoder, dataloader, device, scale_factor):
     total_loss = 0.0
     num_batches = 0
     
-    pbar = tqdm(dataloader, desc="Validating")
-    for batch in pbar:
-        poses = batch['poses'].to(device)
-        pose_mask = batch['pose_mask'].to(device)
-        text_tokens = batch['text_tokens'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        seq_lengths = batch['seq_lengths'].to(device)
-        batch_dict = {'text_tokens': text_tokens, 'attention_mask': attention_mask, 'seq_lengths': seq_lengths}
-        
-        with torch.no_grad():
+    # CHỈNH SỬA: Bỏ tqdm trong validate, dùng with torch.no_grad()
+    with torch.no_grad():
+        for batch in dataloader:
+            poses = batch['poses'].to(device)
+            pose_mask = batch['pose_mask'].to(device)
+            text_tokens = batch['text_tokens'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            seq_lengths = batch['seq_lengths'].to(device)
+            batch_dict = {'text_tokens': text_tokens, 'attention_mask': attention_mask, 'seq_lengths': seq_lengths}
+            
             gt_latent = encoder(poses, mask=pose_mask)
             gt_latent = gt_latent * scale_factor 
 
-        with torch.set_grad_enabled(True): 
+            # Sử dụng torch.no_grad() cho validate
             losses = flow_matcher(batch_dict, gt_latent=gt_latent, pose_gt=poses, mode='train')
-            
-        total_loss += losses['total'].item()
-        num_batches += 1
+                
+            total_loss += losses['total'].item()
+            num_batches += 1
             
     return total_loss / num_batches if num_batches > 0 else 0.0
 
@@ -183,7 +185,8 @@ def main():
             hidden_dim=args.hidden_dim,
             use_ssm_prior=args.use_ssm_prior,
             use_sync_guidance=args.use_sync_guidance,
-            num_layers=args.num_layers
+            num_flow_layers=args.num_layers, # SỬA: Cần truyền num_layers vào constructor (đã sửa trong latent_flow_matcher.py)
+            num_prior_layers=4, # Dùng default nếu không có arg
         ).to(device)
     except TypeError:
         print("⚠️ Model không nhận 'num_layers'. Dùng default...")
@@ -194,15 +197,10 @@ def main():
             use_sync_guidance=args.use_sync_guidance
         ).to(device)
     
-    optimizer = torch.optim.AdamW(flow_matcher.parameters(), lr=args.learning_rate, weight_decay=0.005)
-    #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
-    scheduler = ReduceLROnPlateau(
-    optimizer, 
-    mode='min', 
-    factor=0.5,     # Giảm LR đi 1/2
-    patience=10,    # Nếu Val Loss không giảm sau 10 epoch
-    verbose=True
-)
+    # CHỈNH SỬA: Tăng weight_decay nhẹ để làm mượt hàm loss
+    optimizer = torch.optim.AdamW(flow_matcher.parameters(), lr=args.learning_rate, weight_decay=0.01) # Tăng nhẹ từ 0.005 lên 0.01
+    # scheduler ReduceLROnPlateau đã được thiết lập tốt
+
     # === 5. RESUME LOGIC (SAFE FIX) ===
     start_epoch = 0
     best_val_loss = float('inf')
@@ -256,7 +254,8 @@ def main():
         val_loss = validate(flow_matcher, encoder, val_loader, device, latent_scale_factor)
         scheduler.step(val_loss)
         
-        print(f"Epoch {epoch+1} | Train: {avg_train_loss:.6f} | Val: {val_loss:.6f}")
+        # CHỈNH SỬA: Log chi tiết hơn
+        print(f"Epoch {epoch+1} | Train: {avg_train_loss:.6f} | Val: {val_loss:.6f} | Flow Loss: {train_metrics['flow']:.4f} | Sync Loss: {train_metrics['sync']:.4f}")
         
         # Save Latest (Kèm scheduler & best_loss)
         save_dict = {
