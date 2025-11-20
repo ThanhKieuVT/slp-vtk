@@ -187,8 +187,7 @@ class LatentFlowMatcher(nn.Module):
         
         # --- Losses ---
         # SỬ DỤNG V_PRED_NO_GUIDANCE (v_pred_for_loss) ĐỂ TÍNH FLOW LOSS
-        flow_loss = self.flow_loss_fn(v_pred_for_loss, v_gt, mask=mask)
-        
+        flow_loss = self.flow_loss_fn(v_pred_no_guidance, v_gt, mask=mask)        
         prior_loss = torch.tensor(0.0, device=device)
         if v_prior is not None:
             # Huấn luyện v_flow để match v_prior
