@@ -43,22 +43,12 @@ class SyncGuidanceHead(nn.Module):
     def forward(self, latent, mask=None):
         """
         Predict sync quality (correlation) từ latent
-        
-        Args:
-            latent: [B, T, latent_dim]
-            mask: [B, T] - valid mask
-        
-        Returns:
-            corr_pred: [B, T] - predicted correlation
         """
-        # Project to manual and NMM features
         manual_feat = self.manual_proj(latent)  # [B, T, hidden_dim//2]
         nmm_feat = self.nmm_proj(latent)  # [B, T, hidden_dim//2]
         
-        # Concatenate
         combined = torch.cat([manual_feat, nmm_feat], dim=-1)  # [B, T, hidden_dim]
         
-        # Predict correlation
         corr_pred = self.corr_predictor(combined).squeeze(-1)  # [B, T]
         
         if mask is not None:
@@ -68,47 +58,37 @@ class SyncGuidanceHead(nn.Module):
     
     def compute_loss(self, latent, pose_gt, mask=None):
         """
-        Compute sync loss: -correlation + lag_penalty
+        Compute sync score (correlation) từ pose_gt
         
         Args:
-            latent: [B, T, latent_dim] - predicted latent
+            latent: [B, T, latent_dim] - (Dùng để lấy device)
             pose_gt: [B, T, 214] - ground truth pose
-            mask: [B, T] - valid mask
         
         Returns:
-            loss: [B] - Tensor 1D chứa loss cho mỗi sample
+            losses: [B] - Tensor 1D chứa negative correlation (loss) cho mỗi sample
         """
-        # Decode latent to pose (cần decoder, sẽ pass từ outside)
-        # Ở đây chỉ compute correlation từ pose_gt
+        manual_gt = pose_gt[:, :, :150]
+        nmm_gt = pose_gt[:, :, 150:]
         
-        # Extract manual and NMM from pose
-        manual_gt = pose_gt[:, :, :150]  # [B, T, 150]
-        nmm_gt = pose_gt[:, :, 150:]  # [B, T, 64]
-        
-        # Flatten
         B, T, _ = manual_gt.shape
-        if mask is not None:
-            valid_mask = mask
-        else:
-            valid_mask = torch.ones(B, T, device=manual_gt.device, dtype=torch.bool)
+        device = latent.device
         
-        # Compute correlation per sample
+        if mask is None:
+             mask = torch.ones(B, T, device=device, dtype=torch.bool)
+        
         losses = []
         for i in range(B):
-            valid = valid_mask[i]
+            valid = mask[i]
             if valid.sum() < 2:
-                # === SỬA LỖI 1: Thêm tensor 0.0 để giữ shape [B] ===
-                losses.append(torch.tensor(0.0, device=latent.device))
+                losses.append(torch.tensor(0.0, device=device))
                 continue
             
-            # === (Phần này code gốc của chị đã đúng) ===
-            manual_signal = manual_gt[i, valid].mean(dim=-1) # [T_valid]
-            nmm_signal = nmm_gt[i, valid].mean(dim=-1)    # [T_valid]
+            manual_signal = manual_gt[i, valid].mean(dim=-1)
+            nmm_signal = nmm_gt[i, valid].mean(dim=-1)
             
-            # Normalize
+            # Normalize (zero-mean)
             manual_flat = (manual_signal - manual_signal.mean()) / (manual_signal.std() + 1e-6)
             nmm_flat = (nmm_signal - nmm_signal.mean()) / (nmm_signal.std() + 1e-6)
-            # === KẾT THÚC SỬA LỖI ===
 
             # Correlation
             corr = (manual_flat * nmm_flat).mean()
@@ -118,40 +98,31 @@ class SyncGuidanceHead(nn.Module):
             losses.append(loss)
         
         if len(losses) == 0:
-            # Trả về tensor rỗng hoặc tensor 0.0 tùy logic, 
-            # nhưng vì MSELoss sẽ chạy nên trả về tensor 0.0 an toàn hơn
-            return torch.tensor(0.0, device=latent.device) 
+            return torch.tensor(0.0, device=device).unsqueeze(0) # Đảm bảo shape [1]
         
-        # === SỬA LỖI 2: Bỏ .mean() để trả về shape [B] ===
-        return torch.stack(losses)
+        return torch.stack(losses) # Shape [B]
     
     def compute_gradient(self, latent, pose_gt, mask=None):
         """
         Compute gradient for guidance: ∇_z L_sync
-        
-        Args:
-            latent: [B, T, latent_dim]
-            pose_gt: [B, T, 214]
-            mask: [B, T]
-        
-        Returns:
-            grad: [B, T, latent_dim] - gradient
         """
         # Cần bật grad trên latent để tính
         latent_grad = latent.detach().requires_grad_(True)
         
-        # compute_loss giờ trả về [B]
+        # compute_loss trả về [B]
+        # Loss ở đây là negative correlation (L_sync)
         loss_per_sample = self.compute_loss(latent_grad, pose_gt, mask)
         
-        # Mean để lấy scalar loss
+        # Mean để lấy scalar loss cho autograd
         loss = loss_per_sample.mean()
 
         # Tính gradient
         grad = torch.autograd.grad(
             loss, 
             latent_grad, 
-            grad_outputs=torch.ones_like(loss), # Cần cho scalar loss
-            create_graph=False
+            grad_outputs=torch.ones_like(loss), 
+            create_graph=False,
+            retain_graph=False # Dùng False vì không cần cho backward tiếp
         )[0]
         
         return grad

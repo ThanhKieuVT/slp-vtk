@@ -10,8 +10,6 @@ from .sync_guidance import SyncGuidanceHead
 class LatentFlowMatcher(nn.Module):
     """
     Latent Flow Matcher với SSM Prior và Sync Guidance
-    
-    Velocity: v(z,t|x) = v_flow(z,t|x) + λ(t) * v_prior(z,t) - γ * ∇_z L_sync
     """
     
     def __init__(
@@ -139,37 +137,29 @@ class LatentFlowMatcher(nn.Module):
         else:
             v_pred_no_guidance = v_flow
         
-        # *** BẮT ĐẦU CHỈNH SỬA CHÍNH ***
-        
-        # Dùng v_pred_no_guidance để tính Flow Loss
-        flow_loss_pred = v_pred_no_guidance 
-        
+        # --- Sync Guidance ---
         sync_loss_train = torch.tensor(0.0, device=device)
         
-        # --- Sync Guidance ---
         if self.use_sync_guidance and self.sync_head is not None and pose_gt is not None:
             
-            # --- Tính Sync Loss (Regulization Term) ---
-            # Chạy forward để tính sync_score (vẫn cần grad cho total_loss)
-            sync_score_pred = self.sync_head(latent_t_grad, mask)
+            # 1. Tính Sync Score (từ latent_t_grad)
+            sync_score_pred = self.sync_head(latent_t_grad, mask) # [B, T]
             
             with torch.no_grad():
-                # Target score/loss từ ground truth
-                sync_loss_target = self.sync_head.compute_loss(latent_t.detach(), pose_gt, mask)
+                # 2. Target loss (negative correlation) từ ground truth
+                sync_loss_target = self.sync_head.compute_loss(latent_t.detach(), pose_gt, mask) # [B]
             
-            # Tính toán mean score/loss trên mỗi sample
+            # 3. Tính Sync Loss (Regulization Term): Huấn luyện SyncHead dự đoán đúng target
             masked_score_pred = sync_score_pred * mask.float()
             per_frame_sum = masked_score_pred.sum(dim=1)
             frame_counts = mask.sum(dim=1).clamp(min=1).float()
             pred_mean = per_frame_sum / frame_counts # Shape [B]
             
-            # Sync Loss: Huấn luyện SyncHead dự đoán đúng sync_loss_target
+            # Sync Loss: Huấn luyện SyncHead (minimize MSE giữa mean score pred và target loss)
             sync_loss_train = self.sync_loss_fn(pred_mean, sync_loss_target.detach())
             
             # --- TÍNH V_PRED (vận tốc có Guidance - CHỈ DÙNG CHO INFERENCE) ---
-            
-            # Tính gradient của Sync Score (được dùng để steer v_pred trong inference)
-            # Guidance loss: Maximizing the sync score, hence the negative mean
+            # Guidance loss: Maximizing the sync score, hence the negative mean score
             guidance_loss = - pred_mean.mean() 
             
             sync_grad = torch.autograd.grad(
@@ -179,21 +169,20 @@ class LatentFlowMatcher(nn.Module):
                 retain_graph=False 
             )[0]
             
-            # V_PRED CÓ GUIDANCE (Chỉ dùng cho logging hoặc debug, không dùng cho Flow Loss)
+            # V_PRED CÓ GUIDANCE
             v_pred = v_pred_no_guidance - self.gamma_guidance * sync_grad.detach() 
         else:
-             # Nếu không dùng guidance, v_pred = v_pred_no_guidance
             v_pred = v_pred_no_guidance
         
         # --- Losses ---
-        # SỬ DỤNG V_PRED_NO_GUIDANCE (v_pred_for_loss) ĐỂ TÍNH FLOW LOSS
+        # Flow Loss: Dùng V_PRED_NO_GUIDANCE (core flow model)
         flow_loss = self.flow_loss_fn(v_pred_no_guidance, v_gt, mask=mask)        
         prior_loss = torch.tensor(0.0, device=device)
         if v_prior is not None:
-            # Huấn luyện v_flow để match v_prior
+            # Prior Loss: Regularization v_flow để match v_prior
             prior_loss = self.prior_reg_fn(v_flow, v_prior.detach())
         
-        # Total Loss: Flow Loss là thành phần chính, Sync Loss là Regularization
+        # Total Loss
         total_loss = flow_loss + self.W_PRIOR * prior_loss + self.W_SYNC * sync_loss_train
         
         return {
@@ -204,11 +193,12 @@ class LatentFlowMatcher(nn.Module):
         }
     
     def _inference_forward(self, batch, text_features, num_steps=50):
-        # Hàm inference không cần chỉnh sửa vì nó đã đúng logic sử dụng guidance
-        # (v_pred = v_pred_no_guidance - gamma_guidance * sync_grad.detach())
+        # Hàm này giữ nguyên
         device = text_features.device
         B = text_features.shape[0]
         T = batch.get('target_length', 50)
+        
+        # --- FIX: Đảm bảo T là một giá trị scalar
         if isinstance(T, torch.Tensor):
             T = T.max().item()
         
@@ -239,9 +229,16 @@ class LatentFlowMatcher(nn.Module):
             
             # Sync guidance (inference)
             if self.use_sync_guidance and self.sync_head is not None and 0.2 < t_val < 0.8:
+                
+                # Tính gradient của negative sync score (Maximize Score)
                 sync_score_pred = self.sync_head(latent_grad, mask)
                 masked_score_pred = sync_score_pred * mask.float()
-                per_sample_score = masked_score_pred.sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+                
+                # Tính mean score trên mỗi sample
+                per_frame_sum = masked_score_pred.sum(dim=1)
+                frame_counts = mask.sum(dim=1).clamp(min=1).float()
+                per_sample_score = per_frame_sum / frame_counts
+                
                 guidance_loss = - per_sample_score.mean()
                 
                 sync_grad = torch.autograd.grad(

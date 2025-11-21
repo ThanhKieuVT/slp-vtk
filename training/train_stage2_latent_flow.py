@@ -1,10 +1,6 @@
 """
 Training Script: Stage 2 Latent Flow Matching (Direct Training)
-Fixed by Gemini: 
-- Added 'sys.path' fix for module imports
-- Added '--num_layers' argument to fix CLI error
-- Auto-calculates latent scale factor
-- FIXED RESUME LOGIC (Load best_val_loss & Scheduler)
+FIXED: Corrected weight_decay to 0.05 and added lambda_anneal argument.
 """
 import os
 import sys
@@ -55,7 +51,7 @@ def train_epoch(flow_matcher, encoder, dataloader, optimizer, device, epoch, sca
     encoder.eval()
     
     total_loss = 0.0
-    losses_log = {'flow': 0.0}
+    losses_log = {'flow': 0.0, 'sync': 0.0} # Thêm sync vào log
     num_batches = 0
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
@@ -86,13 +82,16 @@ def train_epoch(flow_matcher, encoder, dataloader, optimizer, device, epoch, sca
         
         total_loss += losses['total'].item()
         losses_log['flow'] += losses['flow'].item()
+        losses_log['sync'] += losses.get('sync', torch.tensor(0.0)).item() # Lấy sync loss nếu có
         num_batches += 1
         
-        pbar.set_postfix({'loss': f"{losses['total'].item():.4f}"})
+        pbar.set_postfix({'loss': f"{losses['total'].item():.4f}", 
+                          'flow': f"{losses['flow'].item():.4f}",
+                          'sync': f"{losses.get('sync', torch.tensor(0.0)).item():.4f}"})
     
     return {k: v / num_batches for k, v in losses_log.items()}, total_loss / num_batches
 
-# === 3. HÀM VALIDATE ===
+# === 4. HÀM VALIDATE ===
 def validate(flow_matcher, encoder, dataloader, device, scale_factor):
     flow_matcher.eval()
     encoder.eval()
@@ -112,6 +111,7 @@ def validate(flow_matcher, encoder, dataloader, device, scale_factor):
             gt_latent = encoder(poses, mask=pose_mask)
             gt_latent = gt_latent * scale_factor 
 
+        # BẬT grad cho validation để tính Sync Loss chính xác
         with torch.set_grad_enabled(True): 
             losses = flow_matcher(batch_dict, gt_latent=gt_latent, pose_gt=poses, mode='train')
             
@@ -120,7 +120,7 @@ def validate(flow_matcher, encoder, dataloader, device, scale_factor):
             
     return total_loss / num_batches if num_batches > 0 else 0.0
 
-# === 4. MAIN ===
+# === 5. MAIN ===
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_dir', type=str, required=True)
@@ -150,7 +150,6 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if torch.backends.mps.is_available() and torch.backends.mps.is_built():
         print("🍎 Phát hiện chip Apple Silicon (MPS).")
-        # device = torch.device('mps') # Uncomment nếu muốn dùng MPS
     
     os.makedirs(args.output_dir, exist_ok=True)
     
@@ -183,27 +182,30 @@ def main():
             hidden_dim=args.hidden_dim,
             use_ssm_prior=args.use_ssm_prior,
             use_sync_guidance=args.use_sync_guidance,
-            num_layers=args.num_layers
+            num_flow_layers=args.num_layers,
+            lambda_anneal=True # Thêm tham số này để khớp với logic trong LatentFlowMatcher
         ).to(device)
     except TypeError:
-        print("⚠️ Model không nhận 'num_layers'. Dùng default...")
+        print("⚠️ Model không nhận đủ tham số. Dùng default...")
         flow_matcher = LatentFlowMatcher(
             latent_dim=args.latent_dim,
             hidden_dim=args.hidden_dim,
             use_ssm_prior=args.use_ssm_prior,
-            use_sync_guidance=args.use_sync_guidance
+            use_sync_guidance=args.use_sync_guidance,
+            lambda_anneal=True
         ).to(device)
     
+    # 5. FIX weight_decay TẠI ĐÂY
     optimizer = torch.optim.AdamW(flow_matcher.parameters(), lr=args.learning_rate, weight_decay=0.05)
-    #scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs)
+    
     scheduler = ReduceLROnPlateau(
-    optimizer, 
-    mode='min', 
-    factor=0.5,     # Giảm LR đi 1/2
-    patience=10,    # Nếu Val Loss không giảm sau 10 epoch
-    verbose=True
-)
-    # === 5. RESUME LOGIC (SAFE FIX) ===
+        optimizer, 
+        mode='min', 
+        factor=0.5,     # Giảm LR đi 1/2
+        patience=10,    # Nếu Val Loss không giảm sau 10 epoch
+        verbose=True
+    )
+    # === 6. RESUME LOGIC ===
     start_epoch = 0
     best_val_loss = float('inf')
 
@@ -228,21 +230,16 @@ def main():
                 optimizer.load_state_dict(ckpt['optimizer_state_dict'])
                 print("✅ Loaded Optimizer state.")
             except Exception as e:
-                print(f"⚠️ Không thể load Optimizer (Lỗi version hoặc params). Sẽ khởi tạo mới. Lỗi: {e}")
-        else:
-            print("⚠️ Checkpoint cũ thiếu 'optimizer_state_dict'. Optimizer sẽ chạy lại từ đầu.")
+                print(f"⚠️ Không thể load Optimizer. Lỗi: {e}")
         
         # 3. Load Scheduler (An toàn)
         if 'scheduler_state_dict' in ckpt:
             scheduler.load_state_dict(ckpt['scheduler_state_dict'])
             
         # 4. Load Epoch & Best Loss
-        # Nếu checkpoint cũ không có key 'epoch', mặc định là 0
         if 'epoch' in ckpt:
             start_epoch = ckpt['epoch'] + 1
-        else:
-            print("⚠️ Checkpoint không có thông tin epoch. Bắt đầu từ epoch 0.")
-
+        
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
         latent_scale_factor = ckpt.get('latent_scale_factor', latent_scale_factor)
         
@@ -250,20 +247,20 @@ def main():
         print(f"ℹ️ Current Best Val Loss: {best_val_loss:.4f}")
         print(f"ℹ️ Scale Factor: {latent_scale_factor:.6f}")
 
-    # 6. Loop
+    # 7. Loop
     for epoch in range(start_epoch, args.num_epochs):
         train_metrics, avg_train_loss = train_epoch(flow_matcher, encoder, train_loader, optimizer, device, epoch, latent_scale_factor)
         val_loss = validate(flow_matcher, encoder, val_loader, device, latent_scale_factor)
         scheduler.step(val_loss)
         
-        print(f"Epoch {epoch+1} | Train: {avg_train_loss:.6f} | Val: {val_loss:.6f}")
+        print(f"Epoch {epoch+1} | Train: {avg_train_loss:.6f} | Val: {val_loss:.6f} | Flow Loss: {train_metrics['flow']:.6f} | Sync Loss: {train_metrics['sync']:.6f}")
         
         # Save Latest (Kèm scheduler & best_loss)
         save_dict = {
             'epoch': epoch,
             'model_state_dict': flow_matcher.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(), # Đã thêm dòng này
+            'scheduler_state_dict': scheduler.state_dict(),
             'latent_scale_factor': latent_scale_factor,
             'best_val_loss': best_val_loss
         }
@@ -272,7 +269,6 @@ def main():
         # Save Best
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            # Cập nhật best_val_loss vào save_dict trước khi lưu best_model
             save_dict['best_val_loss'] = best_val_loss 
             torch.save(save_dict, os.path.join(args.output_dir, 'best_model.pt'))
             print(f"🏆 New Best Model Saved! (Loss: {best_val_loss:.4f})")
