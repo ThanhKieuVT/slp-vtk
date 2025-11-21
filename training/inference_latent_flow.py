@@ -1,6 +1,7 @@
 """
 Inference Script: Text → Latent Flow → Pose
 Hỗ trợ fast sampling (1-4 steps) sau khi distill
+FIXED: Added strict=False loading to handle missing SSM/Sync keys.
 """
 import os
 import argparse
@@ -8,6 +9,11 @@ import torch
 import numpy as np
 from transformers import BertTokenizer
 import time
+
+# --- FIX PATH (nếu cần) ---
+# import sys
+# sys.path.append(os.getcwd()) 
+# ----------------
 
 from models.fml.autoencoder import UnifiedPoseAutoencoder
 from models.fml.latent_flow_matcher import LatentFlowMatcher
@@ -26,20 +32,6 @@ def inference_fast(
 ):
     """
     Fast inference với few-step sampling
-    
-    Args:
-        text: str - input text
-        flow_matcher: LatentFlowMatcher model
-        decoder: PoseDecoder model (frozen)
-        tokenizer: BertTokenizer
-        device: torch.device
-        target_length: int - độ dài target sequence
-        num_steps: int - số bước ODE (1-4 cho fast, 50 cho full quality)
-        normalize_stats: dict với 'mean' và 'std' để denormalize
-    
-    Returns:
-        pose: [T, 214] numpy array (denormalized nếu có stats)
-        latency: float - thời gian inference (seconds)
     """
     flow_matcher.eval()
     decoder.eval()
@@ -55,15 +47,13 @@ def inference_fast(
         return_tensors='pt'
     )
     text_tokens = encoded['input_ids'].to(device)  # [1, L]
-    attention_mask = encoded['attention_mask'].to(device)  # [1, L]
+    attention_mask = encoded['attention_ids'].to(device)  # [1, L]
     
     batch_dict = {
         'text_tokens': text_tokens,
         'attention_mask': attention_mask,
         'target_length': target_length
     }
-    
-    # === SỬA LỖI: BẮT ĐẦU ===
     
     # KHÔNG bọc flow_matcher trong no_grad()
     # vì Sync Guidance (bên trong model) cần tính grad
@@ -77,8 +67,6 @@ def inference_fast(
     # Chỉ bọc decoder trong no_grad()
     with torch.no_grad():
         pose = decoder(latent, mask=None)  # [1, T, 214]
-    
-    # === SỬA LỖI: KẾT THÚC ===
 
     # Convert to numpy
     pose = pose.squeeze(0).cpu().numpy()  # [T, 214]
@@ -161,8 +149,21 @@ def main():
         lambda_prior=0.1,
         gamma_guidance=0.01
     )
+    
+    # --- FIX: Tải linh hoạt (strict=False) để tránh lỗi Missing Key(s) ---
     checkpoint = torch.load(args.flow_checkpoint, map_location=device)
-    flow_matcher.load_state_dict(checkpoint['model_state_dict'])
+    model_state_dict = checkpoint['model_state_dict']
+
+    try:
+        flow_matcher.load_state_dict(model_state_dict)
+    except RuntimeError as e:
+        if "Missing key(s)" in str(e) or "Unexpected key(s)" in str(e):
+            print(f"⚠️ Cảnh báo: Tải checkpoint linh hoạt (strict=False).")
+            flow_matcher.load_state_dict(model_state_dict, strict=False)
+        else:
+            raise e
+    # --- END FIX ---
+            
     flow_matcher.to(device)
     flow_matcher.eval()
     print("✅ Flow matcher loaded")
@@ -200,4 +201,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

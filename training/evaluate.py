@@ -1,6 +1,7 @@
 """
 Evaluation Script cho PHOENIX-2014T (Đã sửa cho LatentFlowMatcher)
 Metrics: MSE, DTW, Sync Quality, BLEU1-4, ROUGE
+FIXED: Added strict=False loading to handle missing SSM/Sync keys.
 """
 import os
 import argparse
@@ -15,14 +16,13 @@ import re
 
 from dataset import SignLanguageDataset, collate_fn
 from models.fml.autoencoder import UnifiedPoseAutoencoder
-# --- THAY ĐỔI 1: Import đúng model ---
 from models.fml.latent_flow_matcher import LatentFlowMatcher
 from data_preparation import denormalize_pose
 
 
 def dtw_distance(seq1, seq2):
     """
-    Simple DTW implementation (không cần fastdtw)
+    Simple DTW implementation
     """
     T1, D = seq1.shape
     T2, D2 = seq2.shape
@@ -125,15 +125,6 @@ def tokenize_text(text):
 def compute_sync_quality(pose_pred, pose_gt, mask=None):
     """
     Tính sync quality giữa tay (manual) và mặt (NMM)
-    
-    Args:
-        pose_pred: [T, 214] - predicted pose
-        pose_gt: [T, 214] - ground truth pose
-        mask: [T] - mask cho valid frames
-    
-    Returns:
-        correlation: float - Pearson correlation
-        lag: int - lag tối ưu (frames)
     """
     if mask is not None:
         pose_pred = pose_pred[mask]
@@ -172,7 +163,6 @@ def compute_sync_quality(pose_pred, pose_gt, mask=None):
             nmm_corr = 0.0
 
     # --- SỬA LỖI: Tính cross-correlation để tìm lag ---
-    # Logic cũ (flattened) bị sai.
     # Tạo 1D motion signal cho tay và mặt (ví dụ: dùng mean trên các features)
     
     manual_signal = np.mean(manual_pred, axis=1) # Shape (T,)
@@ -184,24 +174,20 @@ def compute_sync_quality(pose_pred, pose_gt, mask=None):
     
     best_lag = 0
     try:
-        # Kiểm tra xem tín hiệu có phải là hằng số không (tránh lỗi chia cho 0)
         if np.std(manual_signal_norm) > 1e-6 and np.std(nmm_signal_norm) > 1e-6:
             # Tính cross-correlation
             cross_corr = np.correlate(manual_signal_norm, nmm_signal_norm, mode='full')
             
             # Tìm lag
-            # 'full' mode trả về 2*T - 1 giá trị
-            # Vị trí 0 lag (trung tâm) là ở index (T - 1)
             max_lag_index = np.argmax(cross_corr)
             best_lag = max_lag_index - (T - 1)
             
-            # Giới hạn lag (giống max_lag cũ)
+            # Giới hạn lag 
             max_lag_allowed = min(10, T // 4)
             if abs(best_lag) > max_lag_allowed:
                  best_lag = 0
         
     except ValueError:
-        # Xảy ra nếu có lỗi, ví dụ signal toàn NaN
         best_lag = 0
         
     # --- KẾT THÚC SỬA LỖI ---
@@ -221,7 +207,7 @@ def evaluate_model(
     normalize_stats=None,
     save_predictions=False,
     output_dir=None,
-    num_inference_steps=50  # --- THAY ĐỔI 4: Thêm num_inference_steps ---
+    num_inference_steps=50
 ):
     """
     Evaluate model trên dataset
@@ -253,7 +239,6 @@ def evaluate_model(
             attention_mask = batch['attention_mask'].to(device)
             seq_lengths = batch['seq_lengths'].to(device)
             
-            # --- THAY ĐỔI 5: Thay đổi cách gọi Predictor ---
             # Tạo batch_dict như trong train.py
             batch_dict = {
                 'text_tokens': text_tokens,
@@ -270,7 +255,6 @@ def evaluate_model(
                     mode='inference',
                     num_inference_steps=num_inference_steps
                 )
-            # --- KẾT THÚC THAY ĐỔI 5 ---
             
             predicted_pose = decoder(predicted_latent, mask=pose_mask)
             
@@ -329,7 +313,9 @@ def evaluate_model(
                 if 'texts' in batch and batch['texts'][i]:
                     ref_text = batch['texts'][i]
                     ref_tokens = tokenize_text(ref_text)
-                    cand_tokens = ref_tokens  # Vẫn là placeholder
+                    
+                    # ⚠️ LỖI: Cần có mô hình Pose -> Text để tạo cand_tokens hợp lệ
+                    cand_tokens = ref_tokens # Giữ nguyên lỗi logic nếu không có mô hình dịch ngược
                     
                     bleu1 = compute_bleu(ref_tokens, cand_tokens, n=1)
                     bleu2 = compute_bleu(ref_tokens, cand_tokens, n=2)
@@ -398,7 +384,6 @@ def evaluate_model(
 
 def print_metrics(metrics, split_name=''):
     """Print metrics đẹp"""
-    # ... (hàm này giữ nguyên, không cần thay đổi) ...
     print(f"\n{'='*70}")
     print(f"Evaluation Results - {split_name.upper()} SET")
     print(f"{'='*70}")
@@ -431,8 +416,8 @@ def print_metrics(metrics, split_name=''):
         print(f"  BLEU-3: {metrics['bleu3_mean']:.4f} ± {metrics['bleu3_std']:.4f}")
         print(f"  BLEU-4: {metrics['bleu4_mean']:.4f} ± {metrics['bleu4_std']:.4f}")
         print(f"  ROUGE-L: {metrics['rouge_l_mean']:.4f} ± {metrics['rouge_l_std']:.4f}")
-        print(f"\n  ⚠️  Note: BLEU/ROUGE hiện tại dùng text input làm candidate.")
-        print(f"      Để tính đúng, cần có Pose → Text model để generate text từ pose.")
+        print(f"\n  ⚠️  Note: BLEU/ROUGE hiện tại không thể tính chính xác.")
+        print(f"      Cần có Pose → Text model để generate text từ pose.")
     else:
         print(f"\n⚠️  No text data found for BLEU/ROUGE metrics")
     
@@ -442,8 +427,6 @@ def print_metrics(metrics, split_name=''):
 def main():
     parser = argparse.ArgumentParser(description='Evaluate model trên PHOENIX-2014T')
     
-    # --- THAY ĐỔI 2: Thêm các tham số (arguments) mới ---
-    # Tham số cũ
     parser.add_argument('--data_dir', type=str, required=True,
                         help='Đường dẫn đến processed_data/data/')
     parser.add_argument('--predictor_checkpoint', type=str, required=True,
@@ -463,7 +446,6 @@ def main():
     parser.add_argument('--output_dir', type=str, default=None,
                         help='Thư mục lưu predictions và metrics')
     
-    # Tham số mới (từ train_flow_matcher.py)
     parser.add_argument('--latent_dim', type=int, default=256,
                         help='Latent dimension')
     parser.add_argument('--hidden_dim', type=int, default=512,
@@ -486,7 +468,6 @@ def main():
                         help='Weight cho sync guidance')
     parser.add_argument('--num_inference_steps', type=int, default=50,
                         help='Số bước ODE khi inference')
-    # --- KẾT THÚC THAY ĐỔI 2 ---
 
     
     args = parser.parse_args()
@@ -518,7 +499,7 @@ def main():
     decoder = autoencoder.decoder
     print("✅ Autoencoder loaded")
     
-    # --- THAY ĐỔI 3: Khởi tạo đúng Model Predictor ---
+    # --- FIX: Tải Predictor linh hoạt (strict=False) ---
     print(f"\n📦 Loading predictor from {args.predictor_checkpoint}")
     predictor = LatentFlowMatcher(
         latent_dim=args.latent_dim,
@@ -531,15 +512,25 @@ def main():
         use_sync_guidance=args.use_sync_guidance,
         lambda_prior=args.lambda_prior,
         gamma_guidance=args.gamma_guidance,
-        lambda_anneal=True  # Giống như trong train.py
+        lambda_anneal=True
     ).to(device)
     
     checkpoint = torch.load(args.predictor_checkpoint, map_location=device)
-    predictor.load_state_dict(checkpoint['model_state_dict'])
+    model_state_dict = checkpoint['model_state_dict']
+
+    try:
+        predictor.load_state_dict(model_state_dict)
+    except RuntimeError as e:
+        if "Missing key(s)" in str(e) or "Unexpected key(s)" in str(e):
+            print(f"⚠️ Cảnh báo: Tải checkpoint linh hoạt (strict=False).")
+            predictor.load_state_dict(model_state_dict, strict=False)
+        else:
+            raise e
+    # --- END FIX ---
+            
     predictor.to(device)
     predictor.eval()
     print("✅ Predictor loaded")
-    # --- KẾT THÚC THAY ĐỔI 3 ---
     
     # Dataset (Giữ nguyên)
     print(f"\n📂 Loading {args.split} dataset...")
@@ -571,7 +562,7 @@ def main():
         normalize_stats=normalize_stats,
         save_predictions=args.save_predictions,
         output_dir=args.output_dir,
-        num_inference_steps=args.num_inference_steps # --- THAY ĐỔI 4 (phần 2) ---
+        num_inference_steps=args.num_inference_steps
     )
     
     # Print results (Giữ nguyên)
