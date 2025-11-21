@@ -46,8 +46,10 @@ def inference_fast(
         truncation=True,
         return_tensors='pt'
     )
+    # inference_latent_flow.py, Dòng 49-50
     text_tokens = encoded['input_ids'].to(device)  # [1, L]
-    attention_mask = encoded['attention_ids'].to(device)  # [1, L]
+    attention_mask = encoded['attention_mask'].to(device)  # [1, L] 
+    #                ^^^^^^^^^^^^^^^^^^^^^^ ĐÃ SỬA
     
     batch_dict = {
         'text_tokens': text_tokens,
