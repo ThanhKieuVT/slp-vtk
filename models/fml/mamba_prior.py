@@ -1,5 +1,6 @@
 """
 Mamba/SSM Prior: Học drift có cấu trúc thời gian dài hạn
+FIXED: Added 'condition' argument to forward() to match LatentFlowMatcher call signature.
 """
 import torch
 import torch.nn as nn
@@ -15,7 +16,7 @@ except ImportError:
 
 class MambaPrior(nn.Module):
     """
-    Mamba Prior: Học drift v_prior(z, t) từ latent sequence
+    Mamba Prior: Học drift v_prior(z, t, condition) từ latent sequence
     """
     
     def __init__(
@@ -33,6 +34,9 @@ class MambaPrior(nn.Module):
         # Input projection
         self.input_proj = nn.Linear(latent_dim, hidden_dim)
         
+        # Condition projection (Text features -> Hidden)
+        self.cond_proj = nn.Linear(hidden_dim, hidden_dim) # Giả sử text_feature cũng dim=hidden_dim
+
         # Time embedding
         self.time_embed = nn.Sequential(
             nn.Linear(1, hidden_dim),
@@ -48,24 +52,25 @@ class MambaPrior(nn.Module):
                     d_state=state_dim,
                     d_conv=4,
                     expand=2,
-                    dropout=dropout
+                    # dropout=dropout # Mamba gốc có thể không có tham số dropout trong init, tuỳ version
                 ) for _ in range(num_layers)
             ])
         else:
             raise ValueError("MambaPrior requires mamba-ssm. Use SimpleSSMPrior instead.")
         
+        self.norm = nn.LayerNorm(hidden_dim)
         # Output projection to velocity
         self.output_proj = nn.Linear(hidden_dim, latent_dim)
-        
         self.dropout = nn.Dropout(dropout)
     
-    def forward(self, z, t, mask=None):
+    def forward(self, z, t, condition, mask=None):
         """
-        Predict prior velocity v_prior(z, t)
+        Predict prior velocity v_prior(z, t, condition)
         
         Args:
             z: [B, T, latent_dim] - latent sequence
             t: [B] - timesteps
+            condition: [B, L, hidden_dim] - text features (Tên biến này quan trọng để khớp code gọi)
             mask: [B, T] - valid mask
         
         Returns:
@@ -73,29 +78,40 @@ class MambaPrior(nn.Module):
         """
         B, T, D = z.shape
         
-        # Project input
+        # 1. Project Input & Time
         x = self.input_proj(z)  # [B, T, hidden_dim]
+        t_emb = self.time_embed(t.unsqueeze(-1)).unsqueeze(1) # [B, 1, hidden_dim]
         
-        # Time embedding
-        t_emb = self.time_embed(t.unsqueeze(-1))  # [B, hidden_dim]
-        t_emb = t_emb.unsqueeze(1).expand(-1, T, -1)  # [B, T, hidden_dim]
+        # 2. Inject Condition (Text)
+        # Cách đơn giản nhất cho Prior: Global Average Pooling text features rồi cộng vào
+        # (Để giữ Mamba hoạt động trên chuỗi thời gian T của pose)
+        if condition is not None:
+            # condition: [B, L, H] -> [B, H] (Mean Pooling)
+            cond_global = condition.mean(dim=1).unsqueeze(1) # [B, 1, H]
+            cond_emb = self.cond_proj(cond_global)
+            x = x + cond_emb
+            
         x = x + t_emb
         
-        # Mamba layers
+        # 3. Mamba Layers
         for mamba_layer in self.mamba_layers:
-            x = mamba_layer(x)  # [B, T, hidden_dim]
+            x_res = x
+            x = mamba_layer(x)  
+            x = x + x_res # Residual connection thủ công nếu Mamba block không có
+            
             if mask is not None:
                 x = x * mask.unsqueeze(-1).float()
         
-        # Output
-        v_prior = self.output_proj(x)  # [B, T, latent_dim]
+        x = self.norm(x)
+        v_prior = self.output_proj(x)
         
         return v_prior
 
 
 class SimpleSSMPrior(nn.Module):
     """
-    Simple SSM Prior (nếu không có mamba-ssm, dùng Transformer thay thế)
+    Simple SSM Prior (Fallback dùng Transformer Encoder)
+    FIXED: Thêm tham số 'condition' vào forward để khớp gọi hàm.
     """
     
     def __init__(
@@ -109,7 +125,6 @@ class SimpleSSMPrior(nn.Module):
         super().__init__()
         self.latent_dim = latent_dim
         
-        # Input projection
         self.input_proj = nn.Linear(latent_dim, hidden_dim)
         
         # Time embedding
@@ -119,7 +134,11 @@ class SimpleSSMPrior(nn.Module):
             nn.Linear(hidden_dim, hidden_dim)
         )
         
-        # Transformer (thay cho Mamba)
+        # Condition handling (Cross-Attention like mechanism or simple addition)
+        # Ở đây dùng Transformer Encoder thì ta cộng Global Condition vào Input
+        self.cond_proj = nn.Linear(hidden_dim, hidden_dim)
+
+        # Transformer
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
@@ -130,44 +149,43 @@ class SimpleSSMPrior(nn.Module):
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # Output projection
         self.output_proj = nn.Linear(hidden_dim, latent_dim)
-        
         self.dropout = nn.Dropout(dropout)
     
-    def forward(self, z, t, mask=None):
+    def forward(self, z, t, condition, mask=None):
         """
-        Predict prior velocity v_prior(z, t)
-        
         Args:
-            z: [B, T, latent_dim] - latent sequence
-            t: [B] - timesteps
-            mask: [B, T] - valid mask
-        
-        Returns:
-            v_prior: [B, T, latent_dim] - prior velocity
+            z: [B, T, latent_dim]
+            t: [B]
+            condition: [B, L, hidden_dim] (Text features)
+            mask: [B, T]
         """
         B, T, D = z.shape
         
-        # Project input
-        x = self.input_proj(z)  # [B, T, hidden_dim]
-        
-        # Time embedding
-        t_emb = self.time_embed(t.unsqueeze(-1))  # [B, hidden_dim]
-        t_emb = t_emb.unsqueeze(1).expand(-1, T, -1)  # [B, T, hidden_dim]
+        # 1. Embeddings
+        x = self.input_proj(z)
+        t_emb = self.time_embed(t.unsqueeze(-1)).unsqueeze(1) # [B, 1, H]
         x = x + t_emb
         
-        # Attention mask
+        # 2. Condition Injection
+        if condition is not None:
+            # Mean pooling text features cho đơn giản & nhẹ
+            cond_global = condition.mean(dim=1).unsqueeze(1) # [B, 1, H]
+            x = x + self.cond_proj(cond_global)
+
+        # 3. Masking
         if mask is not None:
-            attn_mask = ~mask  # [B, T]
+            # Transformer nhận mask: True = ignore (padding), False = keep
+            # mask đầu vào của mình: True = keep, False = ignore (padding)
+            # => Cần đảo ngược: ~mask
+            src_key_padding_mask = ~mask.bool()
         else:
-            attn_mask = None
+            src_key_padding_mask = None
         
-        # Transformer
-        x = self.transformer(x, src_key_padding_mask=attn_mask)
+        # 4. Transformer
+        x = self.transformer(x, src_key_padding_mask=src_key_padding_mask)
         
-        # Output
-        v_prior = self.output_proj(x)  # [B, T, latent_dim]
+        # 5. Output
+        v_prior = self.output_proj(x)
         
         return v_prior
-
