@@ -24,9 +24,6 @@ class LengthPredictor(nn.Module):
         # text_features: [Batch, Seq_Len, Dim]
         # Gom thông tin cả câu lại để đoán độ dài
         if mask is not None:
-            # Masking để không tính padding vào trung bình
-            # mask: True = ignore (padding), False = keep
-            # Đổi lại logic mask: 1 = keep, 0 = ignore
             keep_mask = (~mask).float().unsqueeze(-1) # [B, L, 1]
             pooled_text = (text_features * keep_mask).sum(dim=1) / keep_mask.sum(dim=1).clamp(min=1)
         else:
@@ -57,7 +54,7 @@ class LatentFlowMatcher(nn.Module):
         lambda_anneal=True,
         W_PRIOR=0.1,
         W_SYNC=0.5,
-        W_LENGTH=1.0 # Trọng số Loss cho độ dài
+        W_LENGTH=0.1
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -79,7 +76,7 @@ class LatentFlowMatcher(nn.Module):
         text_dim = self.text_encoder.config.hidden_size
         self.text_proj = nn.Linear(text_dim, hidden_dim) 
         
-        # === MỚI: Length Predictor ===
+        # === Length Predictor ===
         self.length_predictor = LengthPredictor(input_dim=hidden_dim)
         self.length_loss_fn = nn.MSELoss()
         
@@ -141,27 +138,23 @@ class LatentFlowMatcher(nn.Module):
         B, T, D = gt_latent.shape
         
         # === 1. TRAINING LENGTH PREDICTOR ===
-        # text_mask đang là True=Padding, nên truyền nguyên vào LengthPredictor (đã xử lý logic bên trong)
         pred_length = self.length_predictor(text_features, text_mask)
         target_length = batch['seq_lengths'].float()
         length_loss = self.length_loss_fn(pred_length, target_length)
         
         # === 2. FLOW MATCHING LOGIC ===
         t = self.scheduler.sample_timesteps(B, device)
-        seq_lengths = batch.get('seq_lengths', torch.full((B,), T, device=device))
+        seq_lengths = batch['seq_lengths']
         mask = torch.arange(T, device=device)[None, :] < seq_lengths[:, None]
         
         latent_t, v_gt, latent_0 = self.scheduler.add_noise(gt_latent, t)
-        
-        # Flow Prediction
-        latent_t_input = latent_t.detach().requires_grad_(False) # Không cần grad cho Flow
-        if self.use_sync_guidance: # Chỉ bật grad nếu cần tính cho Sync Head (Optional, ở đây ta train riêng nên False cũng dc)
-             latent_t_input = latent_t.detach().requires_grad_(True)
-
         pose_attn_mask = ~mask
         
+        # FIX: Flow prediction does not need grad
+        latent_t_flow = latent_t.detach() 
+
         flow_output = self.flow_block(
-            latent_t_input, t, text_features, 
+            latent_t_flow, t, text_features, 
             text_attn_mask=text_mask, pose_attn_mask=pose_attn_mask, 
             return_attn=return_attn_weights
         )
@@ -173,17 +166,21 @@ class LatentFlowMatcher(nn.Module):
         v_prior = None
         if self.use_ssm_prior and self.ssm_prior is not None:
             with torch.no_grad():
-                v_prior = self.ssm_prior(latent_t.detach(), t, text_features, mask=mask)
+                v_prior = self.ssm_prior(latent_t_flow, t, text_features, mask=mask)
         
         lambda_t = self.get_lambda_t(t)
         v_pred_train = v_flow + lambda_t * v_prior if v_prior is not None else v_flow
         
         # Sync Guidance Training
         sync_loss_train = torch.tensor(0.0, device=device)
+        
         if self.use_sync_guidance and self.sync_head is not None and pose_gt is not None:
-            sync_score_pred = self.sync_head(latent_t_input, mask)
+            # Sync Head needs grad: 
+            latent_t_sync = latent_t.detach().requires_grad_(True)
+            
+            sync_score_pred = self.sync_head(latent_t_sync, mask)
             with torch.no_grad():
-                sync_loss_target = self.sync_head.compute_loss(latent_t.detach(), pose_gt, mask)
+                sync_loss_target = self.sync_head.compute_loss(latent_t_flow, pose_gt, mask)
             
             masked_score_pred = sync_score_pred * mask.float()
             pred_mean = masked_score_pred.sum(dim=1) / mask.sum(dim=1).clamp(min=1).float()
@@ -199,7 +196,7 @@ class LatentFlowMatcher(nn.Module):
         result = {
             'total': total_loss, 'flow': flow_loss, 
             'prior': prior_loss, 'sync': sync_loss_train, 
-            'length': length_loss # Log ra để xem
+            'length': length_loss
         }
         if return_attn_weights: result['attn_weights'] = attn_weights
             
@@ -212,16 +209,12 @@ class LatentFlowMatcher(nn.Module):
         # === QUAN TRỌNG: TỰ ĐỘNG DỰ ĐOÁN ĐỘ DÀI ===
         with torch.no_grad():
             pred_len = self.length_predictor(text_features, text_mask)
-            # Clamp độ dài: tối thiểu 10 frames, tối đa 300 frames (tuỳ dataset)
             target_lengths = pred_len.round().long().clamp(min=10, max=400)
             
-        # Lấy độ dài lớn nhất trong batch này làm chuẩn
         T = target_lengths.max().item()
         
-        # Tạo mask thật sự dựa trên độ dài dự đoán
         mask = torch.arange(T, device=device)[None, :] < target_lengths[:, None]
         
-        # Khởi tạo latent ngẫu nhiên với kích thước T vừa đoán
         latent = torch.randn(B, T, self.latent_dim, device=device)
         dt = 1.0 / num_steps
         pose_attn_mask = ~mask
@@ -229,6 +222,7 @@ class LatentFlowMatcher(nn.Module):
         for step in range(num_steps):
             t_val = step / num_steps
             t = torch.full((B,), t_val, device=device)
+            
             latent_grad = latent.detach().requires_grad_(True)
             
             v_flow = self.flow_block(latent_grad, t, text_features, text_attn_mask=text_mask, pose_attn_mask=pose_attn_mask)
@@ -253,6 +247,6 @@ class LatentFlowMatcher(nn.Module):
             
             with torch.no_grad():
                 latent = latent + dt * v_pred
-                latent = latent * mask.unsqueeze(-1).float() # Giữ sạch nền
+                latent = latent * mask.unsqueeze(-1).float()
         
         return latent
