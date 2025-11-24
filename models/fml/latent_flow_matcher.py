@@ -150,7 +150,7 @@ class LatentFlowMatcher(nn.Module):
         latent_t, v_gt, latent_0 = self.scheduler.add_noise(gt_latent, t)
         pose_attn_mask = ~mask
         
-        # FIX: Flow prediction does not need grad
+        # Flow prediction does not need grad
         latent_t_flow = latent_t.detach() 
 
         flow_output = self.flow_block(

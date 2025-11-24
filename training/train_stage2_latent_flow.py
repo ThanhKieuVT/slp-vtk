@@ -1,6 +1,6 @@
 """
-Training Script: Stage 2 Latent Flow Matching (Direct Training) - VERSION FINAL
-FIXED: Cleaned invisible characters (U+00A0) and added Length Predictor Support
+Training Script: Stage 2 Latent Flow Matching (Direct Training) - VERSION SOTA
+FIXED: Using CosineAnnealing, W_SYNC=0.5, và cập nhật logic loop.
 """
 import os
 import sys
@@ -10,23 +10,27 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts 
+from torch.optim.lr_scheduler import ReduceLROnPlateau # Cần cho Resume cũ
 
-sys.path.append(os.getcwd())
+# --- FIX PATH ---
+sys.path.append(os.getcwd()) 
+# ----------------
 
 try:
     from dataset import SignLanguageDataset, collate_fn
     from models.fml.autoencoder import UnifiedPoseAutoencoder
-    from models.fml.latent_flow_matcher import LatentFlowMatcher
+    from models.fml.latent_flow_matcher import LatentFlowMatcher 
 except ImportError as e:
     print(f"❌ Lỗi Import: {e}")
     sys.exit(1)
 
-# === 1. HÀM TÍNH SCALE FACTOR ===
+# === 1. HÀM TÍNH SCALE FACTOR (Giữ nguyên) ===
 def estimate_scale_factor(encoder, dataloader, device, num_batches=20):
     print(f"⏳ Đang tính toán Latent Scale Factor ({num_batches} batches)...")
     encoder.eval()
     all_latents = []
+    
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
             if i >= num_batches: break
@@ -34,10 +38,13 @@ def estimate_scale_factor(encoder, dataloader, device, num_batches=20):
             pose_mask = batch['pose_mask'].to(device)
             z = encoder(poses, mask=pose_mask)
             all_latents.append(z.cpu())
+    
     all_latents = torch.cat(all_latents, dim=0)
     std = all_latents.std()
     scale_factor = 1.0 / (std.item() + 1e-6)
-    print(f"✅ Scale Factor: {scale_factor:.6f}")
+    
+    print(f"✅ Latent Std gốc: {std.item():.4f}")
+    print(f"✅ Scale Factor tự động tính: {scale_factor:.6f}")
     return scale_factor
 
 # === 2. HÀM TRAIN ===
@@ -46,7 +53,7 @@ def train_epoch(flow_matcher, encoder, dataloader, optimizer, scheduler, device,
     encoder.eval()
     
     total_loss = 0.0
-    losses_log = {'flow': 0.0, 'sync': 0.0, 'length': 0.0} 
+    losses_log = {'flow': 0.0, 'sync': 0.0, 'length': 0.0}
     num_batches = 0
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}")
@@ -61,6 +68,7 @@ def train_epoch(flow_matcher, encoder, dataloader, optimizer, scheduler, device,
             'text_tokens': text_tokens,
             'attention_mask': attention_mask,
             'seq_lengths': seq_lengths,
+            'target_length': seq_lengths
         }
         
         with torch.no_grad():
@@ -70,15 +78,22 @@ def train_epoch(flow_matcher, encoder, dataloader, optimizer, scheduler, device,
         return_attn = (batch_idx % log_attn_freq == 0)
         
         losses = flow_matcher(
-            batch_dict, gt_latent=gt_latent, pose_gt=poses, 
-            mode='train', return_attn_weights=return_attn
+            batch_dict, 
+            gt_latent=gt_latent, 
+            pose_gt=poses, 
+            mode='train', 
+            return_attn_weights=return_attn
         )
+        
+        if return_attn and 'attn_weights' in losses:
+            # Code để lưu hoặc visualize losses['attn_weights']
+            pass
         
         optimizer.zero_grad()
         losses['total'].backward()
         torch.nn.utils.clip_grad_norm_(flow_matcher.parameters(), max_norm=1.0)
         optimizer.step()
-        scheduler.step(epoch + batch_idx / len(dataloader)) 
+        scheduler.step(epoch + batch_idx / len(dataloader)) # Step CosineAnnealing
         
         total_loss += losses['total'].item()
         losses_log['flow'] += losses['flow'].item()
@@ -86,16 +101,15 @@ def train_epoch(flow_matcher, encoder, dataloader, optimizer, scheduler, device,
         losses_log['length'] += losses.get('length', torch.tensor(0.0)).item()
         num_batches += 1
         
-        pbar.set_postfix({
-            'loss': f"{losses['total'].item():.4f}", 
-            'flow': f"{losses['flow'].item():.4f}",
-            'len_loss': f"{losses.get('length', torch.tensor(0.0)).item():.4f}", 
-            'lr': f"{optimizer.param_groups[0]['lr']:.2e}"
-        })
+        pbar.set_postfix({'loss': f"{losses['total'].item():.4f}", 
+                          'flow': f"{losses['flow'].item():.4f}",
+                          'sync': f"{losses.get('sync', torch.tensor(0.0)).item():.4f}",
+                          'len': f"{losses.get('length', torch.tensor(0.0)).item():.4f}", # Log length loss
+                          'lr': f"{optimizer.param_groups[0]['lr']:.2e}"})
     
     return {k: v / num_batches for k, v in losses_log.items()}, total_loss / num_batches
 
-# === 3. HÀM VALIDATE ===
+# === 4. HÀM VALIDATE ===
 def validate(flow_matcher, encoder, dataloader, device, scale_factor):
     flow_matcher.eval()
     encoder.eval()
@@ -110,7 +124,6 @@ def validate(flow_matcher, encoder, dataloader, device, scale_factor):
             text_tokens = batch['text_tokens'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             seq_lengths = batch['seq_lengths'].to(device)
-            
             batch_dict = {'text_tokens': text_tokens, 'attention_mask': attention_mask, 'seq_lengths': seq_lengths}
             gt_latent = encoder(poses, mask=pose_mask) * scale_factor 
 
@@ -121,7 +134,7 @@ def validate(flow_matcher, encoder, dataloader, device, scale_factor):
             
     return total_loss / num_batches if num_batches > 0 else 0.0
 
-# === 4. MAIN ===
+# === 5. MAIN ===
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_dir', type=str, required=True)
@@ -137,14 +150,15 @@ def main():
     parser.add_argument('--hidden_dim', type=int, default=512)
     parser.add_argument('--num_layers', type=int, default=6)
     parser.add_argument('--num_heads', type=int, default=8)
-    parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--use_ssm_prior', action='store_true', default=True) 
     parser.add_argument('--use_sync_guidance', action='store_true', default=True) 
     
-    parser.add_argument('--W_PRIOR', type=float, default=0.1)
-    parser.add_argument('--W_SYNC', type=float, default=0.5)
-    parser.add_argument('--W_LENGTH', type=float, default=0.1, help="Weight for Length Prediction Loss")
+    # Loss Weights (SOTA Values)
+    parser.add_argument('--W_PRIOR', type=float, default=0.1, help="Weight for Prior Reg Loss")
+    parser.add_argument('--W_SYNC', type=float, default=0.5, help="Weight for Sync Reg Loss (W_SYNC=0.5 is high)")
+    parser.add_argument('--W_LENGTH', type=float, default=0.01, help="Weight for Length Prediction Loss (Set lower for stability)")
     
+    # Inference Args (for model init)
     parser.add_argument('--lambda_prior', type=float, default=0.1)
     parser.add_argument('--gamma_guidance', type=float, default=0.1)
     parser.add_argument('--resume_from', type=str, default=None)
@@ -155,9 +169,9 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(args.output_dir, exist_ok=True)
     
-    print(f"🚀 Bắt đầu training SOTA Flow Matching (w/ Length Pred) trên: {device}")
+    print(f"🚀 Bắt đầu training SOTA Flow Matching trên: {device}")
 
-    # Load AE
+    # 1. Load Autoencoder
     print("🔄 Loading Autoencoder...")
     autoencoder = UnifiedPoseAutoencoder(pose_dim=214, latent_dim=args.latent_dim, hidden_dim=args.ae_hidden_dim)
     checkpoint = torch.load(args.autoencoder_checkpoint, map_location=device)
@@ -166,74 +180,121 @@ def main():
     autoencoder.load_state_dict(state_dict)
     encoder = autoencoder.encoder.to(device).eval().requires_grad_(False)
 
-    # Dataset
+    # 2. Dataset
     print("📚 Loading Dataset...")
     train_dataset = SignLanguageDataset(args.data_dir, split='train', max_seq_len=args.max_seq_len)
     val_dataset = SignLanguageDataset(args.data_dir, split='dev', max_seq_len=args.max_seq_len)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collate_fn)
     
+    # 3. Scale Factor
     latent_scale_factor = estimate_scale_factor(encoder, train_loader, device)
 
-    # Init Model
+    # 4. Init Model
     print("🔧 Init SOTA Flow Matcher...")
+    
     flow_matcher = LatentFlowMatcher(
-        latent_dim=args.latent_dim, hidden_dim=args.hidden_dim,
-        num_flow_layers=args.num_layers, num_prior_layers=args.num_layers,
-        num_heads=args.num_heads, dropout=args.dropout,
-        use_ssm_prior=args.use_ssm_prior, use_sync_guidance=args.use_sync_guidance,
-        lambda_prior=args.lambda_prior, gamma_guidance=args.gamma_guidance, lambda_anneal=True,
-        W_PRIOR=args.W_PRIOR, W_SYNC=args.W_SYNC, W_LENGTH=args.W_LENGTH 
+        latent_dim=args.latent_dim,
+        hidden_dim=args.hidden_dim,
+        num_flow_layers=args.num_layers,
+        num_prior_layers=args.num_layers,
+        num_heads=args.num_heads,
+        dropout=args.dropout,
+        use_ssm_prior=args.use_ssm_prior,
+        use_sync_guidance=args.use_sync_guidance,
+        lambda_prior=args.lambda_prior,
+        gamma_guidance=args.gamma_guidance,
+        lambda_anneal=True,
+        W_PRIOR=args.W_PRIOR,
+        W_SYNC=args.W_SYNC,
+        W_LENGTH=args.W_LENGTH
     ).to(device)
     
+    # 5. Optimizer & Scheduler (SOTA)
     optimizer = torch.optim.AdamW(flow_matcher.parameters(), lr=args.learning_rate, weight_decay=0.05)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=2, eta_min=1e-6)
     
+    scheduler = CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=20, 
+        T_mult=2,
+        eta_min=1e-6
+    )
+    
+    # 6. RESUME LOGIC (Giữ nguyên)
     start_epoch = 0
     best_val_loss = float('inf')
 
+    # Tự động tìm latest.pt nếu không truyền resume_from
     if args.resume_from is None:
         potential_latest = os.path.join(args.output_dir, 'latest.pt')
-        if os.path.exists(potential_latest): args.resume_from = potential_latest
+        if os.path.exists(potential_latest):
+            args.resume_from = potential_latest
+            print(f"🔍 Tự động tìm thấy checkpoint: {args.resume_from}")
 
     if args.resume_from and os.path.exists(args.resume_from):
         print(f"♻️ Resuming from {args.resume_from}...")
         ckpt = torch.load(args.resume_from, map_location=device)
-        # Handle length predictor weights if resuming from old checkpoint
-        model_dict = flow_matcher.state_dict()
-        pretrained_dict = {k: v for k, v in ckpt['model_state_dict'].items() if k in model_dict}
-        model_dict.update(pretrained_dict)
-        flow_matcher.load_state_dict(model_dict)
         
-        if 'optimizer_state_dict' in ckpt: optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-        if 'scheduler_state_dict' in ckpt: scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-        start_epoch = ckpt.get('epoch', -1) + 1
+        # 1. Load Model (Bắt buộc)
+        flow_matcher.load_state_dict(ckpt['model_state_dict'])
+        print("✅ Loaded Model weights.")
+
+        # 2. Load Optimizer (An toàn: Có thì load, không thì thôi)
+        if 'optimizer_state_dict' in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                print("✅ Loaded Optimizer state.")
+            except Exception as e:
+                print(f"⚠️ Không thể load Optimizer. Lỗi: {e}")
+        
+        # 3. Load Scheduler (An toàn)
+        if 'scheduler_state_dict' in ckpt:
+            try:
+                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+            except Exception as e:
+                 print(f"⚠️ Không thể load Scheduler cũ vào CosineAnnealing. Khởi tạo lại. Lỗi: {e}")
+
+        # 4. Load Epoch & Best Loss
+        if 'epoch' in ckpt:
+            start_epoch = ckpt['epoch'] + 1
+        
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
         latent_scale_factor = ckpt.get('latent_scale_factor', latent_scale_factor)
-        print(f"⏩ Resuming at Epoch: {start_epoch}, Best Loss: {best_val_loss:.4f}")
+        
+        print(f"⏩ Resuming at Epoch: {start_epoch}")
+        print(f"ℹ️ Current Best Val Loss: {best_val_loss:.4f}")
+        print(f"ℹ️ Scale Factor: {latent_scale_factor:.6f}")
 
-    # Training Loop
+    # 7. Loop
     for epoch in range(start_epoch, args.num_epochs):
         train_metrics, avg_train_loss = train_epoch(flow_matcher, encoder, train_loader, optimizer, scheduler, device, epoch, latent_scale_factor, args.log_attn_freq)
         val_loss = validate(flow_matcher, encoder, val_loader, device, latent_scale_factor)
         
-        print(f"Epoch {epoch+1} | Train: {avg_train_loss:.4f} | Val: {val_loss:.4f} | Flow: {train_metrics['flow']:.4f} | Len: {train_metrics['length']:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
+        print(f"Epoch {epoch+1} | Train: {avg_train_loss:.6f} | Val: {val_loss:.6f} | Flow: {train_metrics['flow']:.6f} | Sync: {train_metrics['sync']:.6f} | Len: {train_metrics['length']:.6f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
         
+        # Save Latest (Kèm scheduler & best_loss)
         save_dict = {
-            'epoch': epoch, 'model_state_dict': flow_matcher.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(), 'scheduler_state_dict': scheduler.state_dict(),
-            'latent_scale_factor': latent_scale_factor, 'best_val_loss': best_val_loss
+            'epoch': epoch,
+            'model_state_dict': flow_matcher.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'latent_scale_factor': latent_scale_factor,
+            'best_val_loss': best_val_loss
         }
         torch.save(save_dict, os.path.join(args.output_dir, 'latest.pt'))
         
+        # Save Best
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             save_dict['best_val_loss'] = best_val_loss 
             torch.save(save_dict, os.path.join(args.output_dir, 'best_model.pt'))
-            print(f"🏆 New Best Model Saved!")
+            print(f"🏆 New Best Model Saved! (Loss: {best_val_loss:.4f})")
         
+        # Save milestone
         if (epoch + 1) % 50 == 0:
-            torch.save(save_dict, os.path.join(args.output_dir, f'checkpoint_epoch_{epoch+1}.pt'))
+            milestone_path = os.path.join(args.output_dir, f'checkpoint_epoch_{epoch+1}.pt')
+            torch.save(save_dict, milestone_path)
+            print(f"💾 Milestone saved: {milestone_path}")
 
 if __name__ == '__main__':
     main()
