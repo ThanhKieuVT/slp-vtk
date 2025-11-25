@@ -163,6 +163,7 @@ def main():
     parser.add_argument('--gamma_guidance', type=float, default=0.1)
     parser.add_argument('--resume_from', type=str, default=None)
     parser.add_argument('--log_attn_freq', type=int, default=100) 
+    parser.add_argument('--text_embed_dim', type=int, default=768, help='Dimension of BERT output (768 for bert-base)')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate for Transformer/Flow layers')
     args = parser.parse_args()
     
