@@ -163,7 +163,7 @@ def main():
     parser.add_argument('--gamma_guidance', type=float, default=0.1)
     parser.add_argument('--resume_from', type=str, default=None)
     parser.add_argument('--log_attn_freq', type=int, default=100) 
-
+    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate for Transformer/Flow layers')
     args = parser.parse_args()
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
