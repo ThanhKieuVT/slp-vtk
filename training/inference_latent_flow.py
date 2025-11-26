@@ -1,6 +1,6 @@
 """
 Inference Script: Text → Latent Flow → Pose
-UPDATED: Hỗ trợ Length Predictor tự động & Scale Factor Correction
+FIXED: Bổ sung logic tải Normalization Stats và Denormalize Pose.
 """
 import os
 import argparse
@@ -9,13 +9,14 @@ import numpy as np
 from transformers import BertTokenizer
 import time
 
-# --- IMPORT MODEL ---
+# --- IMPORT MODEL VÀ HÀM DENORMALIZE ---
 try:
     from models.fml.autoencoder import UnifiedPoseAutoencoder
     from models.fml.latent_flow_matcher import LatentFlowMatcher
-    # from data_preparation import denormalize_pose # Bỏ qua nếu chị lưu trực tiếp 214 điểm
+    # ✅ FIX: Cần hàm denormalize_pose và hàm này nằm trong data_preparation
+    from data_preparation import denormalize_pose 
 except ImportError as e:
-    print(f"❌ Lỗi Import: {e}. Hãy chạy script từ thư mục gốc dự án.")
+    print(f"❌ Lỗi Import: {e}. Hãy đảm bảo các module và hàm denormalize_pose đã được định nghĩa.")
     import sys
     sys.exit(1)
 
@@ -25,9 +26,9 @@ def inference_sota(
     decoder,
     tokenizer,
     device,
-    scale_factor=1.0, # MỚI: Cần tham số này để pose không bị bé tí
+    scale_factor=1.0, 
     num_steps=50,
-    manual_length=None # Nếu muốn ép độ dài (optional)
+    normalize_stats=None # ✅ FIX: Nhận normalization_stats
 ):
     flow_matcher.eval()
     decoder.eval()
@@ -39,21 +40,12 @@ def inference_sota(
     text_tokens = encoded['input_ids']
     attention_mask = encoded['attention_mask']
     
-    # 2. Encode Text Features (Làm bên ngoài để clear logic)
+    # 2. Encode Text Features 
     with torch.no_grad():
         text_features, text_mask = flow_matcher.encode_text(text_tokens, attention_mask)
     
     # 3. Flow Matching Inference
-    # Model sẽ TỰ ĐỘNG dự đoán độ dài bên trong hàm này
-    # batch={} vì ta không còn cần target_length từ ngoài nữa (trừ khi manual)
-    
-    # *Mẹo*: Nếu chị muốn ép độ dài thủ công để test, chị có thể hack vào hàm _inference_forward
-    # nhưng mặc định hãy để model tự làm.
-    
     print(f"🔄 Đang sinh Latent (Steps={num_steps})...")
-    # KHÔNG bọc flow_matcher trong no_grad nếu dùng Guidance (nhưng ở đây infer thuần nên ok)
-    # Tuy nhiên, hàm _inference_forward của chị đã có torch.set_grad_enabled bên trong logic guidance rồi
-    # Nên gọi bình thường.
     
     generated_latent = flow_matcher._inference_forward(
         batch={}, 
@@ -63,15 +55,21 @@ def inference_sota(
     ) # [1, T, 256]
     
     # 4. UN-SCALE LATENT (QUAN TRỌNG NHẤT)
-    # Lúc train ta nhân scale_factor, giờ phải chia đi
     generated_latent = generated_latent / scale_factor
     
     # 5. Decode ra Pose
     with torch.no_grad():
-        pose = decoder(generated_latent) # [1, T, 214]
+        pose_norm = decoder(generated_latent) # [1, T, 214] (Pose ĐÃ CHUẨN HÓA)
+        pose = pose_norm.squeeze(0).cpu().numpy()  # [T, 214] (numpy)
 
-    # 6. Post-process
-    pose = pose.squeeze(0).cpu().numpy()  # [T, 214]
+    # 6. Post-process: DENORMALIZE BẮT BUỘC
+    if normalize_stats is not None:
+        mean = normalize_stats['mean']
+        std = normalize_stats['std']
+        # ✅ FIX: Áp dụng Denormalization để pose có tọa độ vật lý đúng
+        pose = denormalize_pose(pose, mean, std) 
+        print("✅ Pose Denormalized.")
+
     latency = time.time() - start_time
     
     return pose, latency
@@ -82,6 +80,7 @@ def main():
     parser.add_argument('--flow_checkpoint', type=str, required=True, help='Checkpoint Flow (Stage 2)')
     parser.add_argument('--autoencoder_checkpoint', type=str, required=True, help='Checkpoint AE (Stage 1)')
     parser.add_argument('--output_path', type=str, default='output_pose.npy', help='Nơi lưu file .npy')
+    parser.add_argument('--data_dir', type=str, required=True, help='Thư mục chứa normalization_stats.npz') # ✅ FIX: data_dir BẮT BUỘC
     
     # Các tham số Model (Phải khớp lúc train)
     parser.add_argument('--latent_dim', type=int, default=256)
@@ -97,8 +96,18 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"🚀 Using device: {device}")
     
+    # --- LOAD NORMALIZATION STATS (FIX) ---
+    normalize_stats = None
+    stats_path = os.path.join(args.data_dir, "normalization_stats.npz")
+    if os.path.exists(stats_path):
+        normalize_stats = np.load(stats_path)
+        print(f"✅ Loaded normalization stats from {stats_path}")
+    else:
+        print(f"❌ ERROR: normalization_stats.npz NOT found at {stats_path}. Cannot Denormalize!")
+        
+    
     # 1. Load Autoencoder
-    print(f"📦 Loading Autoencoder...")
+    print(f"\n📦 Loading Autoencoder...")
     ae = UnifiedPoseAutoencoder(pose_dim=214, latent_dim=args.latent_dim, hidden_dim=args.hidden_dim).to(device)
     ae.load_state_dict(torch.load(args.autoencoder_checkpoint, map_location=device)['model_state_dict'])
     ae.eval()
@@ -107,7 +116,6 @@ def main():
     print(f"📦 Loading Flow Matcher...")
     ckpt = torch.load(args.flow_checkpoint, map_location=device)
     
-    # LẤY SCALE FACTOR TỪ CHECKPOINT
     scale_factor = ckpt.get('latent_scale_factor', 1.0)
     print(f"✅ Tìm thấy Scale Factor: {scale_factor:.4f}")
     
@@ -115,7 +123,6 @@ def main():
         latent_dim=args.latent_dim, hidden_dim=args.hidden_dim,
         num_flow_layers=6, num_prior_layers=4, num_heads=8, dropout=0.1,
         use_ssm_prior=args.use_ssm_prior, use_sync_guidance=args.use_sync_guidance
-        # Các tham số loss weights không quan trọng lúc inference
     ).to(device)
     
     # Load weights (strict=False để an toàn nếu thiếu key linh tinh)
@@ -138,8 +145,9 @@ def main():
         decoder=ae.decoder,
         tokenizer=tokenizer,
         device=device,
-        scale_factor=scale_factor, # Truyền scale factor vào
-        num_steps=args.num_steps
+        scale_factor=scale_factor, 
+        num_steps=args.num_steps,
+        normalize_stats=normalize_stats # ✅ FIX: Truyền stats vào hàm inference
     )
     
     print(f"✅ Done! Shape: {pose.shape}")
