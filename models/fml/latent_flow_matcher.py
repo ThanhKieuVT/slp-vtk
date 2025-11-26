@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import BertModel
 
 from .flow_matching import FlowMatchingBlock, FlowMatchingScheduler, FlowMatchingLoss
@@ -7,7 +8,6 @@ from .mamba_prior import SimpleSSMPrior
 from .sync_guidance import SyncGuidanceHead
 
 class LengthPredictor(nn.Module):
-    """Mạng nhỏ để dự đoán số lượng frames từ text features"""
     def __init__(self, input_dim, hidden_dim=256):
         super().__init__()
         self.net = nn.Sequential(
@@ -31,10 +31,6 @@ class LengthPredictor(nn.Module):
 
 
 class LatentFlowMatcher(nn.Module):
-    """
-    Latent Flow Matcher SOTA: FIXED Gradient Sign & Loss Detach
-    """
-    
     def __init__(
         self,
         latent_dim=256,
@@ -73,7 +69,9 @@ class LatentFlowMatcher(nn.Module):
         self.text_proj = nn.Linear(text_dim, hidden_dim) 
         
         self.length_predictor = LengthPredictor(input_dim=hidden_dim)
-        self.length_loss_fn = nn.MSELoss()
+        
+        # ✅ FIX 3: Dùng SmoothL1Loss cho length (Theo review)
+        self.length_loss_fn = nn.SmoothL1Loss()
         
         self.scheduler = FlowMatchingScheduler()
         
@@ -108,12 +106,14 @@ class LatentFlowMatcher(nn.Module):
         text_mask = ~attention_mask.bool()
         return text_features, text_mask
     
+    # ✅ FIX 1: Sửa Lambda shape logic (Theo review)
     def get_lambda_t(self, t):
-        t_float = t.float()
         if self.lambda_anneal:
-            return self.lambda_prior * (1 - t_float.view(-1, 1, 1))
+            # Shape (B, 1, 1) để broadcast với (B, T, D)
+            return self.lambda_prior * (1 - t.float().view(-1, 1, 1))
         else:
-            return torch.full((t.shape[0],1,1), self.lambda_prior, device=t.device, dtype=t_float.dtype)
+            # Scalar để tự broadcast
+            return self.lambda_prior
     
     def forward(self, batch, gt_latent, pose_gt=None, mode='train', num_inference_steps=50, return_attn_weights=False):
         text_features, text_mask = self.encode_text(batch['text_tokens'], batch['attention_mask'])
@@ -127,12 +127,14 @@ class LatentFlowMatcher(nn.Module):
         device = text_features.device
         B, T, D = gt_latent.shape
         
-        # <--- FIXED: Detach text_features để Length Predictor không phá hỏng feature space của Flow
+        # === 1. LENGTH LOSS (FIX: DETACH + NORMALIZE + SMOOTH L1) ===
         pred_length = self.length_predictor(text_features.detach(), text_mask)
         target_length = batch['seq_lengths'].float()
-        length_loss = self.length_loss_fn(pred_length, target_length)
         
-        # Flow Matching Logic
+        scale_len = 120.0
+        length_loss = self.length_loss_fn(pred_length / scale_len, target_length / scale_len)
+        
+        # === 2. FLOW MATCHING ===
         t = self.scheduler.sample_timesteps(B, device)
         seq_lengths = batch['seq_lengths']
         mask = torch.arange(T, device=device)[None, :] < seq_lengths[:, None]
@@ -140,10 +142,8 @@ class LatentFlowMatcher(nn.Module):
         latent_t, v_gt, latent_0 = self.scheduler.add_noise(gt_latent, t)
         pose_attn_mask = ~mask
         
-        latent_t_flow = latent_t.detach() 
-
         flow_output = self.flow_block(
-            latent_t_flow, t, text_features, 
+            latent_t, t, text_features, 
             text_attn_mask=text_mask, pose_attn_mask=pose_attn_mask, 
             return_attn=return_attn_weights
         )
@@ -151,29 +151,48 @@ class LatentFlowMatcher(nn.Module):
         if return_attn_weights: v_flow, attn_weights = flow_output
         else: v_flow = flow_output
         
-        # Prior
+        # === 3. PRIOR & GUIDANCE ===
         v_prior = None
         if self.use_ssm_prior and self.ssm_prior is not None:
             with torch.no_grad():
-                v_prior = self.ssm_prior(latent_t_flow, t, text_features, mask=mask)
+                v_prior = self.ssm_prior(latent_t.detach(), t, text_features, mask=mask)
         
         lambda_t = self.get_lambda_t(t)
         v_pred_train = v_flow + lambda_t * v_prior if v_prior is not None else v_flow
         
-        # Sync Guidance Training
+        # === SYNC GUIDANCE (🔥 UPGRADE: CONTRASTIVE LEARNING) ===
         sync_loss_train = torch.tensor(0.0, device=device)
         
-        if self.use_sync_guidance and self.sync_head is not None and pose_gt is not None:
-            latent_t_sync = latent_t.detach().requires_grad_(True)
-            sync_score_pred = self.sync_head(latent_t_sync, mask)
-            with torch.no_grad():
-                sync_loss_target = self.sync_head.compute_loss(latent_t_flow, pose_gt, mask)
+        if self.use_sync_guidance and self.sync_head is not None:
+            # 1. Positive Sample: Latent hiện tại (đang train)
+            # KHÔNG detach latent_t để gradient chảy ngược về Flow
+            sync_score_pos = self.sync_head(latent_t, mask) 
             
-            masked_score_pred = sync_score_pred * mask.float()
-            pred_mean = masked_score_pred.sum(dim=1) / mask.sum(dim=1).clamp(min=1).float()
-            sync_loss_train = self.sync_loss_fn(pred_mean, sync_loss_target.detach())
-        
-        # Losses Combine
+            # 2. Negative Sample: GT Latent bị dịch chuyển thời gian (Time-shift)
+            # Tạo sample "lệch nhịp" để model học cách phân biệt
+            with torch.no_grad():
+                # Shift ngẫu nhiên từ 1 đến T/4 frame
+                shift_amount = torch.randint(1, max(2, T // 4), (B,), device=device)
+                shifted_gt = torch.zeros_like(gt_latent)
+                for b in range(B):
+                    shift = shift_amount[b].item()
+                    # Roll (dịch vòng) latent gốc
+                    shifted_gt[b] = torch.roll(gt_latent[b], shifts=shift, dims=0)
+                
+                # Negative score (Detach vì đây là target giả)
+                sync_score_neg = self.sync_head(shifted_gt.detach(), mask)
+            
+            # 3. Contrastive Loss (Hinge Loss)
+            # Mục tiêu: Score(Pos) > Score(Neg) + Margin
+            pos_mean = (sync_score_pos * mask.float()).sum(dim=1) / mask.sum(dim=1).clamp(min=1).float()
+            neg_mean = (sync_score_neg * mask.float()).sum(dim=1) / mask.sum(dim=1).clamp(min=1).float()
+            
+            margin = 0.2
+            # Loss = max(0, margin + neg - pos)
+            # Nghĩa là nếu Pos lớn hơn Neg một khoảng margin rồi thì thôi, không phạt nữa
+            sync_loss_train = F.relu(margin + neg_mean.detach() - pos_mean).mean()
+
+        # === 4. COMBINE ===
         flow_loss = self.flow_loss_fn(v_pred_train, v_gt, mask=mask)        
         prior_loss = self.prior_reg_fn(v_flow, v_prior.detach()) if v_prior is not None else torch.tensor(0.0, device=device)
         
@@ -218,22 +237,27 @@ class LatentFlowMatcher(nn.Module):
             
             lambda_t = self.get_lambda_t(t)
             v_pred_raw = v_flow + lambda_t * v_prior if v_prior is not None else v_flow
-            v_pred = v_pred_raw
             
             # Sync guidance (inference)
             if self.use_sync_guidance and self.sync_head is not None and 0.2 < t_val < 0.8:
                 sync_score_pred = self.sync_head(latent_grad, mask)
+                
+                # Guidance Loss: Maximize Sync Score
                 guidance_loss = (sync_score_pred * mask.float()).sum(dim=1) / mask.sum(dim=1).clamp(min=1).float()
                 guidance_loss = guidance_loss.mean()
                 
                 sync_grad = torch.autograd.grad(guidance_loss, latent_grad, create_graph=False)[0]
                 
-                # <--- FIXED: Dấu "+" (Gradient Ascent) để tăng độ đồng bộ.
-                # Code cũ dùng "-" (Gradient Descent) làm video bị lệch nhịp.
+                # Gradient Ascent
                 v_pred = v_pred_raw + self.gamma_guidance * sync_grad.detach()
+            else:
+                v_pred = v_pred_raw
             
             with torch.no_grad():
                 latent = latent + dt * v_pred
                 latent = latent * mask.unsqueeze(-1).float()
+                
+                # ✅ FIX 4: CLAMP trong inference để chống cháy nổ
+                latent = latent.clamp(-10.0, 10.0)
         
         return latent

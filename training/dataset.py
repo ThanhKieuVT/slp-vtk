@@ -1,5 +1,6 @@
 """
 PyTorch Dataset cho Sign Language Production
+FIXED: Lấy text ở cột cuối cùng [-1] và IN RA MÀN HÌNH để kiểm tra.
 """
 import os
 import pickle
@@ -25,16 +26,6 @@ class SignLanguageDataset(Dataset):
         normalize=True,
         stats_path=None
     ):
-        """
-        Args:
-            data_dir: Thư mục chứa processed_data/data/
-            split: 'train', 'dev', hoặc 'test'
-            text_file: Đường dẫn đến file text (nếu None, sẽ tìm trong data_dir)
-            max_seq_len: Độ dài tối đa của pose sequence
-            max_text_len: Độ dài tối đa của text tokens
-            normalize: Có normalize pose không
-            stats_path: Đường dẫn đến file normalization stats
-        """
         self.data_dir = data_dir
         self.split = split
         self.split_dir = os.path.join(data_dir, split)
@@ -42,7 +33,7 @@ class SignLanguageDataset(Dataset):
         self.max_text_len = max_text_len
         self.normalize = normalize
         
-        # Load normalization stats
+        # 1. LOAD STATS
         if normalize:
             if stats_path is None:
                 stats_path = os.path.join(data_dir, "normalization_stats.npz")
@@ -54,38 +45,71 @@ class SignLanguageDataset(Dataset):
                 print(f"⚠️  Không tìm thấy {stats_path}, sẽ không normalize!")
                 self.normalize = False
         
-        # Load text tokenizer
+        # 2. SETUP TOKENIZER
         self.tokenizer = BertTokenizer.from_pretrained('bert-base-multilingual-cased')
         
-        # Load video IDs
+        # 3. LOAD VIDEO IDs TỪ FOLDER POSES
         poses_dir = os.path.join(self.split_dir, "poses")
         if not os.path.exists(poses_dir):
-            raise ValueError(f"Không tìm thấy {poses_dir}")
-        
-        self.video_ids = sorted([
+            raise ValueError(f"Không tìm thấy thư mục pose: {poses_dir}")
+            
+        # Lấy danh sách video có sẵn file pose
+        # (Để đảm bảo chỉ load text của những video có file pose)
+        available_poses = set([
             f.replace('.npz', '') 
             for f in os.listdir(poses_dir) 
             if f.endswith('.npz')
         ])
         
-        # Load texts
+        self.video_ids = []
+        
+        # 4. LOAD TEXT & DEBUG PRINT
         self.texts = {}
         if text_file is None:
-            # Tìm file text trong data_dir
             text_file = os.path.join(data_dir, f"{split}.txt")
         
         if os.path.exists(text_file):
+            print(f"\n📖 Đang đọc text từ: {text_file}")
+            print(f"{'='*50}")
+            
+            count_debug = 0 # Biến đếm để chỉ in 5 dòng đầu tiên
+            
             with open(text_file, 'r', encoding='utf-8') as f:
                 for line in f:
-                    parts = line.strip().split('|')
+                    line = line.strip()
+                    if not line: continue
+                    
+                    # Cắt theo dấu gạch đứng |
+                    parts = line.split('|')
+                    
+                    # Format PHOENIX: ID | ... | ... | German Text
                     if len(parts) >= 2:
                         vid_id = parts[0].strip()
-                        text = '|'.join(parts[1:]).strip()
-                        self.texts[vid_id] = text
+                        
+                        # --- SỬA Ở ĐÂY: Lấy phần tử CUỐI CÙNG [-1] ---
+                        text_content = parts[-1].strip()
+                        
+                        # Chỉ lấy nếu video này có file pose
+                        if vid_id in available_poses:
+                            self.texts[vid_id] = text_content
+                            self.video_ids.append(vid_id)
+                            
+                            # --- 🔥 DEBUG: IN RA 5 DÒNG ĐẦU TIÊN ĐỂ CHỊ CHECK ---
+                            if count_debug < 5:
+                                print(f"👀 [CHECK DÒNG {count_debug+1}]")
+                                print(f"   🎥 ID:   {vid_id}")
+                                print(f"   📝 Text: {text_content}")
+                                print(f"   -----------------------")
+                                count_debug += 1
+                                
+            print(f"{'='*50}")
+            print(f"✅ Đã load {len(self.texts)} dòng text khớp với pose.")
         else:
-            print(f"⚠️  Không tìm thấy {text_file}, sẽ dùng text rỗng!")
+            print(f"⚠️ CẢNH BÁO: Không tìm thấy file text {text_file}! Text sẽ bị rỗng.")
         
-        print(f"✅ Loaded {len(self.video_ids)} samples từ {split} split")
+        # Sort lại cho nhất quán
+        self.video_ids = sorted(self.video_ids)
+        print(f"✅ Init Dataset {split}: {len(self.video_ids)} samples.")
     
     def __len__(self):
         return len(self.video_ids)
@@ -93,10 +117,9 @@ class SignLanguageDataset(Dataset):
     def __getitem__(self, idx):
         video_id = self.video_ids[idx]
         
-        # Load pose
+        # Load Pose
         pose_214, T = load_sample(video_id, self.split_dir)
         if pose_214 is None:
-            # Fallback: tạo pose zero
             pose_214 = np.zeros((1, 214), dtype=np.float32)
             T = 1
         
@@ -104,19 +127,18 @@ class SignLanguageDataset(Dataset):
         if self.normalize:
             pose_214 = normalize_pose(pose_214, self.mean, self.std)
         
-        # Pad hoặc truncate
+        # Pad/Crop
         if T > self.max_seq_len:
             pose_214 = pose_214[:self.max_seq_len]
             T = self.max_seq_len
         else:
-            # Pad với zeros
             pad_len = self.max_seq_len - T
             pose_214 = np.pad(pose_214, ((0, pad_len), (0, 0)), mode='constant')
         
-        # Load text
+        # Lấy Text
         text = self.texts.get(video_id, "")
         
-        # Tokenize text
+        # Tokenize
         encoded = self.tokenizer(
             text,
             max_length=self.max_text_len,
@@ -125,47 +147,37 @@ class SignLanguageDataset(Dataset):
             return_tensors='pt'
         )
         
-        text_tokens = encoded['input_ids'].squeeze(0)  # [max_text_len]
-        attention_mask = encoded['attention_mask'].squeeze(0)  # [max_text_len]
-        
         return {
             'video_id': video_id,
-            'pose': torch.FloatTensor(pose_214),  # [max_seq_len, 214]
+            'pose': torch.FloatTensor(pose_214),
             'seq_length': T,
             'text': text,
-            'text_tokens': text_tokens,  # [max_text_len]
-            'attention_mask': attention_mask,  # [max_text_len]
+            'text_tokens': encoded['input_ids'].squeeze(0),
+            'attention_mask': encoded['attention_mask'].squeeze(0),
         }
     
     def get_mean_std(self):
-        """Trả về mean và std để denormalize"""
-        if self.normalize:
-            return self.mean, self.std
+        if self.normalize: return self.mean, self.std
         return None, None
 
 
 def collate_fn(batch):
-    """
-    Collate function cho DataLoader
-    """
     video_ids = [item['video_id'] for item in batch]
-    poses = torch.stack([item['pose'] for item in batch])  # [B, T, 214]
-    seq_lengths = torch.LongTensor([item['seq_length'] for item in batch])  # [B]
+    poses = torch.stack([item['pose'] for item in batch])
+    seq_lengths = torch.LongTensor([item['seq_length'] for item in batch])
     texts = [item['text'] for item in batch]
-    text_tokens = torch.stack([item['text_tokens'] for item in batch])  # [B, L]
-    attention_masks = torch.stack([item['attention_mask'] for item in batch])  # [B, L]
+    text_tokens = torch.stack([item['text_tokens'] for item in batch])
+    attention_masks = torch.stack([item['attention_mask'] for item in batch])
     
-    # Tạo mask cho poses (True = valid, False = padding)
     max_len = poses.shape[1]
-    pose_mask = torch.arange(max_len)[None, :] < seq_lengths[:, None]  # [B, T]
+    pose_mask = torch.arange(max_len)[None, :] < seq_lengths[:, None]
     
     return {
         'video_ids': video_ids,
-        'poses': poses,  # [B, T, 214]
-        'pose_mask': pose_mask,  # [B, T]
-        'seq_lengths': seq_lengths,  # [B]
-        'texts': texts,
-        'text_tokens': text_tokens,  # [B, L]
-        'attention_mask': attention_masks,  # [B, L]
+        'poses': poses,         
+        'pose_mask': pose_mask, 
+        'seq_lengths': seq_lengths,
+        'text_tokens': text_tokens,
+        'attention_mask': attention_masks,
+        'texts': texts
     }
-
