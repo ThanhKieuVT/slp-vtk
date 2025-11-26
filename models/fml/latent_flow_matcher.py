@@ -6,7 +6,6 @@ from .flow_matching import FlowMatchingBlock, FlowMatchingScheduler, FlowMatchin
 from .mamba_prior import SimpleSSMPrior
 from .sync_guidance import SyncGuidanceHead
 
-# === MỚI: Class Dự Đoán Độ Dài ===
 class LengthPredictor(nn.Module):
     """Mạng nhỏ để dự đoán số lượng frames từ text features"""
     def __init__(self, input_dim, hidden_dim=256):
@@ -17,25 +16,23 @@ class LengthPredictor(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1) # Output ra 1 số thực (số frames)
+            nn.Linear(hidden_dim, 1) 
         )
 
     def forward(self, text_features, mask=None):
-        # text_features: [Batch, Seq_Len, Dim]
-        # Gom thông tin cả câu lại để đoán độ dài
         if mask is not None:
-            keep_mask = (~mask).float().unsqueeze(-1) # [B, L, 1]
+            keep_mask = (~mask).float().unsqueeze(-1) 
             pooled_text = (text_features * keep_mask).sum(dim=1) / keep_mask.sum(dim=1).clamp(min=1)
         else:
             pooled_text = text_features.mean(dim=1) 
             
         pred_length = self.net(pooled_text)
-        return pred_length.squeeze(-1) # [Batch]
+        return pred_length.squeeze(-1) 
 
 
 class LatentFlowMatcher(nn.Module):
     """
-    Latent Flow Matcher SOTA: Kèm theo Length Predictor
+    Latent Flow Matcher SOTA: FIXED Gradient Sign & Loss Detach
     """
     
     def __init__(
@@ -68,7 +65,6 @@ class LatentFlowMatcher(nn.Module):
         self.W_SYNC = W_SYNC
         self.W_LENGTH = W_LENGTH
         
-        # Text encoder
         self.text_encoder = BertModel.from_pretrained(text_encoder_name)
         for param in self.text_encoder.parameters():
             param.requires_grad = False
@@ -76,14 +72,11 @@ class LatentFlowMatcher(nn.Module):
         text_dim = self.text_encoder.config.hidden_size
         self.text_proj = nn.Linear(text_dim, hidden_dim) 
         
-        # === Length Predictor ===
         self.length_predictor = LengthPredictor(input_dim=hidden_dim)
         self.length_loss_fn = nn.MSELoss()
         
-        # Flow scheduler
         self.scheduler = FlowMatchingScheduler()
         
-        # Flow Block
         self.flow_block = FlowMatchingBlock(
             data_dim=latent_dim,
             condition_dim=hidden_dim, 
@@ -93,19 +86,16 @@ class LatentFlowMatcher(nn.Module):
             dropout=dropout
         )
         
-        # SSM Prior
         if use_ssm_prior:
             self.ssm_prior = SimpleSSMPrior(latent_dim, hidden_dim, num_prior_layers, num_heads, dropout)
         else:
             self.ssm_prior = None
         
-        # Sync Guidance
         if use_sync_guidance:
             self.sync_head = SyncGuidanceHead(latent_dim, hidden_dim // 2, dropout)
         else:
             self.sync_head = None
         
-        # Losses
         self.flow_loss_fn = FlowMatchingLoss()
         self.prior_reg_fn = nn.MSELoss()
         self.sync_loss_fn = nn.MSELoss()
@@ -137,12 +127,12 @@ class LatentFlowMatcher(nn.Module):
         device = text_features.device
         B, T, D = gt_latent.shape
         
-        # === 1. TRAINING LENGTH PREDICTOR ===
-        pred_length = self.length_predictor(text_features, text_mask)
+        # <--- FIXED: Detach text_features để Length Predictor không phá hỏng feature space của Flow
+        pred_length = self.length_predictor(text_features.detach(), text_mask)
         target_length = batch['seq_lengths'].float()
         length_loss = self.length_loss_fn(pred_length, target_length)
         
-        # === 2. FLOW MATCHING LOGIC ===
+        # Flow Matching Logic
         t = self.scheduler.sample_timesteps(B, device)
         seq_lengths = batch['seq_lengths']
         mask = torch.arange(T, device=device)[None, :] < seq_lengths[:, None]
@@ -150,7 +140,6 @@ class LatentFlowMatcher(nn.Module):
         latent_t, v_gt, latent_0 = self.scheduler.add_noise(gt_latent, t)
         pose_attn_mask = ~mask
         
-        # Flow prediction does not need grad
         latent_t_flow = latent_t.detach() 
 
         flow_output = self.flow_block(
@@ -175,9 +164,7 @@ class LatentFlowMatcher(nn.Module):
         sync_loss_train = torch.tensor(0.0, device=device)
         
         if self.use_sync_guidance and self.sync_head is not None and pose_gt is not None:
-            # Sync Head needs grad: 
             latent_t_sync = latent_t.detach().requires_grad_(True)
-            
             sync_score_pred = self.sync_head(latent_t_sync, mask)
             with torch.no_grad():
                 sync_loss_target = self.sync_head.compute_loss(latent_t_flow, pose_gt, mask)
@@ -190,7 +177,6 @@ class LatentFlowMatcher(nn.Module):
         flow_loss = self.flow_loss_fn(v_pred_train, v_gt, mask=mask)        
         prior_loss = self.prior_reg_fn(v_flow, v_prior.detach()) if v_prior is not None else torch.tensor(0.0, device=device)
         
-        # Tổng loss bao gồm cả Length Loss
         total_loss = flow_loss + self.W_PRIOR * prior_loss + self.W_SYNC * sync_loss_train + self.W_LENGTH * length_loss
         
         result = {
@@ -206,13 +192,11 @@ class LatentFlowMatcher(nn.Module):
         device = text_features.device
         B = text_features.shape[0]
         
-        # === QUAN TRỌNG: TỰ ĐỘNG DỰ ĐOÁN ĐỘ DÀI ===
         with torch.no_grad():
             pred_len = self.length_predictor(text_features, text_mask)
             target_lengths = pred_len.round().long().clamp(min=10, max=400)
             
         T = target_lengths.max().item()
-        
         mask = torch.arange(T, device=device)[None, :] < target_lengths[:, None]
         
         latent = torch.randn(B, T, self.latent_dim, device=device)
@@ -243,7 +227,10 @@ class LatentFlowMatcher(nn.Module):
                 guidance_loss = guidance_loss.mean()
                 
                 sync_grad = torch.autograd.grad(guidance_loss, latent_grad, create_graph=False)[0]
-                v_pred = v_pred_raw - self.gamma_guidance * sync_grad.detach()
+                
+                # <--- FIXED: Dấu "+" (Gradient Ascent) để tăng độ đồng bộ.
+                # Code cũ dùng "-" (Gradient Descent) làm video bị lệch nhịp.
+                v_pred = v_pred_raw + self.gamma_guidance * sync_grad.detach()
             
             with torch.no_grad():
                 latent = latent + dt * v_pred

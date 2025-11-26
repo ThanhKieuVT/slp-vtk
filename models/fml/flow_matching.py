@@ -25,17 +25,22 @@ class FlowMatchingScheduler:
         return z_t, v_gt, x0
 
 class FlowMatchingLoss(nn.Module):
-    """Flow Matching Loss"""
+    """Flow Matching Loss - FIXED SCALING"""
     def __init__(self):
         super().__init__()
     
     def forward(self, v_pred, v_gt, mask=None):
         loss = (v_pred - v_gt) ** 2
+        
         if mask is not None:
             loss = loss * mask.unsqueeze(-1).float()
-            loss = loss.sum() / mask.sum().clamp(min=1)
+            # <--- FIXED: Chia cho tổng số phần tử (T * D) thay vì chỉ T
+            # Để tránh Loss quá to làm hỏng gradient các phần khác
+            num_elements = mask.sum() * v_pred.shape[-1]
+            loss = loss.sum() / num_elements.clamp(min=1)
         else:
             loss = loss.mean()
+            
         return loss
 
 class CrossAttentionLayer(nn.Module):
@@ -87,6 +92,7 @@ class FlowMatchingBlock(nn.Module):
         
         all_attn_weights = []
         for layer_dict in self.layers:
+            # TransformerEncoderLayer requires src_key_padding_mask
             x = layer_dict['self_attn_block'](x, src_key_padding_mask=pose_attn_mask)
             x, attn_weights = layer_dict['cross_attn'](
                 query=x, key=condition, value=condition, key_padding_mask=text_attn_mask
