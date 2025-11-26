@@ -49,8 +49,9 @@ def inference_sota(text, flow_matcher, decoder, tokenizer, device, scale_factor=
     # --- BƯỚC 3: Decode & Post-process (Lại dùng no_grad) ---
     with torch.no_grad():
         # UN-SCALE (Quan trọng)
-        generated_latent = generated_latent / scale_factor
-        
+        print(f"ℹ️ Debug: Scale Factor gốc là: {scale_factor}")
+       # generated_latent = generated_latent / scale_factor
+        generated_latent = generated_latent / (scale_factor * 0.2)
         # DECODE: Kiểm tra xem Decoder có cần tham số mask không
         T = generated_latent.shape[1]
         decoder_args = inspect.signature(decoder.forward).parameters
