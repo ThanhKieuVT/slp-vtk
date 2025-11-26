@@ -27,14 +27,16 @@ def inference_sota(text, flow_matcher, decoder, tokenizer, device, scale_factor=
     decoder.eval()
     start_time = time.time()
     
-    # 1. Encode Text
+    # --- BƯỚC 1: Encode Text (Dùng no_grad cho nhẹ) ---
     with torch.no_grad():
         encoded = tokenizer(text, return_tensors='pt', padding=True).to(device)
         text_tokens = encoded['input_ids']
         attention_mask = encoded['attention_mask']
+        
         text_features, text_mask = flow_matcher.encode_text(text_tokens, attention_mask)
         
-    # 2. Flow Matching
+    # --- BƯỚC 2: Inference Flow (QUAN TRỌNG: KHÔNG DÙNG no_grad) ---
+    # Sync Guidance cần tính gradient để "lái" đường đi của latent
     print(f"🔄 Đang sinh Latent (Steps={num_steps})...")
     
     generated_latent = flow_matcher._inference_forward(
@@ -43,52 +45,30 @@ def inference_sota(text, flow_matcher, decoder, tokenizer, device, scale_factor=
         text_mask=text_mask, 
         num_steps=num_steps
     ) 
-    
-    # --- 🔍 DEBUG 1: KIỂM TRA LATENT SINH RA ---
-    # Nếu mean ~ 0 và std cực nhỏ (< 0.1) nghĩa là Flow Matcher chưa học được gì (Model bị chết)
-    lat_mean = generated_latent.mean().item()
-    lat_std = generated_latent.std().item()
-    lat_max = generated_latent.max().item()
-    print(f"\n📊 [DEBUG LATENT] Mean: {lat_mean:.6f} | Std: {lat_std:.6f} | Max: {lat_max:.6f}")
-    
-    if lat_std < 0.1:
-        print("⚠️ CẢNH BÁO: Latent quá yếu! Model Flow có thể chưa hội tụ.")
-
-    # 3. Decode
+        
+    # --- BƯỚC 3: Decode & Post-process (Lại dùng no_grad) ---
     with torch.no_grad():
-        # Trả lại logic chia scale factor bình thường vì 0.84 là số hợp lý
-        latent_input = generated_latent / scale_factor
+        # UN-SCALE (Quan trọng)
+        generated_latent = generated_latent / scale_factor
         
-        # --- 🔍 DEBUG 2: TEST THỬ DECODER ---
-        # Ta sẽ tạo thử một latent ngẫu nhiên mạnh để xem Decoder có vẽ được tay không
-        # Nếu random_pose vẽ được tay -> Lỗi do Flow Matcher.
-        # Nếu random_pose cũng mất tay -> Lỗi do Decoder (Autoencoder).
-        print("🧪 Đang thử nghiệm với Random Noise để test Decoder...")
-        random_latent = torch.randn_like(latent_input) * 2.0 # Nhân 2 cho mạnh
-        
-        # Chọn 1 trong 2 dòng dưới để quyết định lấy pose nào xuất ra video
-        # Dòng này: Lấy pose từ Flow Matcher (để xem kết quả thật)
-        final_latent = latent_input 
-        
-        # Dòng này (Bỏ comment nếu muốn test decoder): Lấy pose từ nhiễu
-        # final_latent = random_latent 
-        
-        # Decode
-        T = final_latent.shape[1]
+        # DECODE: Kiểm tra xem Decoder có cần tham số mask không
+        T = generated_latent.shape[1]
         decoder_args = inspect.signature(decoder.forward).parameters
+        
         if 'mask' in decoder_args:
             decode_mask = torch.ones(1, T, dtype=torch.bool, device=device)
-            pose_norm = decoder(final_latent, mask=decode_mask)
+            pose_norm = decoder(generated_latent, mask=decode_mask)
         else:
-            pose_norm = decoder(final_latent)
-            
+            pose_norm = decoder(generated_latent)
+        
         pose = pose_norm.squeeze(0).cpu().numpy()
 
-    # 4. Denormalize
+    # --- BƯỚC 4: Denormalize ---
     if normalize_stats is not None:
         mean = normalize_stats['mean']
         std = normalize_stats['std']
         pose = denormalize_pose(pose, mean, std) 
+        print("✅ Pose Denormalized.")
 
     latency = time.time() - start_time
     return pose, latency
