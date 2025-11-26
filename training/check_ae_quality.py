@@ -1,8 +1,6 @@
 """
-Script: Check Autoencoder Reconstruction Quality (CLI Version)
-Mục đích: Kiểm tra xem Autoencoder có bị "hỏng" (mất tay) không bằng cách tái tạo 1 file pose thật.
+Script: Check Autoencoder Reconstruction Quality (CLI Version) - SAFE MODE
 """
-
 import torch
 import numpy as np
 import argparse
@@ -20,7 +18,7 @@ except ImportError as e:
     sys.exit(1)
 
 def main():
-    # --- 1. CẤU HÌNH ARGPARSE (Theo ý chị) ---
+    # --- 1. CẤU HÌNH ARGPARSE ---
     parser = argparse.ArgumentParser(description='Kiểm tra chất lượng Autoencoder (Stage 1)')
     
     parser.add_argument('--data_dir', type=str, required=True,
@@ -30,6 +28,10 @@ def main():
     parser.add_argument('--output_dir', type=str, default='check_stage1_output',
                         help='Thư mục lưu file kết quả')
     
+    # Thêm các tham số config model (để tránh lỗi nếu chị từng thay đổi khi train)
+    parser.add_argument('--latent_dim', type=int, default=256)
+    parser.add_argument('--hidden_dim', type=int, default=512)
+
     args = parser.parse_args()
 
     # Tạo thư mục output nếu chưa có
@@ -38,35 +40,47 @@ def main():
     print(f"🚀 Đang kiểm tra trên device: {device}")
 
     # --- 2. TÌM FILE DỮ LIỆU ĐỂ TEST ---
-    # Tự động tìm 1 file .npy bất kỳ trong data_dir để làm mẫu
     print(f"🔍 Đang tìm file .npy mẫu trong: {args.data_dir}")
     npy_files = glob.glob(os.path.join(args.data_dir, "**/*.npy"), recursive=True)
-    # Lọc bỏ các file không phải data (như stats hay output cũ)
     valid_files = [f for f in npy_files if 'stats' not in f and 'output' not in f and 'check' not in f]
     
     if not valid_files:
         print("❌ Không tìm thấy file .npy dữ liệu nào trong thư mục data_dir!")
         return
     
-    # Lấy file đầu tiên tìm được
     sample_file = valid_files[0]
     print(f"✅ Đã chọn file mẫu để test: {sample_file}")
 
     # --- 3. LOAD AUTOENCODER ---
     print(f"📦 Loading Autoencoder từ: {args.autoencoder_checkpoint}")
+    
+    # ⚠️ QUAN TRỌNG: Model này phải khởi tạo giống hệt lúc Train
     ae = UnifiedPoseAutoencoder(
         pose_dim=214, 
-        latent_dim=256, 
-        hidden_dim=512
+        latent_dim=args.latent_dim, 
+        hidden_dim=args.hidden_dim
+        # Nếu lúc train chị chỉnh số layers khác mặc định, phải sửa cứng ở đây
+        # ví dụ: encoder_layers=4
     ).to(device)
 
     try:
         ckpt = torch.load(args.autoencoder_checkpoint, map_location=device)
-        if 'model_state_dict' in ckpt:
-            ae.load_state_dict(ckpt['model_state_dict'])
+        
+        # Xử lý linh hoạt dictionary
+        if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+            state_dict = ckpt['model_state_dict']
         else:
-            ae.load_state_dict(ckpt)
+            state_dict = ckpt
+            
+        # Load strict=True để đảm bảo không sai lệch layer nào
+        ae.load_state_dict(state_dict, strict=True)
+        print("✅ Load weights thành công (Strict Mode)!")
         ae.eval()
+        
+    except RuntimeError as e:
+        print(f"⚠️ Lỗi khớp cấu trúc Model (Shape Mismatch): {e}")
+        print("👉 Gợi ý: Kiểm tra xem 'hidden_dim' hoặc số layers trong code này có khớp với file checkpoint không.")
+        return
     except Exception as e:
         print(f"❌ Lỗi load checkpoint: {e}")
         return
@@ -74,7 +88,6 @@ def main():
     # --- 4. LOAD STATS & NORMALIZE ---
     stats_path = os.path.join(args.data_dir, "normalization_stats.npz")
     if not os.path.exists(stats_path):
-        # Thử tìm trong thư mục cha nếu không thấy
         stats_path = os.path.join(args.data_dir, "../normalization_stats.npz")
         
     if not os.path.exists(stats_path):
@@ -83,6 +96,7 @@ def main():
         
     print("📊 Loading Stats...")
     stats = np.load(stats_path)
+    # Load lên GPU để tính toán normalize
     mean = torch.tensor(stats['mean']).float().to(device)
     std = torch.tensor(stats['std']).float().to(device)
 
@@ -91,23 +105,24 @@ def main():
     real_pose = torch.tensor(real_pose_np, dtype=torch.float32).to(device)
     
     # Normalize: (X - Mean) / Std
+    # Thêm 1e-6 để tránh chia cho 0 nếu std có chỗ bằng 0
     real_pose_norm = (real_pose - mean) / (std + 1e-6)
     real_pose_norm = real_pose_norm.unsqueeze(0) # [1, T, 214]
 
-    # --- 5. RECONSTRUCT (CHẠY QUA AE) ---
+    # --- 5. RECONSTRUCT ---
     print("🔄 Đang chạy qua Autoencoder...")
     with torch.no_grad():
+        # Mask=None vì ta đang test 1 file trọn vẹn, không có padding thừa
         recon_norm, _ = ae(real_pose_norm)
 
     # --- 6. DENORMALIZE & SAVE ---
     print("💾 Đang lưu kết quả...")
     
-    # 6.1. Lưu file GỐC (để so sánh)
     real_save_path = os.path.join(args.output_dir, "original_sample.npy")
     np.save(real_save_path, real_pose_np)
     
-    # 6.2. Lưu file TÁI TẠO (qua AE)
     recon = recon_norm.squeeze(0).cpu().numpy()
+    # Denormalize bằng numpy array gốc trong stats (hàm denormalize thường nhận numpy)
     recon_final = denormalize_pose(recon, stats['mean'], stats['std'])
     
     recon_save_path = os.path.join(args.output_dir, "reconstructed_sample.npy")

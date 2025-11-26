@@ -27,18 +27,45 @@ def inference_sota(text, flow_matcher, decoder, tokenizer, device, scale_factor=
     decoder.eval()
     start_time = time.time()
     
-    # --- BƯỚC 1: Encode Text (Dùng no_grad cho nhẹ) ---
+    # --- 1. ENCODE TEXT & DEBUG INPUT (QUAN TRỌNG) ---
     with torch.no_grad():
+        # Tokenize
         encoded = tokenizer(text, return_tensors='pt', padding=True).to(device)
         text_tokens = encoded['input_ids']
         attention_mask = encoded['attention_mask']
         
+        # 🔥 ĐOẠN CODE DEBUG SOI INPUT STAGE 2 🔥
+        print("\n" + "="*30)
+        print("🕵️‍♀️ DEBUG INPUT STAGE 2 (TEXT)")
+        print(f"📝 Text gốc nhập vào: '{text}'")
+        
+        # 1. In ra các ID số (Xem có bị toàn số 100/0 không)
+        ids = text_tokens[0].cpu().tolist()
+        print(f"🔢 Token IDs: {ids}")
+        
+        # 2. Dịch ngược từ ID ra chữ (Xem BERT nó hiểu là chữ gì)
+        tokens_str = tokenizer.convert_ids_to_tokens(ids)
+        print(f"🔤 Tokens tách ra: {tokens_str}")
+        
+        decoded_text = tokenizer.decode(ids, skip_special_tokens=True)
+        print(f"✅ Decoded lại: '{decoded_text}'")
+        
+        # 3. Cảnh báo lỗi thường gặp
+        if "[UNK]" in tokens_str:
+            print("⚠️ CẢNH BÁO: Có token [UNK] (Unknown)! Tokenizer không hiểu từ này.")
+        if len(decoded_text.strip()) == 0:
+            print("❌ LỖI: Text sau khi decode bị rỗng! Kiểm tra lại input.")
+            
+        print("="*30 + "\n")
+        # ------------------------------------------------
+        
+        # Tiếp tục encode features cho Flow Matcher
         text_features, text_mask = flow_matcher.encode_text(text_tokens, attention_mask)
         
-    # --- BƯỚC 2: Inference Flow (QUAN TRỌNG: KHÔNG DÙNG no_grad) ---
-    # Sync Guidance cần tính gradient để "lái" đường đi của latent
+    # --- 2. Inference Flow ---
     print(f"🔄 Đang sinh Latent (Steps={num_steps})...")
     
+    # (Nhớ giữ cái fix đưa ra ngoài no_grad này nhé)
     generated_latent = flow_matcher._inference_forward(
         batch={}, 
         text_features=text_features, 
@@ -46,24 +73,25 @@ def inference_sota(text, flow_matcher, decoder, tokenizer, device, scale_factor=
         num_steps=num_steps
     ) 
         
-    # --- BƯỚC 3: Decode & Post-process (Lại dùng no_grad) ---
+    # --- 3. Decode & Post-process ---
     with torch.no_grad():
-        # UN-SCALE (Quan trọng)
-        generated_latent = generated_latent / scale_factor
+        # UN-SCALE (Giữ lại logic nhân 1.5 như chị đang test)
+        latent_input = generated_latent / scale_factor
+        # latent_input = latent_input * 1.5 # <--- Nếu chị đang test nhân tín hiệu thì bỏ comment dòng này
         
-        # DECODE: Kiểm tra xem Decoder có cần tham số mask không
+        # DECODE
         T = generated_latent.shape[1]
         decoder_args = inspect.signature(decoder.forward).parameters
         
         if 'mask' in decoder_args:
             decode_mask = torch.ones(1, T, dtype=torch.bool, device=device)
-            pose_norm = decoder(generated_latent, mask=decode_mask)
+            pose_norm = decoder(latent_input, mask=decode_mask)
         else:
-            pose_norm = decoder(generated_latent)
+            pose_norm = decoder(latent_input)
         
         pose = pose_norm.squeeze(0).cpu().numpy()
 
-    # --- BƯỚC 4: Denormalize ---
+    # --- 4. Denormalize ---
     if normalize_stats is not None:
         mean = normalize_stats['mean']
         std = normalize_stats['std']
@@ -72,7 +100,6 @@ def inference_sota(text, flow_matcher, decoder, tokenizer, device, scale_factor=
 
     latency = time.time() - start_time
     return pose, latency
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--text', type=str, required=True)
