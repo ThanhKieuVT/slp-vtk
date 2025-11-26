@@ -1,6 +1,9 @@
 """
 Inference Script: Text -> Latent Flow -> Pose
-FIXED: Safe loading, Check mask decoder, Full Error Handling
+FIXED: 
+1. Enable Gradients for Sync Guidance (Fixed RuntimeError)
+2. Match Prior Layers to Checkpoint (Fixed Warning)
+3. Safe Checkpoint Loading & Full Error Handling
 """
 import os
 import argparse
@@ -9,7 +12,7 @@ import numpy as np
 from transformers import BertTokenizer
 import time
 import sys
-import inspect # <--- MỚI
+import inspect
 
 try:
     from models.fml.autoencoder import UnifiedPoseAutoencoder
@@ -24,6 +27,7 @@ def inference_sota(text, flow_matcher, decoder, tokenizer, device, scale_factor=
     decoder.eval()
     start_time = time.time()
     
+    # --- BƯỚC 1: Encode Text (Dùng no_grad cho nhẹ) ---
     with torch.no_grad():
         encoded = tokenizer(text, return_tensors='pt', padding=True).to(device)
         text_tokens = encoded['input_ids']
@@ -31,18 +35,23 @@ def inference_sota(text, flow_matcher, decoder, tokenizer, device, scale_factor=
         
         text_features, text_mask = flow_matcher.encode_text(text_tokens, attention_mask)
         
-        print(f"🔄 Đang sinh Latent (Steps={num_steps})...")
-        generated_latent = flow_matcher._inference_forward(
-            batch={}, 
-            text_features=text_features, 
-            text_mask=text_mask, 
-            num_steps=num_steps
-        ) 
+    # --- BƯỚC 2: Inference Flow (QUAN TRỌNG: KHÔNG DÙNG no_grad) ---
+    # Sync Guidance cần tính gradient để "lái" đường đi của latent
+    print(f"🔄 Đang sinh Latent (Steps={num_steps})...")
+    
+    generated_latent = flow_matcher._inference_forward(
+        batch={}, 
+        text_features=text_features, 
+        text_mask=text_mask, 
+        num_steps=num_steps
+    ) 
         
-        # UN-SCALE
+    # --- BƯỚC 3: Decode & Post-process (Lại dùng no_grad) ---
+    with torch.no_grad():
+        # UN-SCALE (Quan trọng)
         generated_latent = generated_latent / scale_factor
         
-        # DECODE: Kiểm tra Decoder có cần mask ko
+        # DECODE: Kiểm tra xem Decoder có cần tham số mask không
         T = generated_latent.shape[1]
         decoder_args = inspect.signature(decoder.forward).parameters
         
@@ -54,7 +63,7 @@ def inference_sota(text, flow_matcher, decoder, tokenizer, device, scale_factor=
         
         pose = pose_norm.squeeze(0).cpu().numpy()
 
-    # DENORMALIZE
+    # --- BƯỚC 4: Denormalize ---
     if normalize_stats is not None:
         mean = normalize_stats['mean']
         std = normalize_stats['std']
@@ -82,46 +91,53 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"🚀 Using device: {device}")
     
-    # Check stats
+    # Check normalization stats
     normalize_stats = None
     stats_path = os.path.join(args.data_dir, "normalization_stats.npz")
     if os.path.exists(stats_path):
         normalize_stats = np.load(stats_path, allow_pickle=True)
     else:
-        print(f"❌ Error: Không tìm thấy {stats_path}")
+        print(f"❌ Error: Không tìm thấy file stats tại {stats_path}")
+        print("💡 Vui lòng tạo lại file stats hoặc copy vào đúng thư mục.")
         sys.exit(1)
     
-    # Load Models
+    # 1. Load Autoencoder
     print(f"📦 Loading Autoencoder...")
     ae = UnifiedPoseAutoencoder(pose_dim=214, latent_dim=args.latent_dim, hidden_dim=args.hidden_dim).to(device)
     ae_ckpt = torch.load(args.autoencoder_checkpoint, map_location=device)
-    # <--- Safe load state dict
-    if 'model_state_dict' in ae_ckpt: ae.load_state_dict(ae_ckpt['model_state_dict'])
-    else: ae.load_state_dict(ae_ckpt)
+    
+    if 'model_state_dict' in ae_ckpt: 
+        ae.load_state_dict(ae_ckpt['model_state_dict'])
+    else: 
+        ae.load_state_dict(ae_ckpt)
     ae.eval()
     
+    # 2. Load Flow Matcher
     print(f"📦 Loading Flow Matcher...")
     flow_ckpt = torch.load(args.flow_checkpoint, map_location=device)
     scale_factor = flow_ckpt.get('latent_scale_factor', 1.0)
+    print(f"ℹ️ Scale Factor: {scale_factor:.4f}")
     
     flow_matcher = LatentFlowMatcher(
         latent_dim=args.latent_dim, hidden_dim=args.hidden_dim,
-        num_flow_layers=6, num_prior_layers=4, num_heads=8, dropout=0.1,
+        num_flow_layers=6, 
+        num_prior_layers=6, # <--- FIXED: Sửa thành 6 để khớp với checkpoint
+        num_heads=8, dropout=0.1,
         use_ssm_prior=args.use_ssm_prior, use_sync_guidance=args.use_sync_guidance
     ).to(device)
     
+    # Load weights an toàn
+    state_dict = flow_ckpt['model_state_dict'] if 'model_state_dict' in flow_ckpt else flow_ckpt
     try:
-        if 'model_state_dict' in flow_ckpt: flow_matcher.load_state_dict(flow_ckpt['model_state_dict'], strict=True)
-        else: flow_matcher.load_state_dict(flow_ckpt, strict=True)
+        flow_matcher.load_state_dict(state_dict, strict=True)
     except Exception as e:
-        print(f"⚠️ Warning strict loading: {e}. Trying strict=False")
-        if 'model_state_dict' in flow_ckpt: flow_matcher.load_state_dict(flow_ckpt['model_state_dict'], strict=False)
-        else: flow_matcher.load_state_dict(flow_ckpt, strict=False)
+        print(f"⚠️ Warning strict loading: {e}. Trying strict=False...")
+        flow_matcher.load_state_dict(state_dict, strict=False)
     
     flow_matcher.eval()
     tokenizer = BertTokenizer.from_pretrained('bert-base-multilingual-cased')
     
-    # Run
+    # 3. Run Inference
     pose, latency = inference_sota(args.text, flow_matcher, ae.decoder, tokenizer, device, scale_factor, args.num_steps, normalize_stats)
     
     print(f"✅ Done! Latency: {latency:.2f}s. Saved to {args.output_path}")
