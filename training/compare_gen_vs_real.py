@@ -1,6 +1,4 @@
-v"""
-Script so sánh Real vs Gen (Phiên bản Point Cloud - Chuẩn không cần chỉnh)
-"""
+ 
 import os
 import argparse
 import numpy as np
