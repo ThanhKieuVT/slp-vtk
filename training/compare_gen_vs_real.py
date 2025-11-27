@@ -1,162 +1,198 @@
 """
-Script so sánh Real vs Generated Pose (Phiên bản Chuẩn Xác)
-Chức năng:
-1. Load pose thật (Real) từ ID và pose giả (Gen) từ file .npy
-2. Tách bỏ các thành phần phi tọa độ (AUs, Head, Gaze) trong vector 214 chiều.
-3. Vẽ video so sánh dạng Point Cloud (Chấm điểm).
+Script: Đánh giá & So sánh ngẫu nhiên các mẫu từ tập Test/Dev
+Tự động sinh video so sánh Real vs Gen (Dạng Point Cloud chuẩn).
 """
 import os
 import sys
 import argparse
+import torch
 import numpy as np
+import random
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+from transformers import BertTokenizer
 
-# Thêm đường dẫn hiện tại để import module
-sys.path.append(os.getcwd())
+# --- SETUP PATH ---
+sys.path.append(os.getcwd()) 
 
 try:
-    # Cố gắng import hàm load chuẩn từ file của chị
-    from data_preparation import load_sample
-except ImportError:
-    print("❌ Lỗi: Không tìm thấy file 'data_preparation.py'.")
-    print("💡 Hãy đảm bảo chị chạy lệnh từ thư mục gốc của project.")
+    from models.fml.autoencoder import UnifiedPoseAutoencoder
+    from models.fml.latent_flow_matcher import LatentFlowMatcher
+    from data_preparation import load_sample, denormalize_pose
+except ImportError as e:
+    print(f"❌ Lỗi Import: {e}")
+    print("💡 Chị nhớ chạy từ thư mục gốc dự án nhé!")
     sys.exit(1)
 
-# === 1. HÀM TÁCH TỌA ĐỘ (CỐT LÕI) ===
+# === 1. HÀM TÁCH TỌA ĐỘ (Logic chuẩn: Body + Mouth, bỏ rác) ===
 def extract_visual_coordinates(pose_214):
-    """
-    Input: [T, 214] vector chứa lung tung cả tọa độ lẫn số đo.
-    Output: [T, N_points, 2] chỉ chứa tọa độ X,Y để vẽ.
+    # 1. Lấy Body + Hands (75 điểm x 2 = 150) -> Index: 0-150
+    body_hands = pose_214[:, :150] 
     
-    Cấu trúc vector 214 chiều (dựa trên data_preparation.py):
-    - 0   -> 150: Body + Hands (75 điểm x 2 chiều) -> LẤY
-    - 150 -> 167: Facial AUs (17 số)               -> BỎ
-    - 167 -> 170: Head Pose (3 số)                 -> BỎ
-    - 170 -> 174: Eye Gaze (4 số)                  -> BỎ
-    - 174 -> 214: Mouth (20 điểm x 2 chiều)        -> LẤY
-    """
-    # 1. Lấy phần Body + Hands
-    body_hands_flat = pose_214[:, :150] # [T, 150]
+    # 2. Lấy Mouth (20 điểm x 2 = 40) -> Index: 174-214
+    mouth = pose_214[:, 174:214]
     
-    # 2. Lấy phần Mouth
-    mouth_flat = pose_214[:, 174:214]   # [T, 40]
+    # Gộp lại: 75 + 20 = 95 điểm
+    visual_flat = np.concatenate([body_hands, mouth], axis=1)
     
-    # 3. Gộp lại
-    visual_flat = np.concatenate([body_hands_flat, mouth_flat], axis=1) # [T, 190]
-    
-    # 4. Reshape thành tọa độ (X, Y)
-    # Tổng số điểm = 190 / 2 = 95 điểm
-    visual_points = visual_flat.reshape(len(pose_214), -1, 2) # [T, 95, 2]
-    
-    return visual_points
+    # Reshape thành (N, 2)
+    return visual_flat.reshape(len(pose_214), -1, 2) 
 
-# === 2. HÀM VẼ VIDEO SO SÁNH ===
-def create_comparison_video(real_pose_raw, gen_pose_raw, output_path, video_id):
-    print(f"🔄 Đang xử lý data cho ID: {video_id}")
+# === 2. HÀM TẠO VIDEO (Point Cloud) ===
+def create_comparison_video(real_pose, gen_pose, save_path, title):
+    # Lấy tọa độ sạch
+    real_data = extract_visual_coordinates(real_pose)
+    gen_data = extract_visual_coordinates(gen_pose)
     
-    # 1. Cắt độ dài cho bằng nhau
-    min_len = min(len(real_pose_raw), len(gen_pose_raw))
-    real_raw = real_pose_raw[:min_len]
-    gen_raw = gen_pose_raw[:min_len]
+    min_len = min(len(real_data), len(gen_data))
     
-    # 2. Trích xuất tọa độ sạch
-    real_data = extract_visual_coordinates(real_raw)
-    gen_data = extract_visual_coordinates(gen_raw)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
     
-    print(f"🎬 Đang render video ({min_len} frames)...")
-    
-    # 3. Setup khung hình (2 bên)
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-    
-    # Tính giới hạn khung hình (Scale) dựa trên dữ liệu thật
+    # Tính scale chung
     all_x = real_data[:, :, 0].flatten()
     all_y = real_data[:, :, 1].flatten()
     
-    # Lọc bỏ điểm 0 (padding) để tính scale chuẩn
-    valid_mask = (all_x > 0.01) & (all_y > 0.01)
-    
-    if valid_mask.sum() > 0:
-        x_min, x_max = all_x[valid_mask].min(), all_x[valid_mask].max()
-        y_min, y_max = all_y[valid_mask].min(), all_y[valid_mask].max()
+    # Lọc điểm rác để tính khung hình
+    valid = (all_x > 0.01) & (all_y > 0.01)
+    if valid.sum() > 0:
+        x_min, x_max = all_x[valid].min(), all_x[valid].max()
+        y_min, y_max = all_y[valid].min(), all_y[valid].max()
     else:
-        # Fallback nếu data lỗi
         x_min, x_max, y_min, y_max = 0, 1, 0, 1
         
-    # Nới rộng viền tí cho đẹp
     margin_w = (x_max - x_min) * 0.1
     margin_h = (y_max - y_min) * 0.1
     
     for ax in [ax1, ax2]:
         ax.set_xlim(x_min - margin_w, x_max + margin_w)
-        ax.set_ylim(y_max + margin_h, y_min - margin_h) # Đảo trục Y (ảnh gốc gốc toạ độ ở trên cùng)
-        ax.axis('off') # Tắt trục số
+        ax.set_ylim(y_max + margin_h, y_min - margin_h) # Đảo trục Y
+        ax.axis('off')
         
     ax1.set_title("REAL (Ground Truth)", color='darkred', fontweight='bold')
     ax2.set_title("GENERATED (AI)", color='darkblue', fontweight='bold')
-    fig.suptitle(f"Video ID: {video_id}", fontsize=10)
+    fig.suptitle(title, fontsize=9)
     
-    # 4. Init Artists (Các chấm điểm)
-    # Real = Đỏ, Gen = Xanh
-    scat_real = ax1.scatter([], [], s=15, c='red', alpha=0.7, edgecolors='none')
-    scat_gen = ax2.scatter([], [], s=15, c='blue', alpha=0.7, edgecolors='none')
+    # Vẽ chấm (Scatter)
+    scat_real = ax1.scatter([], [], s=10, c='red', alpha=0.6)
+    scat_gen = ax2.scatter([], [], s=10, c='blue', alpha=0.6)
     
     def update(frame):
-        # Lấy frame t
-        p_real = real_data[frame]
-        p_gen = gen_data[frame]
+        p_r = real_data[frame]
+        p_g = gen_data[frame]
         
-        # Lọc bỏ các điểm rác (tọa độ 0,0 do padding hoặc missing)
-        # Điểm hợp lệ là điểm có tổng trị tuyệt đối > 0
-        mask_r = (np.abs(p_real).sum(axis=1) > 1e-3)
-        mask_g = (np.abs(p_gen).sum(axis=1) > 1e-3)
+        # Mask điểm rác (tọa độ 0,0)
+        mask_r = (np.abs(p_r).sum(axis=1) > 1e-3)
+        mask_g = (np.abs(p_g).sum(axis=1) > 1e-3)
         
-        scat_real.set_offsets(p_real[mask_r])
-        scat_gen.set_offsets(p_gen[mask_g])
-        
+        scat_real.set_offsets(p_r[mask_r])
+        scat_gen.set_offsets(p_g[mask_g])
         return scat_real, scat_gen
 
-    # Render
     ani = animation.FuncAnimation(fig, update, frames=min_len, blit=True, interval=50)
-    ani.save(output_path, writer='ffmpeg', fps=20)
-    print(f"✅ HOÀN TẤT! Video lưu tại: {output_path}")
+    ani.save(save_path, writer='ffmpeg', fps=25)
     plt.close()
 
 # === 3. MAIN ===
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gen_path', type=str, required=True, help="Đường dẫn file .npy sinh ra từ model")
-    parser.add_argument('--data_dir', type=str, required=True, help="Thư mục chứa data gốc (processed_data/data)")
-    parser.add_argument('--video_id', type=str, required=True, help="Tên ID của video gốc để so sánh")
-    parser.add_argument('--split', type=str, default='train', help="Split chứa video gốc (train/dev/test)")
-    parser.add_argument('--output_video', type=str, default='compare_final.mp4', help="Tên file video đầu ra")
+    parser.add_argument('--text_file', type=str, required=True)
+    parser.add_argument('--data_dir', type=str, required=True)
+    parser.add_argument('--flow_ckpt', type=str, required=True)
+    parser.add_argument('--ae_ckpt', type=str, required=True)
+    parser.add_argument('--output_dir', type=str, default='evaluation_results')
+    parser.add_argument('--num_samples', type=int, default=5)
+    parser.add_argument('--split', type=str, default='test')
+    
+    # Model config
+    parser.add_argument('--latent_dim', type=int, default=256)
+    parser.add_argument('--hidden_dim', type=int, default=512)
+    parser.add_argument('--ae_hidden_dim', type=int, default=512)
     
     args = parser.parse_args()
     
-    # 1. Load Gen
-    if not os.path.exists(args.gen_path):
-        print(f"❌ Không tìm thấy file Gen: {args.gen_path}")
-        return
-    gen_pose = np.load(args.gen_path)
-    print(f"📂 Loaded Gen Pose: {gen_pose.shape}")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    os.makedirs(args.output_dir, exist_ok=True)
+    print(f"🚀 Bắt đầu đánh giá trên: {device}")
+
+    # --- Load Models ---
+    print("📦 Loading Models...")
+    ae = UnifiedPoseAutoencoder(214, args.latent_dim, args.ae_hidden_dim).to(device)
+    ae.load_state_dict(torch.load(args.ae_ckpt, map_location=device)['model_state_dict'])
+    ae.eval()
     
-    # 2. Load Real
-    split_dir = os.path.join(args.data_dir, args.split)
-    if not os.path.exists(split_dir):
-        print(f"❌ Không tìm thấy thư mục split: {split_dir}")
-        return
+    ckpt = torch.load(args.flow_ckpt, map_location=device)
+    scale_factor = ckpt.get('latent_scale_factor', 1.0)
+    print(f"ℹ️ Scale Factor: {scale_factor:.4f}")
+    
+    flow = LatentFlowMatcher(
+        latent_dim=args.latent_dim, hidden_dim=args.hidden_dim,
+        num_flow_layers=6, num_prior_layers=4, num_heads=8,
+        use_ssm_prior=True, use_sync_guidance=True
+    ).to(device)
+    flow.load_state_dict(ckpt['model_state_dict'], strict=False)
+    flow.eval()
+    
+    tokenizer = BertTokenizer.from_pretrained('bert-base-multilingual-cased')
+    
+    # --- Load Stats ---
+    stats_path = os.path.join(args.data_dir, "normalization_stats.npz")
+    if not os.path.exists(stats_path): stats_path = os.path.join(args.data_dir, "../normalization_stats.npz")
+    stats = np.load(stats_path)
+    mean, std = stats['mean'], stats['std']
+
+    # --- Select Samples ---
+    split_pose_dir = os.path.join(args.data_dir, args.split, "poses")
+    available_ids = set([f.replace('.npz','') for f in os.listdir(split_pose_dir)])
+    
+    samples = []
+    with open(args.text_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            parts = line.strip().split('|')
+            if len(parts) >= 2:
+                vid_id = parts[0].strip()
+                text = parts[-1].strip()
+                if vid_id in available_ids:
+                    samples.append((vid_id, text))
+    
+    if not samples:
+        print("❌ Không tìm thấy mẫu nào!")
+        sys.exit(1)
         
-    print(f"📂 Loading Real ID: {args.video_id}...")
-    real_pose, T = load_sample(args.video_id, split_dir)
-    
-    if real_pose is None:
-        print("❌ Không load được Pose gốc! Kiểm tra lại ID hoặc đường dẫn Data.")
-        return
-    
-    print(f"📊 Real Pose Shape: {real_pose.shape}")
-    
-    # 3. Tạo Video
-    create_comparison_video(real_pose, gen_pose, args.output_video, args.video_id)
+    selected = random.sample(samples, min(args.num_samples, len(samples)))
+    print(f"✅ Đã chọn {len(selected)} mẫu.")
+
+    # --- Run Inference ---
+    for idx, (vid_id, text) in enumerate(selected):
+        print(f"\n[{idx+1}/{len(selected)}] Generating: {vid_id}")
+        
+        # 1. Generate
+        with torch.no_grad():
+            encoded = tokenizer(text, return_tensors='pt', padding=True).to(device)
+            text_feat, text_mask = flow.encode_text(encoded['input_ids'], encoded['attention_mask'])
+            
+            latent = flow._inference_forward(
+                batch={}, text_features=text_feat, text_mask=text_mask, num_steps=50
+            )
+            
+            latent = latent / scale_factor
+            pose_norm = ae.decoder(latent).squeeze(0).cpu().numpy()
+            
+            # Smoothing
+            from scipy.signal import savgol_filter
+            if pose_norm.shape[0] > 7:
+                pose_norm = savgol_filter(pose_norm, 7, 2, axis=0)
+            
+            gen_pose = denormalize_pose(pose_norm, mean, std)
+            
+        # 2. Get Real
+        real_pose, _ = load_sample(vid_id, os.path.join(args.data_dir, args.split))
+        
+        # 3. Create Video
+        out_path = os.path.join(args.output_dir, f"sample_{idx}_{vid_id}.mp4")
+        create_comparison_video(real_pose, gen_pose, out_path, f"ID: {vid_id}")
+        print(f"   💾 Saved: {out_path}")
+
+    print("\n🎉 DONE!")
 
 if __name__ == '__main__':
     main()
