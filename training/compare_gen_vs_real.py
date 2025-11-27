@@ -1,5 +1,5 @@
 """
-Script: Đánh giá & So sánh (Visual Skeleton + Print Text Input)
+Script: Đánh giá & So sánh (FIXED: Length Prediction + Smooth Inference)
 """
 import os
 import sys
@@ -7,14 +7,15 @@ import argparse
 import torch
 import numpy as np
 import random
+import matplotlib
+matplotlib.use('Agg') # Chạy chế độ không màn hình (Headless)
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.lines import Line2D
 from transformers import BertTokenizer
 from scipy.signal import savgol_filter
 
-# --- SETUP PATH ---
-sys.path.append(os.getcwd()) 
+sys.path.append(os.getcwd())
 
 try:
     from models.fml.autoencoder import UnifiedPoseAutoencoder
@@ -24,11 +25,8 @@ except ImportError as e:
     print(f"❌ Lỗi Import: {e}")
     sys.exit(1)
 
-# ... (Giữ nguyên phần cấu hình ALL_CONNECTIONS và các hàm vẽ visual y hệt như trước) ...
-# Để tiết kiệm không gian, em chỉ paste lại phần Main Loop có thay đổi quan trọng
-
 # ==========================================
-# 1. CẤU HÌNH KẾT NỐI XƯƠNG
+# CẤU HÌNH SKELETON
 # ==========================================
 HAND_CONNECTIONS = [(0,1),(1,2),(2,3),(3,4),(0,5),(5,6),(6,7),(7,8),(0,9),(9,10),(10,11),(11,12),(0,13),(13,14),(14,15),(15,16),(0,17),(17,18),(18,19),(19,20)]
 POSE_CONNECTIONS_UPPER_BODY = [(0,1),(1,2),(2,3),(3,7),(0,4),(4,5),(5,6),(6,8),(9,10),(11,12),(11,13),(13,15),(12,14),(14,16),(11,23),(12,24),(23,24)]
@@ -71,14 +69,14 @@ def create_comparison_video(real_pose, gen_pose, save_path, title):
     valid_kps = plot_points_gt[np.sum(np.abs(plot_points_gt), axis=2) > VALID_POINT_THRESHOLD]
     
     if valid_kps.shape[0] > 0:
-         min_vals = np.min(valid_kps, axis=0)
-         max_vals = np.max(valid_kps, axis=0)
-         padding = np.maximum(0.2 * (max_vals - min_vals), 0.1)
-         x_lims = (min_vals[0] - padding[0], max_vals[0] + padding[0])
-         y_lims = (max_vals[1] + padding[1], min_vals[1] - padding[1])
+        min_vals = np.min(valid_kps, axis=0)
+        max_vals = np.max(valid_kps, axis=0)
+        padding = np.maximum(0.2 * (max_vals - min_vals), 0.1)
+        x_lims = (min_vals[0] - padding[0], max_vals[0] + padding[0])
+        y_lims = (max_vals[1] + padding[1], min_vals[1] - padding[1])
     else:
-         x_lims = (-0.5, 0.5)
-         y_lims = (0.5, -0.5)
+        x_lims = (-0.5, 0.5)
+        y_lims = (0.5, -0.5)
     
     for ax in [ax1, ax2]:
         ax.set_xlim(x_lims)
@@ -128,7 +126,33 @@ def create_comparison_video(real_pose, gen_pose, save_path, title):
     plt.close()
 
 # ==========================================
-# 4. MAIN LOGIC (CÓ IN RA TEXT)
+# 🔥 FIX: THÊM TEMPORAL SMOOTHING
+# ==========================================
+def temporal_smooth_latent(latent, window=5, polyorder=2):
+    """
+    Làm mượt latent trajectory bằng Savitzky-Golay filter
+    
+    Args:
+        latent: [B, T, D] tensor
+        window: Kích thước cửa sổ (phải lẻ)
+        polyorder: Bậc đa thức
+    """
+    if latent.shape[1] < window:
+        return latent
+    
+    # Convert to numpy
+    latent_np = latent.cpu().numpy()
+    
+    # Apply filter cho từng batch và feature dim
+    smoothed = np.zeros_like(latent_np)
+    for b in range(latent_np.shape[0]):
+        for d in range(latent_np.shape[2]):
+            smoothed[b, :, d] = savgol_filter(latent_np[b, :, d], window, polyorder)
+    
+    return torch.from_numpy(smoothed).to(latent.device)
+
+# ==========================================
+# MAIN LOGIC
 # ==========================================
 def main():
     parser = argparse.ArgumentParser()
@@ -142,6 +166,8 @@ def main():
     parser.add_argument('--latent_dim', type=int, default=256)
     parser.add_argument('--hidden_dim', type=int, default=512)
     parser.add_argument('--ae_hidden_dim', type=int, default=512)
+    parser.add_argument('--num_inference_steps', type=int, default=100, help="Số bước ODE solving (càng cao càng mượt)")
+    parser.add_argument('--use_temporal_smooth', action='store_true', default=True, help="Bật temporal smoothing")
     
     args = parser.parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -168,7 +194,8 @@ def main():
     
     # Load Stats
     stats_path = os.path.join(args.data_dir, "normalization_stats.npz")
-    if not os.path.exists(stats_path): stats_path = os.path.join(args.data_dir, "../normalization_stats.npz")
+    if not os.path.exists(stats_path): 
+        stats_path = os.path.join(args.data_dir, "../normalization_stats.npz")
     stats = np.load(stats_path)
     mean, std = stats['mean'], stats['std']
 
@@ -189,33 +216,63 @@ def main():
     # --- Run Inference ---
     for idx, (vid_id, text) in enumerate(selected):
         print(f"\n[{idx+1}/{len(selected)}] Generating: {vid_id}")
-        
-        # 🔥 IN RA TEXT ĐỂ KIỂM TRA 🔥
         print(f"   📝 Input Text: '{text}'")
-        print(f"   ℹ️ Tokenized: {tokenizer.tokenize(text)[:5]}...")
         
-        # Generate
         with torch.no_grad():
+            # 1. Encode text
             encoded = tokenizer(text, return_tensors='pt', padding=True).to(device)
             text_feat, text_mask = flow.encode_text(encoded['input_ids'], encoded['attention_mask'])
             
-        # Inference
+            # 🔥 FIX 1: DỰ ĐOÁN CHIỀU DÀI ĐÚNG CÁCH
+            # Gọi đúng API của length_predictor (đã được train với scale)
+            if hasattr(flow, 'length_predictor'):
+                # Predictor được train với scale = 120.0
+                pred_len_scaled = flow.length_predictor(text_feat, text_mask)
+                estimated_length = int((pred_len_scaled * 120.0).round().item())
+                print(f"   🤖 Model Predicted Length: {estimated_length} frames")
+            else:
+                # Fallback: Heuristic (1 token ≈ 5 frames)
+                num_tokens = (~text_mask).sum().item()
+                estimated_length = int(num_tokens * 5)
+                print(f"   ⚠️ Using Heuristic Length: {estimated_length} frames")
+            
+            # Clamp an toàn
+            estimated_length = max(20, min(estimated_length, 300))
+            
+            # 🔥 FIX 2: TRUYỀN ĐÚNG KEY
+            fake_batch = {
+                'seq_lengths': torch.tensor([estimated_length], device=device, dtype=torch.long)
+            }
+        
+        # 2. Inference
+        print(f"   ⏳ Running Flow Matching ({args.num_inference_steps} steps)...")
         latent = flow._inference_forward(
-            batch={}, text_features=text_feat, text_mask=text_mask, num_steps=100 # Tăng lên 100 bước cho mượt
+            batch=fake_batch,
+            text_features=text_feat, 
+            text_mask=text_mask, 
+            num_steps=args.num_inference_steps
         )
         
-        # Decode
+        # 🔥 FIX 3: TEMPORAL SMOOTHING
+        if args.use_temporal_smooth:
+            print(f"   🧹 Applying temporal smoothing...")
+            latent = temporal_smooth_latent(latent, window=7, polyorder=3)
+        
+        # 3. Decode
         with torch.no_grad():
             latent = latent / scale_factor
             pose_norm = ae.decoder(latent).squeeze(0).cpu().numpy()
+            
+            # Smooth pose (bổ sung)
             if pose_norm.shape[0] > 7:
                 pose_norm = savgol_filter(pose_norm, 7, 2, axis=0)
-            gen_pose = denormalize_pose(pose_norm, mean, std)
             
-        # Get Real
+            gen_pose = denormalize_pose(pose_norm, mean, std)
+        
+        # 4. Compare with real
         real_pose, _ = load_sample(vid_id, os.path.join(args.data_dir, args.split))
         
-        # Video
+        # 5. Create video
         out_path = os.path.join(args.output_dir, f"sample_{idx}_{vid_id}.mp4")
         create_comparison_video(real_pose, gen_pose, out_path, f"ID: {vid_id}\nText: {text[:40]}...")
         print(f"   💾 Video saved: {out_path}")

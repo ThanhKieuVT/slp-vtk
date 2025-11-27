@@ -189,9 +189,8 @@ def main():
     
     # Loss Weights (ĐÃ FIX MẶC ĐỊNH CHUẨN)
     parser.add_argument('--W_PRIOR', type=float, default=0.1, help="Weight for Prior Reg Loss")
-    parser.add_argument('--W_SYNC', type=float, default=0.1, help="Weight for Sync Loss (Contrastive, nên nhỏ)")
-    parser.add_argument('--W_LENGTH', type=float, default=1.0, help="Weight for Length Loss (Đã normalize nên để 1.0)")
-    
+    parser.add_argument('--W_SYNC', type=float, default=0.05)  # Từ 0.1 → 0.05
+    parser.add_argument('--W_LENGTH', type=float, default=0.01)  # Từ 1.0 → 0.01
     # Inference Params (cho model init)
     parser.add_argument('--lambda_prior', type=float, default=0.1)
     parser.add_argument('--gamma_guidance', type=float, default=0.1)
@@ -257,11 +256,11 @@ def main():
     optimizer = torch.optim.AdamW(flow_matcher.parameters(), lr=args.learning_rate, weight_decay=0.01)
     
     scheduler = CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=20, 
-        T_mult=2,
-        eta_min=1e-6
-    )
+    optimizer,
+    T_0=20,
+    T_mult=2,
+    eta_min=5e-5  # Từ 1e-6 → 5e-5
+)
     
     # 6. RESUME LOGIC (ROBUST VERSION)
     start_epoch = 0

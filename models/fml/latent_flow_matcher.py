@@ -16,18 +16,17 @@ class LengthPredictor(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1) 
+            nn.Linear(hidden_dim, 1)
         )
 
     def forward(self, text_features, mask=None):
         if mask is not None:
-            keep_mask = (~mask).float().unsqueeze(-1) 
+            keep_mask = (~mask).float().unsqueeze(-1)
             pooled_text = (text_features * keep_mask).sum(dim=1) / keep_mask.sum(dim=1).clamp(min=1)
         else:
-            pooled_text = text_features.mean(dim=1) 
-            
+            pooled_text = text_features.mean(dim=1)
         pred_length = self.net(pooled_text)
-        return pred_length.squeeze(-1) 
+        return pred_length.squeeze(-1)
 
 
 class LatentFlowMatcher(nn.Module):
@@ -46,8 +45,8 @@ class LatentFlowMatcher(nn.Module):
         gamma_guidance=0.01,
         lambda_anneal=True,
         W_PRIOR=0.1,
-        W_SYNC=0.5,
-        W_LENGTH=0.1
+        W_SYNC=0.1,  # 🔥 GIẢM TỪ 0.5 → 0.1
+        W_LENGTH=0.01  # 🔥 GIẢM TỪ 1.0 → 0.01
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -66,18 +65,16 @@ class LatentFlowMatcher(nn.Module):
             param.requires_grad = False
             
         text_dim = self.text_encoder.config.hidden_size
-        self.text_proj = nn.Linear(text_dim, hidden_dim) 
+        self.text_proj = nn.Linear(text_dim, hidden_dim)
         
         self.length_predictor = LengthPredictor(input_dim=hidden_dim)
-        
-        # ✅ FIX 3: Dùng SmoothL1Loss cho length (Theo review)
         self.length_loss_fn = nn.SmoothL1Loss()
         
         self.scheduler = FlowMatchingScheduler()
         
         self.flow_block = FlowMatchingBlock(
             data_dim=latent_dim,
-            condition_dim=hidden_dim, 
+            condition_dim=hidden_dim,
             hidden_dim=hidden_dim,
             num_layers=num_flow_layers,
             num_heads=num_heads,
@@ -96,23 +93,19 @@ class LatentFlowMatcher(nn.Module):
         
         self.flow_loss_fn = FlowMatchingLoss()
         self.prior_reg_fn = nn.MSELoss()
-        self.sync_loss_fn = nn.MSELoss()
     
     def encode_text(self, text_tokens, attention_mask):
         self.text_encoder.eval()
         with torch.no_grad():
             outputs = self.text_encoder(text_tokens, attention_mask=attention_mask)
-        text_features = self.text_proj(outputs.last_hidden_state) 
+        text_features = self.text_proj(outputs.last_hidden_state)
         text_mask = ~attention_mask.bool()
         return text_features, text_mask
     
-    # ✅ FIX 1: Sửa Lambda shape logic (Theo review)
     def get_lambda_t(self, t):
         if self.lambda_anneal:
-            # Shape (B, 1, 1) để broadcast với (B, T, D)
             return self.lambda_prior * (1 - t.float().view(-1, 1, 1))
         else:
-            # Scalar để tự broadcast
             return self.lambda_prior
     
     def forward(self, batch, gt_latent, pose_gt=None, mode='train', num_inference_steps=50, return_attn_weights=False):
@@ -127,10 +120,9 @@ class LatentFlowMatcher(nn.Module):
         device = text_features.device
         B, T, D = gt_latent.shape
         
-        # === 1. LENGTH LOSS (FIX: DETACH + NORMALIZE + SMOOTH L1) ===
-        pred_length = self.length_predictor(text_features.detach(), text_mask)
+        # === FIX 1: LENGTH LOSS - BỎ DETACH ===
+        pred_length = self.length_predictor(text_features, text_mask)
         target_length = batch['seq_lengths'].float()
-        
         scale_len = 120.0
         length_loss = self.length_loss_fn(pred_length / scale_len, target_length / scale_len)
         
@@ -143,8 +135,8 @@ class LatentFlowMatcher(nn.Module):
         pose_attn_mask = ~mask
         
         flow_output = self.flow_block(
-            latent_t, t, text_features, 
-            text_attn_mask=text_mask, pose_attn_mask=pose_attn_mask, 
+            latent_t, t, text_features,
+            text_attn_mask=text_mask, pose_attn_mask=pose_attn_mask,
             return_attn=return_attn_weights
         )
         
@@ -160,47 +152,42 @@ class LatentFlowMatcher(nn.Module):
         lambda_t = self.get_lambda_t(t)
         v_pred_train = v_flow + lambda_t * v_prior if v_prior is not None else v_flow
         
-        # === SYNC GUIDANCE (🔥 UPGRADE: CONTRASTIVE LEARNING) ===
+        # === FIX 2: SYNC LOSS - DÙNG SHUFFLED NEGATIVE ===
         sync_loss_train = torch.tensor(0.0, device=device)
         
         if self.use_sync_guidance and self.sync_head is not None:
-            # 1. Positive Sample: Latent hiện tại (đang train)
-            # KHÔNG detach latent_t để gradient chảy ngược về Flow
-            sync_score_pos = self.sync_head(latent_t, mask) 
+            # Positive: latent hiện tại
+            sync_score_pos = self.sync_head(latent_t, mask)
             
-            # 2. Negative Sample: GT Latent bị dịch chuyển thời gian (Time-shift)
-            # Tạo sample "lệch nhịp" để model học cách phân biệt
+            # 🔥 Negative: Pose của sample KHÁC trong batch (shuffled)
             with torch.no_grad():
-                # Shift ngẫu nhiên từ 1 đến T/4 frame
-                shift_amount = torch.randint(1, max(2, T // 4), (B,), device=device)
-                shifted_gt = torch.zeros_like(gt_latent)
-                for b in range(B):
-                    shift = shift_amount[b].item()
-                    # Roll (dịch vòng) latent gốc
-                    shifted_gt[b] = torch.roll(gt_latent[b], shifts=shift, dims=0)
+                rand_idx = torch.randperm(B, device=device)
+                neg_latent = gt_latent[rand_idx].detach()
                 
-                # Negative score (Detach vì đây là target giả)
-                sync_score_neg = self.sync_head(shifted_gt.detach(), mask)
+                # Add noise như latent_t để công bằng
+                neg_t = t[rand_idx]
+                neg_mask = mask[rand_idx]
+                noise = torch.randn_like(neg_latent)
+                neg_latent_noisy = (1 - neg_t.view(-1, 1, 1)) * noise + neg_t.view(-1, 1, 1) * neg_latent
+                
+                sync_score_neg = self.sync_head(neg_latent_noisy, neg_mask)
             
-            # 3. Contrastive Loss (Hinge Loss)
-            # Mục tiêu: Score(Pos) > Score(Neg) + Margin
-            pos_mean = (sync_score_pos * mask.float()).sum(dim=1) / mask.sum(dim=1).clamp(min=1).float()
-            neg_mean = (sync_score_neg * mask.float()).sum(dim=1) / mask.sum(dim=1).clamp(min=1).float()
+            # Contrastive Loss (Hinge)
+            pos_mean = (sync_score_pos * mask.float()).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+            neg_mean = (sync_score_neg * mask.float()).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
             
             margin = 0.2
-            # Loss = max(0, margin + neg - pos)
-            # Nghĩa là nếu Pos lớn hơn Neg một khoảng margin rồi thì thôi, không phạt nữa
-            sync_loss_train = F.relu(margin + neg_mean.detach() - pos_mean).mean()
-
+            sync_loss_train = F.relu(margin + neg_mean - pos_mean).mean()
+        
         # === 4. COMBINE ===
-        flow_loss = self.flow_loss_fn(v_pred_train, v_gt, mask=mask)        
+        flow_loss = self.flow_loss_fn(v_pred_train, v_gt, mask=mask)
         prior_loss = self.prior_reg_fn(v_flow, v_prior.detach()) if v_prior is not None else torch.tensor(0.0, device=device)
         
         total_loss = flow_loss + self.W_PRIOR * prior_loss + self.W_SYNC * sync_loss_train + self.W_LENGTH * length_loss
         
         result = {
-            'total': total_loss, 'flow': flow_loss, 
-            'prior': prior_loss, 'sync': sync_loss_train, 
+            'total': total_loss, 'flow': flow_loss,
+            'prior': prior_loss, 'sync': sync_loss_train,
             'length': length_loss
         }
         if return_attn_weights: result['attn_weights'] = attn_weights
@@ -241,14 +228,10 @@ class LatentFlowMatcher(nn.Module):
             # Sync guidance (inference)
             if self.use_sync_guidance and self.sync_head is not None and 0.2 < t_val < 0.8:
                 sync_score_pred = self.sync_head(latent_grad, mask)
-                
-                # Guidance Loss: Maximize Sync Score
-                guidance_loss = (sync_score_pred * mask.float()).sum(dim=1) / mask.sum(dim=1).clamp(min=1).float()
+                guidance_loss = (sync_score_pred * mask.float()).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
                 guidance_loss = guidance_loss.mean()
                 
                 sync_grad = torch.autograd.grad(guidance_loss, latent_grad, create_graph=False)[0]
-                
-                # Gradient Ascent
                 v_pred = v_pred_raw + self.gamma_guidance * sync_grad.detach()
             else:
                 v_pred = v_pred_raw
@@ -257,7 +240,7 @@ class LatentFlowMatcher(nn.Module):
                 latent = latent + dt * v_pred
                 latent = latent * mask.unsqueeze(-1).float()
                 
-                # ✅ FIX 4: CLAMP trong inference để chống cháy nổ
-                latent = latent.clamp(-10.0, 10.0)
+                # 🔥 FIX 3: SOFT CLAMP
+                latent = torch.tanh(latent / 10.0) * 10.0
         
         return latent
