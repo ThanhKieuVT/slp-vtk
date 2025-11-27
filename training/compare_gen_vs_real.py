@@ -1,6 +1,6 @@
 """
 Script: Đánh giá & So sánh ngẫu nhiên các mẫu từ tập Test/Dev
-Tự động sinh video so sánh Real vs Gen (Dạng Point Cloud chuẩn).
+FIXED: Gradient Calculation cho Sync Guidance
 """
 import os
 import sys
@@ -11,6 +11,7 @@ import random
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from transformers import BertTokenizer
+from scipy.signal import savgol_filter
 
 # --- SETUP PATH ---
 sys.path.append(os.getcwd()) 
@@ -150,6 +151,7 @@ def main():
             parts = line.strip().split('|')
             if len(parts) >= 2:
                 vid_id = parts[0].strip()
+                # Lấy text ở cột cuối cùng [-1] (German Text)
                 text = parts[-1].strip()
                 if vid_id in available_ids:
                     samples.append((vid_id, text))
@@ -166,19 +168,24 @@ def main():
         print(f"\n[{idx+1}/{len(selected)}] Generating: {vid_id}")
         
         # 1. Generate
+        
+        # A. Encode Text (Không cần gradient)
         with torch.no_grad():
             encoded = tokenizer(text, return_tensors='pt', padding=True).to(device)
             text_feat, text_mask = flow.encode_text(encoded['input_ids'], encoded['attention_mask'])
             
-            latent = flow._inference_forward(
-                batch={}, text_features=text_feat, text_mask=text_mask, num_steps=50
-            )
-            
+        # B. Sinh Latent (QUAN TRỌNG: KHÔNG DÙNG no_grad Ở ĐÂY)
+        # Vì Sync Guidance cần tính đạo hàm để hướng dẫn latent
+        latent = flow._inference_forward(
+            batch={}, text_features=text_feat, text_mask=text_mask, num_steps=50
+        )
+        
+        # C. Decode (Không cần gradient)
+        with torch.no_grad():
             latent = latent / scale_factor
             pose_norm = ae.decoder(latent).squeeze(0).cpu().numpy()
             
             # Smoothing
-            from scipy.signal import savgol_filter
             if pose_norm.shape[0] > 7:
                 pose_norm = savgol_filter(pose_norm, 7, 2, axis=0)
             
