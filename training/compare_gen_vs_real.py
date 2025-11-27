@@ -1,6 +1,6 @@
 """
-Script: Đánh giá & So sánh ngẫu nhiên (Phiên bản Skeleton Visual Xịn)
-Tích hợp visualization chuẩn: Có nối dây, màu sắc phân biệt, tự xử lý lệch độ dài.
+Script: Đánh giá & So sánh ngẫu nhiên các mẫu từ tập Test/Dev
+VISUALIZATION: Skeleton Format (Đẹp, có màu, nối dây chuẩn)
 """
 import os
 import sys
@@ -26,7 +26,7 @@ except ImportError as e:
     sys.exit(1)
 
 # ==========================================
-# 1. CẤU HÌNH KẾT NỐI XƯƠNG (Theo format chuẩn chị gửi)
+# 1. CẤU HÌNH KẾT NỐI XƯƠNG (COPY TỪ FILE CỦA CHỊ)
 # ==========================================
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
@@ -43,21 +43,36 @@ MOUTH_INNER_LIP = list(zip(range(12, 19), range(13, 20))) + [(19, 12)]
 MOUTH_CONNECTIONS_20 = MOUTH_OUTER_LIP + MOUTH_INNER_LIP
 
 ALL_CONNECTIONS = []
-ALL_CONNECTIONS.extend([{'indices': (s, e), 'offset': 0, 'color': 'gray', 'lw': 2} for (s, e) in POSE_CONNECTIONS_UPPER_BODY])
-ALL_CONNECTIONS.extend([{'indices': (s, e), 'offset': 33, 'color': 'blue', 'lw': 1.5} for (s, e) in HAND_CONNECTIONS])
+ALL_CONNECTIONS.extend([
+    {'indices': (s, e), 'offset': 0, 'color': 'gray', 'lw': 2}
+    for (s, e) in POSE_CONNECTIONS_UPPER_BODY
+])
+ALL_CONNECTIONS.extend([
+    {'indices': (s, e), 'offset': 33, 'color': 'blue', 'lw': 1.5}
+    for (s, e) in HAND_CONNECTIONS
+])
 # Nối cổ tay vào thân
 ALL_CONNECTIONS.append({'indices': (15, 0), 'offset': (0, 33), 'color': 'blue', 'lw': 2})
-ALL_CONNECTIONS.extend([{'indices': (s, e), 'offset': 54, 'color': 'green', 'lw': 1.5} for (s, e) in HAND_CONNECTIONS])
+
+ALL_CONNECTIONS.extend([
+    {'indices': (s, e), 'offset': 54, 'color': 'green', 'lw': 1.5}
+    for (s, e) in HAND_CONNECTIONS
+])
 # Nối cổ tay phải vào thân
 ALL_CONNECTIONS.append({'indices': (16, 0), 'offset': (0, 54), 'color': 'green', 'lw': 2})
-ALL_CONNECTIONS.extend([{'indices': (s, e), 'offset': 75, 'color': 'red', 'lw': 1} for (s, e) in MOUTH_CONNECTIONS_20])
 
+ALL_CONNECTIONS.extend([
+    {'indices': (s, e), 'offset': 75, 'color': 'red', 'lw': 1}
+    for (s, e) in MOUTH_CONNECTIONS_20
+])
+
+# Các điểm cần vẽ scatter
 MANUAL_UPPER_BODY_IDXS = list(range(23))
 LEFT_HAND_IDXS = list(range(33, 54))
 RIGHT_HAND_IDXS = list(range(54, 75))
 MOUTH_IDXS = list(range(75, 95))
 PLOT_IDXS = MANUAL_UPPER_BODY_IDXS + LEFT_HAND_IDXS + RIGHT_HAND_IDXS + MOUTH_IDXS
-VALID_POINT_THRESHOLD = 0.01 # Hạ thấp một chút để bắt các điểm nhỏ
+VALID_POINT_THRESHOLD = 0.01 # Ngưỡng lọc điểm rác (chỉnh nhỏ xuống vì data đã normalize)
 
 # ==========================================
 # 2. HÀM XỬ LÝ DATA
@@ -77,14 +92,13 @@ def load_and_prepare_pose(pose_214):
     return all_kps
 
 # ==========================================
-# 3. HÀM TẠO VIDEO SO SÁNH (SKELETON STYLE)
+# 3. HÀM TẠO VIDEO SO SÁNH (SKELETON)
 # ==========================================
 def create_comparison_video(real_pose, gen_pose, save_path, title):
-    # Chuẩn bị data
+    # Prepare data
     kps_gt = load_and_prepare_pose(real_pose)
     kps_recon = load_and_prepare_pose(gen_pose)
     
-    # Xử lý lệch độ dài
     min_len = min(len(kps_gt), len(kps_recon))
     kps_gt = kps_gt[:min_len]
     kps_recon = kps_recon[:min_len]
@@ -122,9 +136,9 @@ def create_comparison_video(real_pose, gen_pose, save_path, title):
     def init_artists(ax):
         lines = []
         for item in ALL_CONNECTIONS:
-            line = Line2D([], [], color=item['color'], lw=item['lw'], alpha=0.8)
+            line = Line2D([], [], color=item['color'], lw=item['lw'], alpha=0.7)
             ax.add_line(line)
-            lines.append({'line': line, 'item': item})
+            lines.append({'line': line, 'item': item}) # Lưu kèm item để lấy indices sau này
         
         scatter = ax.scatter([], [], s=2, c='black', alpha=0.4)
         return lines, scatter
@@ -145,7 +159,7 @@ def create_comparison_video(real_pose, gen_pose, save_path, title):
                 item = obj['item']
                 idx_start, idx_end = item['indices']
                 
-                # Xử lý offset
+                # Xử lý offset (có thể là tuple hoặc int)
                 offset = item['offset']
                 if isinstance(offset, (tuple, list)):
                     s_off, e_off = offset[0], offset[1]
@@ -171,7 +185,7 @@ def create_comparison_video(real_pose, gen_pose, save_path, title):
         update_one_side(kps_r_frame, lines_real, scat_real)
         update_one_side(kps_g_frame, lines_gen, scat_gen)
         
-        # Return all artists
+        # Return all artists to update
         return [x['line'] for x in lines_real] + [scat_real] + \
                [x['line'] for x in lines_gen] + [scat_gen]
 
@@ -192,7 +206,7 @@ def main():
     parser.add_argument('--num_samples', type=int, default=5)
     parser.add_argument('--split', type=str, default='test')
     
-    # Model config
+    # Model config (Khớp với lúc train)
     parser.add_argument('--latent_dim', type=int, default=256)
     parser.add_argument('--hidden_dim', type=int, default=512)
     parser.add_argument('--ae_hidden_dim', type=int, default=512)
