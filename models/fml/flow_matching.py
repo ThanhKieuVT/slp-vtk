@@ -48,9 +48,6 @@ class SinusoidalPosEmb(nn.Module):
         return emb[None, :, :] # [1, T, D]
 
 class FlowMatchingBlock(nn.Module):
-    """
-    Nâng cấp: Dùng Transformer thay vì MLP để học Temporal (thời gian)
-    """
     def __init__(self, data_dim, condition_dim, hidden_dim, num_layers=4, num_heads=4, dropout=0.1):
         super().__init__()
         
@@ -67,11 +64,10 @@ class FlowMatchingBlock(nn.Module):
             nn.Linear(hidden_dim, hidden_dim)
         )
         
-        # Positional Embedding (Bắt buộc cho Transformer)
+        # Positional Embedding
         self.pos_emb = SinusoidalPosEmb(hidden_dim)
         
         # Transformer Blocks
-        # batch_first=True là QUAN TRỌNG
         layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=num_heads,
@@ -93,21 +89,22 @@ class FlowMatchingBlock(nn.Module):
         
         # 1. Embeddings
         h = self.data_proj(x)
-        # Cộng vị trí (Positional Encoding)
         h = h + self.pos_emb(x)[:, :T, :] 
         
-        # 2. Time Embedding (Cộng vào tất cả các frame)
+        # 2. Time Embedding
         t_emb = self.time_mlp(t.view(-1, 1)).unsqueeze(1) # [B, 1, H]
         h = h + t_emb
         
-        # 3. Condition (Text) Embedding
-        # Pooling text condition
+        # 3. Condition (Text) Embedding with FIXED POOLING
+        # condition: [B, L, H]
         if condition.dim() == 3:
             if text_attn_mask is not None:
-                # text_attn_mask: True=Keep, False=Pad (logic BERT cũ) -> cần check lại input
-                # Giả sử mask input vào đây là 1=valid, 0=pad
-                mask = text_attn_mask.unsqueeze(-1).float()
-                cond_vec = (condition * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+                # FIX #2: text_attn_mask bây giờ là True=Padding (Ignore)
+                # Cần đảo ngược thành True=Valid để nhân pooling
+                valid_mask = (~text_attn_mask).unsqueeze(-1).float()
+                
+                # Mean Pooling chỉ trên các token hợp lệ
+                cond_vec = (condition * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)
             else:
                 cond_vec = condition.mean(dim=1)
         else:
@@ -117,7 +114,8 @@ class FlowMatchingBlock(nn.Module):
         h = h + c_emb
         
         # 4. Transformer Forward
-        # pose_attn_mask: True là padding (cần ignore). 
+        # PyTorch convention: src_key_padding_mask=True means IGNORE/PADDING.
+        # pose_attn_mask đã được chuẩn bị đúng ở bên ngoài.
         h = self.transformer(h, src_key_padding_mask=pose_attn_mask)
         
         h = self.final_norm(h)

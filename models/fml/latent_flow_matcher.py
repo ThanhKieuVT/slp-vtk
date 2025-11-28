@@ -7,12 +7,10 @@ from transformers import BertModel
 # 1. IMPORT HANDLING & DUMMY CLASSES
 # ==============================================================================
 try:
-    # Ưu tiên import local
     from .flow_matching import FlowMatchingBlock, FlowMatchingScheduler, FlowMatchingLoss
     from .mamba_prior import SimpleSSMPrior
     from .sync_guidance import SyncGuidanceHead
 except ImportError:
-    # Fallback paths (nếu chạy từ root)
     try:
         from models.fml.flow_matching import FlowMatchingBlock, FlowMatchingScheduler, FlowMatchingLoss
     except ImportError:
@@ -28,14 +26,12 @@ except ImportError:
         class FlowMatchingLoss(nn.Module):
             def forward(self, *args, **kwargs): return torch.tensor(0.0)
 
-    # --- FIX 1: Trả về None để báo hiệu là module giả ---
     class SimpleSSMPrior(nn.Module):
         def __init__(self, *args, **kwargs): super().__init__()
         def forward(self, x, *args, **kwargs): return None 
 
     class SyncGuidanceHead(nn.Module):
         def __init__(self, *args, **kwargs): super().__init__()
-        # FIX QUAN TRỌNG: Trả về None để logic bên dưới biết đường bỏ qua
         def forward(self, x, *args, **kwargs): return None
 
 # ==============================================================================
@@ -54,10 +50,13 @@ class LengthPredictor(nn.Module):
         )
 
     def forward(self, text_features, mask=None):
+        # text_features: [B, L, D]
+        # mask: [B, L] (True = Padding/Ignore) -> FIX LOGIC
         if mask is not None:
-            # FIX Type safety
-            keep_mask = mask.float().unsqueeze(-1) if mask.dtype != torch.float else mask.unsqueeze(-1)
-            pooled_text = (text_features * keep_mask).sum(dim=1) / keep_mask.sum(dim=1).clamp(min=1)
+            # FIX: Mask đầu vào là True=Padding. 
+            # Cần đảo ngược thành True=Valid để tính mean pooling.
+            valid_mask = (~mask).float().unsqueeze(-1)
+            pooled_text = (text_features * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)
         else:
             pooled_text = text_features.mean(dim=1)
         return self.net(pooled_text).squeeze(-1)
@@ -79,7 +78,6 @@ class LatentFlowMatcher(nn.Module):
         self.gamma_guidance = gamma_guidance
         self.lambda_anneal = lambda_anneal
         
-        # Loss Weights
         self.W_PRIOR = W_PRIOR
         self.W_SYNC = W_SYNC
         self.W_LENGTH = W_LENGTH
@@ -101,7 +99,6 @@ class LatentFlowMatcher(nn.Module):
             num_layers=num_flow_layers, num_heads=num_heads, dropout=dropout
         )
         
-        # Safe Init
         self.ssm_prior = None
         if self.use_ssm_prior:
             try:
@@ -117,101 +114,101 @@ class LatentFlowMatcher(nn.Module):
                 self.use_sync_guidance = False
         
         self.flow_loss_fn = FlowMatchingLoss()
-        self.prior_reg_fn = nn.MSELoss()
     
     def encode_text(self, text_tokens, attention_mask):
         self.text_encoder.eval()
         with torch.no_grad():
             outputs = self.text_encoder(text_tokens, attention_mask=attention_mask)
         text_features = self.text_proj(outputs.last_hidden_state)
-        text_valid_mask = attention_mask.bool() 
-        return text_features, text_valid_mask
+        
+        # FIX #1: Logic Mask
+        # BERT attention_mask: 1=Valid, 0=Padding
+        # PyTorch Transformer: True=Padding (Ignore), False=Valid
+        # => Đảo ngược mask (NOT)
+        text_padding_mask = ~attention_mask.bool() 
+        return text_features, text_padding_mask
     
     def get_lambda_t(self, t):
         if self.lambda_anneal:
             return self.lambda_prior * (1 - t.float().view(-1, 1, 1))
-        else:
-            return self.lambda_prior
+        return self.lambda_prior
     
     def forward(self, batch, gt_latent=None, pose_gt=None, mode='train', num_inference_steps=50, latent_scale=1.0, return_attn_weights=False):
-        text_features, text_valid_mask = self.encode_text(batch['text_tokens'], batch['attention_mask'])
+        # text_padding_mask: True = Padding/Ignore
+        text_features, text_padding_mask = self.encode_text(batch['text_tokens'], batch['attention_mask'])
         
         if mode == 'train':
-            return self._train_forward(batch, text_features, text_valid_mask, gt_latent, pose_gt, return_attn_weights)
+            return self._train_forward(batch, text_features, text_padding_mask, gt_latent, pose_gt, return_attn_weights)
         else:
-            return self._inference_forward(batch, text_features, text_valid_mask, num_inference_steps, latent_scale)
+            return self._inference_forward(batch, text_features, text_padding_mask, num_inference_steps, latent_scale)
     
-    def _train_forward(self, batch, text_features, text_valid_mask, gt_latent, pose_gt=None, return_attn_weights=False):
+    def _train_forward(self, batch, text_features, text_padding_mask, gt_latent, pose_gt=None, return_attn_weights=False):
         device = text_features.device
         B, T, D = gt_latent.shape
         
-        # 1. Length Prediction Loss
-        pred_length = self.length_predictor(text_features, text_valid_mask)
+        # 1. Length Prediction
+        pred_length = self.length_predictor(text_features, text_padding_mask)
         target_length = batch['seq_lengths'].float().to(device)
         length_loss = self.length_loss_fn(pred_length, target_length)
         
         # 2. Flow Matching Setup
         t = self.scheduler.sample_timesteps(B, device)
-        seq_mask = torch.arange(T, device=device)[None, :] < batch['seq_lengths'][:, None]
+        # Pose Mask: True = Padding/Ignore (cho các frame thừa)
+        seq_mask_bool = torch.arange(T, device=device)[None, :] < batch['seq_lengths'][:, None] # True = Valid
+        pose_padding_mask = ~seq_mask_bool # True = Padding
         
-        latent_t, v_gt, latent_0 = self.scheduler.add_noise(gt_latent, t)
-        pose_attn_mask = ~seq_mask 
+        # FIX #6: Memory Leak (discard latent_0)
+        latent_t, v_gt, _ = self.scheduler.add_noise(gt_latent, t)
         
         # 3. Predict Velocity
         flow_output = self.flow_block(
             latent_t, t, text_features,
-            text_attn_mask=text_valid_mask, 
-            pose_attn_mask=pose_attn_mask,
+            text_attn_mask=text_padding_mask, 
+            pose_attn_mask=pose_padding_mask,
             return_attn=return_attn_weights
         )
         
         if return_attn_weights: v_flow, attn_weights = flow_output
         else: v_flow, attn_weights = flow_output, None
         
-        # 4. Prior Integration (Safe Check)
+        # 4. Prior Integration
         v_prior = None
         if self.use_ssm_prior and self.ssm_prior is not None:
-            prior_out = self.ssm_prior(latent_t.detach(), t, text_features, mask=seq_mask)
-            if prior_out is not None: # Chỉ dùng nếu module trả về Tensor thật
+            prior_out = self.ssm_prior(latent_t.detach(), t, text_features, mask=seq_mask_bool)
+            if prior_out is not None: 
                 v_prior = prior_out
         
         lambda_t = self.get_lambda_t(t)
         v_pred_train = v_flow + lambda_t * v_prior if v_prior is not None else v_flow
         
         # 5. Losses
-        flow_loss = self.flow_loss_fn(v_pred_train, v_gt, mask=seq_mask)
-        prior_loss = torch.tensor(0.0, device=device)
-        sync_loss = torch.tensor(0.0, device=device)
+        # Loss function cần mask True=Valid (để nhân 1)
+        flow_loss = self.flow_loss_fn(v_pred_train, v_gt, mask=seq_mask_bool)
         
-        # --- FIX QUAN TRỌNG: Sync Guidance Logic ---
-        # Chỉ chạy nếu module tồn tại VÀ trả về dữ liệu (không phải None)
+        # Sync Guidance (Optional)
+        sync_loss = torch.tensor(0.0, device=device)
         if self.use_sync_guidance and self.sync_head is not None and self.W_SYNC > 0:
-            sync_pos = self.sync_head(latent_t, seq_mask)
-            
-            # Check None: Bỏ qua hoàn toàn nếu là dummy module
+            sync_pos = self.sync_head(latent_t, seq_mask_bool)
             if sync_pos is not None:
                 with torch.no_grad():
                     idx_perm = torch.randperm(B, device=device)
                     latent_neg = latent_t[idx_perm]
-                    mask_neg = seq_mask[idx_perm]
-                
+                    mask_neg = seq_mask_bool[idx_perm]
                 sync_neg = self.sync_head(latent_neg, mask_neg)
                 
-                # Double check sync_neg cũng không phải None
                 if sync_neg is not None:
                     def masked_mean(val, m): return (val * m.float()).sum() / m.sum().clamp(min=1)
-                    
-                    pos_score = masked_mean(sync_pos.sum(dim=-1), seq_mask)
+                    pos_score = masked_mean(sync_pos.sum(dim=-1), seq_mask_bool)
                     neg_score = masked_mean(sync_neg.sum(dim=-1), mask_neg)
                     sync_loss = F.relu(0.2 - pos_score + neg_score)
 
-        total_loss = flow_loss + self.W_LENGTH * length_loss + self.W_SYNC * sync_loss + self.W_PRIOR * prior_loss
+        total_loss = flow_loss + self.W_LENGTH * length_loss + self.W_SYNC * sync_loss
 
         result = {'total': total_loss, 'flow': flow_loss, 'length': length_loss, 'sync': sync_loss}
         if return_attn_weights: result['attn_weights'] = attn_weights
         return result
     
-    def _inference_forward(self, batch, text_features, text_valid_mask, num_steps=50, latent_scale=1.0):
+    def _inference_forward(self, batch, text_features, text_padding_mask, num_steps=50, latent_scale=1.0):
         device = text_features.device
         B = text_features.shape[0]
         
@@ -219,42 +216,43 @@ class LatentFlowMatcher(nn.Module):
              target_lengths = batch['seq_lengths'].long()
         else:
              with torch.no_grad():
-                pred_len = self.length_predictor(text_features, text_valid_mask)
+                pred_len = self.length_predictor(text_features, text_padding_mask)
                 target_lengths = pred_len.round().long().clamp(min=20, max=400)
         
         T = target_lengths.max().item()
-        seq_mask = torch.arange(T, device=device)[None, :] < target_lengths[:, None]
+        seq_mask_bool = torch.arange(T, device=device)[None, :] < target_lengths[:, None] # True=Valid
+        pose_padding_mask = ~seq_mask_bool # True=Padding
         
         latent = torch.randn(B, T, self.latent_dim, device=device) 
         dt = 1.0 / num_steps
-        pose_attn_mask = ~seq_mask
         
         for step in range(num_steps):
             t_val = step / num_steps
             t = torch.full((B,), t_val, device=device)
             
             latent_in = latent.detach()
-            # Chỉ bật grad nếu thực sự có dùng guidance
-            if self.use_sync_guidance and self.sync_head is not None:
+            
+            # FIX #3: Gradient control
+            # Chỉ bật grad nếu dùng guidance VÀ đang ở giữa process
+            if self.use_sync_guidance and self.sync_head is not None and 0.1 < t_val < 0.9:
                 latent_in.requires_grad_(True)
             
             v_flow = self.flow_block(latent_in, t, text_features, 
-                                     text_attn_mask=text_valid_mask, 
-                                     pose_attn_mask=pose_attn_mask)
+                                     text_attn_mask=text_padding_mask, 
+                                     pose_attn_mask=pose_padding_mask)
             
             v_prior = None
             if self.use_ssm_prior and self.ssm_prior is not None:
                 with torch.no_grad():
-                    prior_out = self.ssm_prior(latent_in, t, text_features, mask=seq_mask)
+                    prior_out = self.ssm_prior(latent_in, t, text_features, mask=seq_mask_bool)
                     if prior_out is not None: v_prior = prior_out
             
             lambda_t = self.get_lambda_t(t)
             v_final = v_flow + lambda_t * v_prior if v_prior is not None else v_flow
             
-            # Sync Guidance
-            if self.use_sync_guidance and self.sync_head is not None and 0.1 < t_val < 0.9:
-                sync_out = self.sync_head(latent_in, seq_mask)
-                # FIX: Check None trước khi dùng
+            # Sync Guidance with Gradient
+            if latent_in.requires_grad:
+                sync_out = self.sync_head(latent_in, seq_mask_bool)
                 if sync_out is not None:
                     with torch.enable_grad():
                         guidance_score = sync_out.mean()
@@ -263,7 +261,7 @@ class LatentFlowMatcher(nn.Module):
             
             with torch.no_grad():
                 latent = latent + v_final.detach() * dt
-                latent = latent * seq_mask.unsqueeze(-1).float()
-                latent = torch.clamp(latent, -5.0, 5.0)
+                latent = latent * seq_mask_bool.unsqueeze(-1).float()
+                # latent = torch.clamp(latent, -5.0, 5.0) # Có thể bỏ clamp nếu muốn tự nhiên hơn
 
         return latent * latent_scale
