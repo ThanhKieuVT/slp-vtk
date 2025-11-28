@@ -12,22 +12,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 sys.path.append(os.getcwd())
 
-# Import Models & Data
-# Fallback import logic
-try:
-    from dataset import SignLanguageDataset, collate_fn
-    from models.fml.autoencoder import UnifiedPoseAutoencoder
-    from models.fml.latent_flow_matcher import LatentFlowMatcher
-except ImportError:
-    try:
-        from dataset import SignLanguageDataset, collate_fn
-        from models.autoencoder import UnifiedPoseAutoencoder
-        from models.fml.latent_flow_matcher import LatentFlowMatcher
-    except ImportError:
-        # Last resort for structure mismatch
-        from dataset import SignLanguageDataset, collate_fn
-        from autoencoder import UnifiedPoseAutoencoder
-        from latent_flow_matcher import LatentFlowMatcher
+from dataset import SignLanguageDataset, collate_fn
+from models.fml.autoencoder import UnifiedPoseAutoencoder
+from models.fml.latent_flow_matcher import LatentFlowMatcher
 
 def safe_float(x):
     return float(x) if isinstance(x, (int, float, np.floating)) else x.item() if hasattr(x, "item") else float(x)
@@ -54,7 +41,6 @@ def estimate_scale_factor(encoder, dataloader, device, max_samples=1024):
         return 1.0
     
     latents = torch.cat(latents, dim=0)
-    # Robust scale estimation using quantile
     scale = float(latents.abs().quantile(0.95))
     return max(scale, 1e-6)
 
@@ -66,15 +52,25 @@ def extract_poses(batch):
         return batch[0] if len(batch) > 0 else None
 
 def prepare_batch(batch, device):
-    """Convert batch to standard dict format"""
+    """
+    Convert batch to standard dict format.
+    
+    CRITICAL: This function REQUIRES seq_lengths to be present in the batch.
+    Creating fake seq_lengths (e.g., torch.full((B,), T)) will break training
+    because the model will compute loss on padding frames.
+    """
     if isinstance(batch, dict):
         poses = extract_poses(batch)
         
+        # CRITICAL: Dataset MUST provide seq_lengths
         if "seq_lengths" not in batch:
-            # Fallback if seq_lengths missing: use full length
-            if poses is not None:
-                B, T, _ = poses.shape
-                batch["seq_lengths"] = torch.full((B,), T, dtype=torch.long)
+            raise ValueError(
+                "❌ CRITICAL ERROR: Dataset must return 'seq_lengths'!\n\n"
+                "Your collate_fn should include actual sequence lengths:\n"
+                "  'seq_lengths': torch.tensor([len(sample['pose']) for sample in batch])\n\n"
+                "NEVER use torch.full((B,), max_len) as this will train on padding!\n"
+                "Fix your dataset.py collate_fn first."
+            )
         
         # Move tensors to device
         for k, v in batch.items():
@@ -85,22 +81,18 @@ def prepare_batch(batch, device):
     
     else:
         # Tuple format: (poses, text_tokens, attention_mask, seq_lengths)
-        if len(batch) < 3:
-            return None, None
-            
-        poses = batch[0].to(device)
+        if len(batch) < 4:
+            raise ValueError(
+                "❌ Batch tuple must have 4 elements: "
+                "(poses, text_tokens, attention_mask, seq_lengths)\n"
+                f"Got {len(batch)} elements instead."
+            )
         
-        # Handle seq_lengths if present in tuple
-        if len(batch) >= 4:
-            seq_lens = batch[3].to(device)
-        else:
-            B, T, _ = poses.shape
-            seq_lens = torch.full((B,), T, device=device, dtype=torch.long)
-
+        poses = batch[0].to(device)
         return poses, {
             'text_tokens': batch[1].to(device),
             'attention_mask': batch[2].to(device),
-            'seq_lengths': seq_lens
+            'seq_lengths': batch[3].to(device)
         }
 
 @torch.no_grad()
@@ -129,7 +121,7 @@ def validate(model, ae, val_loader, device, latent_scale):
             n += 1
             
         except Exception as e:
-            # print(f"⚠️  Validation batch error: {e}")
+            print(f"⚠️  Validation batch error: {e}")
             continue
     
     if n == 0:
@@ -165,9 +157,6 @@ def parse_args():
     p.add_argument("--hidden_dim", type=int, default=512)
     p.add_argument("--ae_hidden_dim", type=int, default=512)
     
-    # NEW: Max Seq Len (This fixes the error)
-    p.add_argument("--max_seq_len", type=int, default=120, help="Max sequence length for padding")
-    
     # Loss Weights
     p.add_argument("--W_SYNC", type=float, default=0.1)
     p.add_argument("--W_LENGTH", type=float, default=0.01)
@@ -185,18 +174,11 @@ def main():
     print(f"   • Device: {device}")
     print(f"   • Batch Size: {args.batch_size}")
     print(f"   • Learning Rate: {args.lr}")
-    print(f"   • Max Seq Len: {args.max_seq_len}")
     print(f"   • Weights: Sync={args.W_SYNC}, Length={args.W_LENGTH}")
 
     # 1. Load Dataset
     print("\n⏳ Loading dataset...")
-    # Thử truyền max_seq_len vào dataset, nếu dataset ko hỗ trợ thì fallback
-    try:
-        full_dataset = SignLanguageDataset(data_dir=args.data_dir, max_seq_len=args.max_seq_len)
-    except TypeError:
-        print("⚠️  SignLanguageDataset does not accept 'max_seq_len' arg. Using default length.")
-        full_dataset = SignLanguageDataset(data_dir=args.data_dir)
-        # Nếu muốn dùng 160 mà dataset mặc định 120, bạn cần sửa file dataset.py nữa.
+    full_dataset = SignLanguageDataset(data_dir=args.data_dir)
     
     # Split train/val
     val_size = int(len(full_dataset) * args.val_split)
@@ -337,7 +319,7 @@ def main():
                 })
                 
             except Exception as e:
-                # print(f"\n⚠️  Batch error: {e}")
+                print(f"\n⚠️  Batch error: {e}")
                 continue
         
         if n_batches == 0:
@@ -356,6 +338,9 @@ def main():
         writer.add_scalar("Train/Length_Loss", avg_length, epoch)
         writer.add_scalar("Train/Sync_Loss", avg_sync, epoch)
         writer.add_scalar("LR", optimizer.param_groups[0]['lr'], epoch)
+        
+        # Step scheduler BEFORE validation (best practice)
+        scheduler.step(epoch + 1)
         
         # Validation
         val_metrics = validate(flow_matcher, ae, val_loader, device, latent_scale)
@@ -400,8 +385,6 @@ def main():
                 "latent_scale_factor": latent_scale,
                 "val_loss": val_metrics['total'] if val_metrics else None
             }, periodic_path)
-        
-        scheduler.step(epoch + 1)
     
     writer.close()
     print("\n✅ Training completed!")
