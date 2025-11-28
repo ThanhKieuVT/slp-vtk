@@ -66,8 +66,21 @@ def estimate_scale_factor(encoder, dataloader, device, max_samples=1024):
     if not latents: 
         return 1.0
     
-    latents = torch.cat(latents, dim=0)
-    # Robust scale estimation using quantile
+    # Gộp tất cả latent vectors lại
+    latents = torch.cat(latents, dim=0) # Shape [N, T, D]
+    
+    # FIX: Làm phẳng và lấy mẫu (Subsampling) để tránh lỗi "Tensor too large"
+    latents = latents.flatten() # Biến thành vector 1 chiều khổng lồ
+    
+    # Nếu dữ liệu quá lớn (> 1 triệu phần tử), ta chỉ lấy mẫu đại diện
+    # 1 triệu điểm là quá đủ để tính thống kê (quantile) chính xác
+    MAX_ELEMENTS = 1_000_000
+    if latents.numel() > MAX_ELEMENTS:
+        # Lấy bước nhảy để sample đều (Strided slicing) - Nhanh và tốn ít RAM hơn randperm
+        step = latents.numel() // MAX_ELEMENTS
+        latents = latents[::step]
+    
+    # Tính quantile trên tập mẫu đã rút gọn
     scale = float(latents.abs().quantile(0.95))
     return max(scale, 1e-6)
 
