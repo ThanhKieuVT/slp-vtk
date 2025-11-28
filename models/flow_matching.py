@@ -1,264 +1,229 @@
-# models/flow_matching.py
-"""
-Core Flow Matching utilities
-Implements Optimal Transport Conditional Flow Matching
-"""
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import math
 
+# ============================================
+# 1. FLOW MATCHING SCHEDULER
+# ============================================
 class FlowMatchingScheduler:
-    """
-    Manages timesteps and noise schedules for flow matching
-    """
-    def __init__(self, num_timesteps=1000, sigma_min=0.001):
-        self.num_timesteps = num_timesteps
+    """Flow Matching Scheduler - Straight-line interpolation"""
+    def __init__(self, sigma_min=0.0, sigma_max=1.0):
         self.sigma_min = sigma_min
-        
+        self.sigma_max = sigma_max
+    
     def sample_timesteps(self, batch_size, device):
-        """Sample random timesteps for training"""
-        # Uniform sampling in [0, 1]
-        t = torch.rand(batch_size, device=device)
-        return t
+        """Sample random timesteps t ~ U(0,1)"""
+        return torch.rand(batch_size, device=device)
     
-    def add_noise(self, x_0, t):
-        """
-        Add noise to data according to flow schedule
-        x_t = (1-t)·x_0 + t·x_1
-        where x_1 ~ N(0, I) is target noise
-        """
-        batch_size = x_0.shape[0]
-        
-        # Sample target noise
-        x_1 = torch.randn_like(x_0)
-        
-        # Interpolate: x_t = (1-t)·x_0 + t·x_1
-        t_expanded = t.view(-1, 1, 1)  # [B, 1, 1]
-        x_t = (1 - t_expanded) * x_0 + t_expanded * x_1
-        
-        # Ground truth velocity: v = x_1 - x_0
-        velocity_gt = x_1 - x_0
-        
-        return x_t, velocity_gt, x_1
+    def get_path(self, x0, x1, t):
+        """Interpolation path: z_t = (1-t)*x0 + t*x1"""
+        t = t.view(-1, 1, 1)
+        return (1 - t) * x0 + t * x1
     
-    def generate_timesteps(self, num_steps):
+    def get_velocity(self, x0, x1, t):
+        """Target velocity: v = x1 - x0 (constant for straight line)"""
+        return x1 - x0
+    
+    def add_noise(self, x1, t):
         """
-        Generate inference timesteps
-        Using linear schedule from 0 to 1
+        Add noise to clean data x1 at timestep t
+        Returns: z_t, v_gt, x0
         """
-        return torch.linspace(0, 1, num_steps)
+        x0 = torch.randn_like(x1)  # Sample from standard Gaussian
+        z_t = self.get_path(x0, x1, t)
+        v_gt = self.get_velocity(x0, x1, t)
+        return z_t, v_gt, x0
 
-class SinusoidalPosEmb(nn.Module):
+
+# ============================================
+# 2. FLOW MATCHING LOSS (FIXED SCALING)
+# ============================================
+class FlowMatchingLoss(nn.Module):
     """
-    Sinusoidal positional embeddings for timestep encoding
-    Same as in Transformers, but for continuous time t ∈ [0,1]
+    Flow Matching Loss - FIXED SCALING
+    
+    FIX: Chia cho số SAMPLES thay vì (samples × dimensions)
+    để tránh loss quá nhỏ làm yếu gradient
     """
-    def __init__(self, dim):
+    def __init__(self):
         super().__init__()
-        self.dim = dim
-        
-    def forward(self, t):
+    
+    def forward(self, v_pred, v_gt, mask=None):
         """
-        t: [B] timesteps in [0, 1]
-        Returns: [B, dim] embeddings
+        Args:
+            v_pred: [B, T, D] - Predicted velocity
+            v_gt: [B, T, D] - Ground truth velocity
+            mask: [B, T] - Valid frame mask (True = valid)
         """
-        device = t.device
-        half_dim = self.dim // 2
+        # MSE Loss
+        loss = (v_pred - v_gt) ** 2  # [B, T, D]
         
-        # Frequencies
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        
-        # Compute embeddings
-        emb = t[:, None] * emb[None, :]  # [B, half_dim]
-        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)  # [B, dim]
-        
-        return emb
+        if mask is not None:
+            # 🔥 FIX: Sum over D first, then average over valid frames
+            # Cách cũ: loss.sum() / (mask.sum() * D) → Quá nhỏ
+            # Cách mới: loss.sum(D) / mask.sum() → Vừa phải
+            
+            loss_per_frame = loss.sum(dim=-1)  # [B, T] - Sum over D
+            masked_loss = loss_per_frame * mask.float()  # Apply mask
+            
+            total_valid_frames = mask.sum()
+            loss = masked_loss.sum() / total_valid_frames.clamp(min=1)
+        else:
+            loss = loss.mean()
+            
+        return loss
 
+
+# ============================================
+# 3. CROSS-ATTENTION LAYER
+# ============================================
+class CrossAttentionLayer(nn.Module):
+    """Cross-Attention: Pose (Query) -> Text (Key/Value)"""
+    def __init__(self, d_model, nhead, dropout=0.1):
+        super().__init__()
+        self.multihead_attn = nn.MultiheadAttention(
+            embed_dim=d_model, 
+            num_heads=nhead, 
+            dropout=dropout, 
+            batch_first=True
+        )
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, query, key, value, key_padding_mask=None):
+        """
+        Args:
+            query: [B, T_pose, D] - Pose features
+            key: [B, T_text, D] - Text features
+            value: [B, T_text, D] - Text features
+            key_padding_mask: [B, T_text] - True = ignore
+        
+        Returns:
+            output: [B, T_pose, D]
+            attn_weights: [B, num_heads, T_pose, T_text]
+        """
+        attn_output, attn_weights = self.multihead_attn(
+            query=query, 
+            key=key, 
+            value=value, 
+            key_padding_mask=key_padding_mask
+        )
+        
+        # Residual + LayerNorm
+        output = self.norm(query + self.dropout(attn_output))
+        return output, attn_weights
+
+
+# ============================================
+# 4. FLOW MATCHING BLOCK (DENOISER)
+# ============================================
 class FlowMatchingBlock(nn.Module):
     """
-    Basic building block for flow matching
-    Predicts velocity field v(x_t, t, condition)
-    
-    Architecture:
-        Input: noisy_data [B, T, D] + timestep [B] + condition [B, L, C]
-        Output: velocity [B, T, D]
+    SOTA Flow Matching Block
+    - Self-attention for temporal modeling
+    - Cross-attention for text conditioning
+    - Time embedding injection
     """
     def __init__(
-        self,
-        data_dim,           # Dimension of data (e.g., 66 for body poses)
-        condition_dim,      # Dimension of conditioning (e.g., 768 from BERT)
-        hidden_dim=512,
-        num_layers=6,
-        num_heads=8,
+        self, 
+        data_dim=256,           # Latent dimension
+        condition_dim=512,      # Text feature dimension
+        hidden_dim=512,         # Internal hidden dimension
+        num_layers=6,           # Number of transformer layers
+        num_heads=8,            # Number of attention heads
         dropout=0.1
     ):
         super().__init__()
         
-        self.data_dim = data_dim
-        self.condition_dim = condition_dim
-        self.hidden_dim = hidden_dim
+        # Input projection: latent -> hidden
+        self.input_proj = nn.Linear(data_dim, hidden_dim)
         
-        # Timestep embedding
+        # Time embedding (sinusoidal + MLP)
         self.time_embed = nn.Sequential(
-            SinusoidalPosEmb(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(1, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
         
-        # Data projection
-        self.data_proj = nn.Linear(data_dim, hidden_dim)
+        # Transformer layers
+        self.layers = nn.ModuleList()
+        for _ in range(num_layers):
+            self.layers.append(nn.ModuleDict({
+                # Self-attention on pose sequence
+                'self_attn_block': nn.TransformerEncoderLayer(
+                    d_model=hidden_dim,
+                    nhead=num_heads,
+                    dim_feedforward=hidden_dim * 4,
+                    dropout=dropout,
+                    activation='gelu',
+                    batch_first=True
+                ),
+                # Cross-attention to text
+                'cross_attn': CrossAttentionLayer(
+                    d_model=hidden_dim, 
+                    nhead=num_heads, 
+                    dropout=dropout
+                ),
+            }))
         
-        # Condition projection
-        self.condition_proj = nn.Linear(condition_dim, hidden_dim)
-        
-        # Transformer blocks for temporal modeling
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            activation='gelu',
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers
-        )
-        
-        # Cross-attention to condition on text
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.norm_cross = nn.LayerNorm(hidden_dim)
-        
-        # Output projection to velocity
-        self.output_proj = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, data_dim)
-        )
-        
-    def forward(self, x_t, t, condition, mask=None):
+        # Output projection: hidden -> velocity (data_dim)
+        self.output_proj = nn.Linear(hidden_dim, data_dim)
+    
+    def forward(
+        self, 
+        z_t,                    # [B, T, data_dim] - Noisy latent
+        t,                      # [B] - Timesteps
+        condition,              # [B, T_text, condition_dim] - Text features
+        text_attn_mask=None,    # [B, T_text] - Text padding mask
+        pose_attn_mask=None,    # [B, T] - Pose padding mask
+        return_attn=False
+    ):
         """
-        x_t: [B, T, data_dim] - noisy data at time t
-        t: [B] - timestep
-        condition: [B, L, condition_dim] - text features
-        mask: [B, T] - padding mask (optional)
+        Args:
+            z_t: Noisy latent at timestep t
+            t: Timesteps (0 to 1)
+            condition: Text condition features
+            text_attn_mask: Mask for text (True = ignore)
+            pose_attn_mask: Mask for pose (True = ignore)
+            return_attn: Return attention weights
         
-        Returns: velocity [B, T, data_dim]
+        Returns:
+            v_pred: Predicted velocity [B, T, data_dim]
+            (optional) attn_weights: List of attention maps
         """
-        B, T, D = x_t.shape
+        B, T, D = z_t.shape
         
-        # 1. Embed timestep
-        t_emb = self.time_embed(t)  # [B, hidden_dim]
+        # Project input
+        x = self.input_proj(z_t)  # [B, T, hidden_dim]
         
-        # 2. Project data
-        h = self.data_proj(x_t)  # [B, T, hidden_dim]
+        # Add time embedding (broadcast to all frames)
+        t_emb = self.time_embed(t.unsqueeze(-1))  # [B, hidden_dim]
+        t_emb = t_emb.unsqueeze(1).expand(-1, T, -1)  # [B, T, hidden_dim]
+        x = x + t_emb
         
-        # 3. Add timestep information (broadcast)
-        h = h + t_emb[:, None, :]  # [B, T, hidden_dim]
+        # Process through transformer layers
+        all_attn_weights = []
+        for layer_dict in self.layers:
+            # Self-attention (temporal modeling)
+            x = layer_dict['self_attn_block'](
+                x, 
+                src_key_padding_mask=pose_attn_mask
+            )
+            
+            # Cross-attention (text conditioning)
+            x, attn_weights = layer_dict['cross_attn'](
+                query=x,
+                key=condition,
+                value=condition,
+                key_padding_mask=text_attn_mask
+            )
+            
+            if return_attn:
+                all_attn_weights.append(attn_weights.cpu())
         
-        # 4. Self-attention (temporal modeling)
-        h = self.transformer(h, src_key_padding_mask=mask)
+        # Predict velocity
+        v_pred = self.output_proj(x)  # [B, T, data_dim]
         
-        # 5. Cross-attention to text condition
-        h_cross, _ = self.cross_attn(
-            query=h,
-            key=condition,
-            value=condition
-        )
-        h = self.norm_cross(h + h_cross)  # Residual
-        
-        # 6. Predict velocity
-        velocity = self.output_proj(h)  # [B, T, data_dim]
-        
-        return velocity
-
-class FlowMatchingLoss(nn.Module):
-    """
-    Loss function for flow matching training
-    """
-    def __init__(self):
-        super().__init__()
-        
-    def forward(self, pred_velocity, gt_velocity, mask=None):
-        """
-        pred_velocity: [B, T, D] - predicted by model
-        gt_velocity: [B, T, D] - ground truth (x_1 - x_0)
-        mask: [B, T] - padding mask
-        
-        Returns: scalar loss
-        """
-        # MSE loss
-        loss = F.mse_loss(pred_velocity, gt_velocity, reduction='none')
-        
-        # Apply mask if provided
-        if mask is not None:
-            # mask: True for valid, False for padding
-            loss = loss * mask.unsqueeze(-1)
-            loss = loss.sum() / mask.sum()
-        else:
-            loss = loss.mean()
-        
-        return loss
-
-def euler_integrate(velocity_fn, x_0, t_span, num_steps):
-    """
-    Euler integration for ODE: dx/dt = v(x, t)
-    
-    velocity_fn: function that computes velocity given (x, t, condition)
-    x_0: [B, T, D] - initial condition (noise)
-    t_span: (t_start, t_end) - integration interval
-    num_steps: number of integration steps
-    
-    Returns: x at t_end
-    """
-    t_start, t_end = t_span
-    dt = (t_end - t_start) / num_steps
-    
-    x = x_0
-    t = t_start
-    
-    for _ in range(num_steps):
-        # Compute velocity
-        v = velocity_fn(x, t)
-        
-        # Euler step: x_{n+1} = x_n + dt * v_n
-        x = x + dt * v
-        t = t + dt
-    
-    return x
-
-def rk4_integrate(velocity_fn, x_0, t_span, num_steps):
-    """
-    Runge-Kutta 4th order integration (more accurate than Euler)
-    
-    RK4 formula:
-        k1 = f(x_n, t_n)
-        k2 = f(x_n + dt/2 * k1, t_n + dt/2)
-        k3 = f(x_n + dt/2 * k2, t_n + dt/2)
-        k4 = f(x_n + dt * k3, t_n + dt)
-        x_{n+1} = x_n + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
-    """
-    t_start, t_end = t_span
-    dt = (t_end - t_start) / num_steps
-    
-    x = x_0
-    t = t_start
-    
-    for _ in range(num_steps):
-        k1 = velocity_fn(x, t)
-        k2 = velocity_fn(x + dt/2 * k1, t + dt/2)
-        k3 = velocity_fn(x + dt/2 * k2, t + dt/2)
-        k4 = velocity_fn(x + dt * k3, t + dt)
-        
-        x = x + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
-        t = t + dt
-    
-    return x
+        if return_attn:
+            return v_pred, all_attn_weights
+        return v_pred
