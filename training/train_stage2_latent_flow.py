@@ -14,7 +14,7 @@ sys.path.append(os.getcwd())
 # Import Models & Data
 # Hãy đảm bảo file dataset.py và models/autoencoder.py tồn tại
 from dataset import SignLanguageDataset, collate_fn
-from models.autoencoder import UnifiedPoseAutoencoder
+from models.fml.autoencoder import UnifiedPoseAutoencoder
 from models.fml.latent_flow_matcher import LatentFlowMatcher
 
 def safe_float(x):
