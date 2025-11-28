@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from transformers import BertModel
 
 # ==============================================================================
-# ROBUST IMPORT (từ Doc 5)
+# ROBUST IMPORT
 # ==============================================================================
 try:
     from .flow_matching import FlowMatchingBlock, FlowMatchingScheduler, FlowMatchingLoss
@@ -35,7 +35,7 @@ except ImportError:
         def forward(self, x, *args, **kwargs): return None
 
 # ==============================================================================
-# LENGTH PREDICTOR (Fix từ Doc 5)
+# LENGTH PREDICTOR
 # ==============================================================================
 class LengthPredictor(nn.Module):
     def __init__(self, input_dim, hidden_dim=256):
@@ -63,14 +63,15 @@ class LengthPredictor(nn.Module):
         return self.net(pooled).squeeze(-1)
 
 # ==============================================================================
-# MAIN MODEL
+# MAIN MODEL (FIXED VERSION)
 # ==============================================================================
 class LatentFlowMatcher(nn.Module):
     def __init__(self, latent_dim=256, text_encoder_name='bert-base-multilingual-cased',
                  hidden_dim=512, num_flow_layers=6, num_prior_layers=4, num_heads=8,
                  dropout=0.1, use_ssm_prior=True, use_sync_guidance=True,
                  lambda_prior=0.1, gamma_guidance=0.01, lambda_anneal=True,
-                 W_PRIOR=0.05, W_SYNC=0.1, W_LENGTH=0.1):
+                 W_PRIOR=0.05, W_SYNC=0.1, W_LENGTH=0.1,
+                 sync_margin=0.2, clamp_scale=8.0):  # ✅ NEW: Configurable params
         super().__init__()
         
         self.latent_dim = latent_dim
@@ -84,6 +85,10 @@ class LatentFlowMatcher(nn.Module):
         self.W_PRIOR = W_PRIOR
         self.W_SYNC = W_SYNC
         self.W_LENGTH = W_LENGTH
+        
+        # ✅ FIX 1: Configurable hyperparameters
+        self.sync_margin = sync_margin  # Margin for contrastive loss
+        self.clamp_scale = clamp_scale  # Latent clamping range
         
         # Text Encoder (frozen)
         print(f"Loading Text Encoder: {text_encoder_name}...")
@@ -209,39 +214,53 @@ class LatentFlowMatcher(nn.Module):
         lambda_t = self.get_lambda_t(t)
         v_pred = v_flow + lambda_t * v_prior if v_prior is not None else v_flow
         
-        # 5. Flow loss
+        # 5. Flow loss (main objective)
         flow_loss = self.flow_loss_fn(v_pred, v_gt, mask=seq_valid_mask)
         
-        # 6. Prior regularization (optional)
+        # ✅ FIX 2: IMPROVED Prior Regularization Loss
+        # Purpose: Encourage flow to align with prior (regularization)
         prior_loss = torch.tensor(0.0, device=device)
         if v_prior is not None and self.W_PRIOR > 0:
-            # Encourage flow and prior to agree
-            prior_diff = (v_flow - v_prior.detach()) ** 2 * seq_valid_mask.unsqueeze(-1).float()
+            # MSE between flow prediction and prior prediction
+            # Detach prior to avoid backprop through SSM (SSM trains separately if needed)
+            prior_diff = F.mse_loss(v_flow, v_prior.detach(), reduction='none')
+            prior_diff = prior_diff * seq_valid_mask.unsqueeze(-1).float()
             prior_loss = prior_diff.sum() / (seq_valid_mask.sum() * D).clamp(min=1)
         
-        # 7. Sync guidance loss
+        # ✅ FIX 3: IMPROVED Sync Guidance Loss with Time-Shift Negatives
         sync_loss = torch.tensor(0.0, device=device)
         if self.use_sync_guidance and self.sync_head is not None and self.W_SYNC > 0:
             # Positive: current latent
             sync_pos = self.sync_head(latent_t, seq_valid_mask)
             
             if sync_pos is not None:
-                # Negative: permuted latent (safer than time-shift)
+                # ✅ SAFER Negative: Time-shifted latent (better than permutation)
                 with torch.no_grad():
-                    idx_perm = torch.randperm(B, device=device)
-                    latent_neg = latent_t[idx_perm]
-                    mask_neg = seq_valid_mask[idx_perm]
+                    # Random shift between 1 and T//4
+                    max_shift = max(1, T // 4)
+                    shifts = torch.randint(1, max_shift + 1, (B,), device=device)
+                    
+                    # Apply time-shift to each sample
+                    latent_neg = torch.stack([
+                        torch.roll(latent_t[i], shifts=shifts[i].item(), dims=0)
+                        for i in range(B)
+                    ])
+                    
+                    # Mask stays the same (temporal structure matters)
+                    mask_neg = seq_valid_mask
                 
                 sync_neg = self.sync_head(latent_neg, mask_neg)
                 
                 if sync_neg is not None:
-                    # Contrastive loss: encourage positive > negative
+                    # Contrastive loss: encourage positive > negative + margin
                     def masked_mean(val, m):
                         return (val * m.float()).sum() / m.sum().clamp(min=1)
                     
                     pos_score = masked_mean(sync_pos.sum(dim=-1), seq_valid_mask)
                     neg_score = masked_mean(sync_neg.sum(dim=-1), mask_neg)
-                    sync_loss = F.relu(0.2 - pos_score + neg_score)
+                    
+                    # Hinge loss with configurable margin
+                    sync_loss = F.relu(self.sync_margin - pos_score + neg_score)
         
         # 8. Total loss
         total_loss = (
@@ -285,6 +304,10 @@ class LatentFlowMatcher(nn.Module):
         # Initialize latent
         latent = torch.randn(B, T, self.latent_dim, device=device)
         dt = 1.0 / num_steps
+        
+        # ✅ FIX 4: Dynamic clamping based on latent_scale
+        clamp_min = -self.clamp_scale * latent_scale
+        clamp_max = self.clamp_scale * latent_scale
         
         # ODE solve
         for step in range(num_steps):
@@ -336,7 +359,7 @@ class LatentFlowMatcher(nn.Module):
                 latent = latent + v_final.detach() * dt
                 # Mask padding positions
                 latent = latent * seq_valid_mask.unsqueeze(-1).float()
-                # Clipping for numerical stability (from Doc 4, but adjusted)
-                latent = torch.clamp(latent, -8.0, 8.0)
+                # ✅ FIX 4: Dynamic clamping
+                latent = torch.clamp(latent, clamp_min, clamp_max)
         
         return latent * latent_scale
