@@ -153,7 +153,7 @@ def main():
             # 2. Get Ground Truth Latents
             with torch.no_grad():
                 gt_latent = ae.encode(poses)
-            
+                gt_latent = gt_latent / latent_scale
             # 3. Forward
             optimizer.zero_grad()
             with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
