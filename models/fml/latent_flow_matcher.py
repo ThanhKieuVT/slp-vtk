@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from transformers import BertModel
 
 # ==============================================================================
-# 1. IMPORT HANDLING & DUMMY CLASSES (Prevent Crash)
+# 1. IMPORT HANDLING & DUMMY CLASSES
 # ==============================================================================
 try:
     # Ưu tiên import local
@@ -28,18 +28,15 @@ except ImportError:
         class FlowMatchingLoss(nn.Module):
             def forward(self, *args, **kwargs): return torch.tensor(0.0)
 
-    # Dummy cho các module Optional (Mamba, SyncGuidance)
+    # --- FIX 1: Trả về None để báo hiệu là module giả ---
     class SimpleSSMPrior(nn.Module):
         def __init__(self, *args, **kwargs): super().__init__()
         def forward(self, x, *args, **kwargs): return None 
 
-    # --- FIX QUAN TRỌNG Ở ĐÂY ---
     class SyncGuidanceHead(nn.Module):
         def __init__(self, *args, **kwargs): super().__init__()
-        def forward(self, x, *args, **kwargs):
-            # x shape: [Batch, Time, Dim]
-            # Trả về [Batch, Time, 1] để khớp dimension khi tính toán
-            return torch.zeros(x.shape[0], x.shape[1], 1, device=x.device)
+        # FIX QUAN TRỌNG: Trả về None để logic bên dưới biết đường bỏ qua
+        def forward(self, x, *args, **kwargs): return None
 
 # ==============================================================================
 # 2. HELPER MODULES
@@ -58,6 +55,7 @@ class LengthPredictor(nn.Module):
 
     def forward(self, text_features, mask=None):
         if mask is not None:
+            # FIX Type safety
             keep_mask = mask.float().unsqueeze(-1) if mask.dtype != torch.float else mask.unsqueeze(-1)
             pooled_text = (text_features * keep_mask).sum(dim=1) / keep_mask.sum(dim=1).clamp(min=1)
         else:
@@ -97,20 +95,18 @@ class LatentFlowMatcher(nn.Module):
         self.length_predictor = LengthPredictor(input_dim=hidden_dim)
         self.length_loss_fn = nn.SmoothL1Loss()
         
-        # Init scheduler & Main Flow Block
         self.scheduler = FlowMatchingScheduler()
         self.flow_block = FlowMatchingBlock(
             data_dim=latent_dim, condition_dim=hidden_dim, hidden_dim=hidden_dim,
             num_layers=num_flow_layers, num_heads=num_heads, dropout=dropout
         )
         
-        # Optional Modules (Safe Init)
+        # Safe Init
         self.ssm_prior = None
         if self.use_ssm_prior:
             try:
                 self.ssm_prior = SimpleSSMPrior(latent_dim, hidden_dim, num_prior_layers, num_heads, dropout)
             except (NameError, TypeError):
-                print("⚠️ Cannot init SSM Prior. Disabling.")
                 self.use_ssm_prior = False
 
         self.sync_head = None
@@ -118,7 +114,6 @@ class LatentFlowMatcher(nn.Module):
             try:
                 self.sync_head = SyncGuidanceHead(latent_dim, hidden_dim // 2, dropout)
             except (NameError, TypeError):
-                print("⚠️ Cannot init SyncGuidance. Disabling.")
                 self.use_sync_guidance = False
         
         self.flow_loss_fn = FlowMatchingLoss()
@@ -139,7 +134,6 @@ class LatentFlowMatcher(nn.Module):
             return self.lambda_prior
     
     def forward(self, batch, gt_latent=None, pose_gt=None, mode='train', num_inference_steps=50, latent_scale=1.0, return_attn_weights=False):
-        # Common text encoding
         text_features, text_valid_mask = self.encode_text(batch['text_tokens'], batch['attention_mask'])
         
         if mode == 'train':
@@ -160,11 +154,10 @@ class LatentFlowMatcher(nn.Module):
         t = self.scheduler.sample_timesteps(B, device)
         seq_mask = torch.arange(T, device=device)[None, :] < batch['seq_lengths'][:, None]
         
-        # Add Noise: x0 (noise), x1 (data) -> xt
         latent_t, v_gt, latent_0 = self.scheduler.add_noise(gt_latent, t)
         pose_attn_mask = ~seq_mask 
         
-        # 3. Predict Velocity (Vector Field)
+        # 3. Predict Velocity
         flow_output = self.flow_block(
             latent_t, t, text_features,
             text_attn_mask=text_valid_mask, 
@@ -175,42 +168,42 @@ class LatentFlowMatcher(nn.Module):
         if return_attn_weights: v_flow, attn_weights = flow_output
         else: v_flow, attn_weights = flow_output, None
         
-        # 4. Prior Integration (Optional)
+        # 4. Prior Integration (Safe Check)
         v_prior = None
         if self.use_ssm_prior and self.ssm_prior is not None:
             prior_out = self.ssm_prior(latent_t.detach(), t, text_features, mask=seq_mask)
-            if prior_out is not None:
+            if prior_out is not None: # Chỉ dùng nếu module trả về Tensor thật
                 v_prior = prior_out
         
         lambda_t = self.get_lambda_t(t)
         v_pred_train = v_flow + lambda_t * v_prior if v_prior is not None else v_flow
         
-        # 5. Losses Calculation
+        # 5. Losses
         flow_loss = self.flow_loss_fn(v_pred_train, v_gt, mask=seq_mask)
         prior_loss = torch.tensor(0.0, device=device)
         sync_loss = torch.tensor(0.0, device=device)
         
-        # Sync Guidance Loss (Contrastive)
+        # --- FIX QUAN TRỌNG: Sync Guidance Logic ---
+        # Chỉ chạy nếu module tồn tại VÀ trả về dữ liệu (không phải None)
         if self.use_sync_guidance and self.sync_head is not None and self.W_SYNC > 0:
             sync_pos = self.sync_head(latent_t, seq_mask)
             
-            # Kiểm tra nếu sync_pos trả về 0 do dummy class thì skip tính toán
-            if sync_pos.sum() != 0 or sync_pos.shape[-1] > 1:
+            # Check None: Bỏ qua hoàn toàn nếu là dummy module
+            if sync_pos is not None:
                 with torch.no_grad():
                     idx_perm = torch.randperm(B, device=device)
                     latent_neg = latent_t[idx_perm]
                     mask_neg = seq_mask[idx_perm]
+                
                 sync_neg = self.sync_head(latent_neg, mask_neg)
                 
-                def masked_mean(val, m): 
-                    # Val [B, T], Mask [B, T] -> OK
-                    return (val * m.float()).sum() / m.sum().clamp(min=1)
-
-                # sum(dim=-1) biến [B, T, 1] thành [B, T] -> OK
-                pos_score = masked_mean(sync_pos.sum(dim=-1), seq_mask)
-                neg_score = masked_mean(sync_neg.sum(dim=-1), mask_neg)
-                
-                sync_loss = F.relu(0.2 - pos_score + neg_score)
+                # Double check sync_neg cũng không phải None
+                if sync_neg is not None:
+                    def masked_mean(val, m): return (val * m.float()).sum() / m.sum().clamp(min=1)
+                    
+                    pos_score = masked_mean(sync_pos.sum(dim=-1), seq_mask)
+                    neg_score = masked_mean(sync_neg.sum(dim=-1), mask_neg)
+                    sync_loss = F.relu(0.2 - pos_score + neg_score)
 
         total_loss = flow_loss + self.W_LENGTH * length_loss + self.W_SYNC * sync_loss + self.W_PRIOR * prior_loss
 
@@ -233,7 +226,6 @@ class LatentFlowMatcher(nn.Module):
         seq_mask = torch.arange(T, device=device)[None, :] < target_lengths[:, None]
         
         latent = torch.randn(B, T, self.latent_dim, device=device) 
-        
         dt = 1.0 / num_steps
         pose_attn_mask = ~seq_mask
         
@@ -242,7 +234,8 @@ class LatentFlowMatcher(nn.Module):
             t = torch.full((B,), t_val, device=device)
             
             latent_in = latent.detach()
-            if self.use_sync_guidance:
+            # Chỉ bật grad nếu thực sự có dùng guidance
+            if self.use_sync_guidance and self.sync_head is not None:
                 latent_in.requires_grad_(True)
             
             v_flow = self.flow_block(latent_in, t, text_features, 
@@ -261,8 +254,8 @@ class LatentFlowMatcher(nn.Module):
             # Sync Guidance
             if self.use_sync_guidance and self.sync_head is not None and 0.1 < t_val < 0.9:
                 sync_out = self.sync_head(latent_in, seq_mask)
-                # Chỉ tính guidance nếu output khác 0
-                if sync_out.sum() != 0:
+                # FIX: Check None trước khi dùng
+                if sync_out is not None:
                     with torch.enable_grad():
                         guidance_score = sync_out.mean()
                         sync_grad = torch.autograd.grad(guidance_score, latent_in)[0]
