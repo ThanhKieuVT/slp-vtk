@@ -14,13 +14,12 @@ sys.path.append(os.getcwd())
 # Import Models & Data
 try:
     from dataset import SignLanguageDataset, collate_fn
-    from models.fml.autoencoder import UnifiedPoseAutoencoder
+    from models.autoencoder import UnifiedPoseAutoencoder
     from models.fml.latent_flow_matcher import LatentFlowMatcher
 except ImportError:
-    # Fallback nếu cấu trúc thư mục khác
     from dataset import SignLanguageDataset, collate_fn
-    from models.fml.autoencoder import UnifiedPoseAutoencoder
-    from models.fml.latent_flow_matcher import LatentFlowMatcher
+    from autoencoder import UnifiedPoseAutoencoder
+    from latent_flow_matcher import LatentFlowMatcher
 
 def safe_float(x):
     return float(x) if isinstance(x, (int, float, np.floating)) else x.item() if hasattr(x, "item") else float(x)
@@ -32,11 +31,18 @@ def estimate_scale_factor(encoder, dataloader, device, max_samples=1024):
     print("Computing latent scale factor...")
     with torch.no_grad():
         for batch in dataloader:
+            # --- FIX LOGIC TENSOR ---
+            poses = None
             if isinstance(batch, dict):
-                poses = batch.get("poses") or batch.get("pose") or batch.get("x")
+                if "poses" in batch: poses = batch["poses"]
+                elif "pose" in batch: poses = batch["pose"]
+                elif "x" in batch: poses = batch["x"]
             else:
                 poses = batch[0]
             
+            if poses is None:
+                continue # Skip bad batch
+                
             poses = poses.to(device)
             z = encoder.encode(poses)
             latents.append(z.detach().cpu())
@@ -54,7 +60,6 @@ def parse_args():
     
     # --- Data & Paths ---
     p.add_argument("--data_dir", type=str, required=True)
-    # Hỗ trợ cả 2 tên: --ae_ckpt VÀ --autoencoder_checkpoint
     p.add_argument("--ae_ckpt", "--autoencoder_checkpoint", dest="ae_ckpt", type=str, required=True)
     p.add_argument("--save_dir", "--outputza_dir", dest="save_dir", type=str, default="./ckpts")
     p.add_argument("--flow_ckpt", "--resume_from", dest="flow_ckpt", type=str, default=None)
@@ -69,8 +74,8 @@ def parse_args():
     # --- Model Params ---
     p.add_argument("--latent_dim", type=int, default=256)
     p.add_argument("--hidden_dim", type=int, default=512)
-    p.add_argument("--ae_hidden_dim", type=int, default=512) # Dummy để không lỗi lệnh
-    p.add_argument("--max_seq_len", type=int, default=120)   # Dummy để không lỗi lệnh
+    p.add_argument("--ae_hidden_dim", type=int, default=512)
+    p.add_argument("--max_seq_len", type=int, default=120)
     
     # --- Loss Weights ---
     p.add_argument("--W_SYNC", type=float, default=0.1)
@@ -92,9 +97,8 @@ def main():
     # 1. Init Dataset
     print("⏳ Loading dataset...")
     try:
-        train_dataset = SignLanguageDataset(data_dir=args.data_dir) # Bỏ max_seq_len nếu dataset ko hỗ trợ
+        train_dataset = SignLanguageDataset(data_dir=args.data_dir)
     except TypeError:
-        # Nếu dataset của bạn hỗ trợ tham số khác
         train_dataset = SignLanguageDataset(data_dir=args.data_dir)
 
     train_loader = DataLoader(
@@ -108,10 +112,8 @@ def main():
     print(f"✅ Loaded {len(train_dataset)} samples.")
 
     # 2. Init Models
-    # Lưu ý: Cần truyền hidden_dim vào AE nếu AE của bạn dùng tham số đó lúc init
     ae = UnifiedPoseAutoencoder(latent_dim=args.latent_dim, hidden_dim=args.ae_hidden_dim).to(device)
     
-    # Init Flow Matcher với weights từ command line
     flow_matcher = LatentFlowMatcher(
         latent_dim=args.latent_dim, 
         hidden_dim=args.hidden_dim,
@@ -159,20 +161,29 @@ def main():
         n_batches = 0
         
         for batch in pbar:
-            # Handle Batch Logic
+            # --- FIX LOGIC TENSOR (Lặp lại fix ở đây) ---
+            poses = None
             if isinstance(batch, dict):
-                poses = batch.get("poses") or batch.get("pose") or batch.get("x")
-                if "seq_lengths" not in batch:
+                # Ưu tiên lấy poses
+                if "poses" in batch: poses = batch["poses"]
+                elif "pose" in batch: poses = batch["pose"]
+                elif "x" in batch: poses = batch["x"]
+                
+                # Setup seq_lengths nếu chưa có
+                if poses is not None and "seq_lengths" not in batch:
                      batch["seq_lengths"] = torch.full((poses.shape[0],), poses.shape[1], device=device, dtype=torch.long)
             else:
                 poses = batch[0]
-                # Re-wrap if tuple
                 batch = {
                     'text_tokens': batch[1].to(device),
                     'attention_mask': batch[2].to(device),
                     'seq_lengths': torch.full((poses.shape[0],), poses.shape[1], device=device, dtype=torch.long)
                 }
             
+            if poses is None:
+                # Debug print nếu cần
+                continue
+
             poses = poses.to(device)
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor) and k != 'poses':
@@ -216,7 +227,7 @@ def main():
         scheduler.step(epoch + 1)
         
         # Save Checkpoint
-        save_path = os.path.join(args.save_dir, "best_model.pt") # Overwrite best model or use epoch name
+        save_path = os.path.join(args.save_dir, "best_model.pt")
         torch.save({
             "epoch": epoch + 1,
             "model_state_dict": flow_matcher.state_dict(),
