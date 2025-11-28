@@ -14,13 +14,13 @@ sys.path.append(os.getcwd())
 # Import Models & Data
 try:
     from dataset import SignLanguageDataset, collate_fn
-    from models.autoencoder import UnifiedPoseAutoencoder
+    from models.fml.autoencoder import UnifiedPoseAutoencoder
     from models.fml.latent_flow_matcher import LatentFlowMatcher
 except ImportError:
     # Fallback nếu cấu trúc thư mục khác
     from dataset import SignLanguageDataset, collate_fn
-    from autoencoder import UnifiedPoseAutoencoder
-    from latent_flow_matcher import LatentFlowMatcher
+    from models.fml.autoencoder import UnifiedPoseAutoencoder
+    from models.fml.latent_flow_matcher import LatentFlowMatcher
 
 def safe_float(x):
     return float(x) if isinstance(x, (int, float, np.floating)) else x.item() if hasattr(x, "item") else float(x)
