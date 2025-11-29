@@ -195,7 +195,7 @@ class LatentFlowMatcher(nn.Module):
         if return_attn_weights: result['attn_weights'] = attn_weights
         return result
     
-   def _inference_forward(self, batch, text_features, text_mask, num_steps=50):
+    def _inference_forward(self, batch, text_features, text_mask, num_steps=50):
         device = text_features.device
         B = text_features.shape[0]
         
