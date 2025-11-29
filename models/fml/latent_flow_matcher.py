@@ -6,7 +6,7 @@ from transformers import BertModel
 # Import các module vệ tinh
 from .flow_matching import FlowMatchingBlock, FlowMatchingScheduler, FlowMatchingLoss
 from .mamba_prior import SimpleSSMPrior
-from .sync_guidance import SyncGuidanceHead  # <-- Load class mới sửa
+from .sync_guidance import SyncGuidanceHead 
 
 class LengthPredictor(nn.Module):
     def __init__(self, input_dim, hidden_dim=256):
@@ -90,7 +90,6 @@ class LatentFlowMatcher(nn.Module):
             self.ssm_prior = None
         
         if use_sync_guidance:
-            # Hidden dim // 2 để chuẩn bị cho phép concat bên trong SyncHead
             self.sync_head = SyncGuidanceHead(latent_dim, hidden_dim // 2, dropout)
         else:
             self.sync_head = None
@@ -111,7 +110,6 @@ class LatentFlowMatcher(nn.Module):
         else:
             return torch.full((t.shape[0], 1, 1), self.lambda_prior, device=t.device)
     
-    # === FIX: Thêm tham số prior_scale ===
     def forward(self, batch, gt_latent, pose_gt=None, mode='train', num_inference_steps=50, return_attn_weights=False, prior_scale=1.0):
         text_features, text_mask = self.encode_text(batch['text_tokens'], batch['attention_mask'])
         
@@ -157,44 +155,46 @@ class LatentFlowMatcher(nn.Module):
         if return_attn_weights: v_flow, attn_weights = flow_output
         else: v_flow = flow_output
         
-        # === FIX: Apply prior_scale (Warmup) ===
+        # === FIX 1: Explicit Residual Target ===
+        # Flow học phần dư (residual) mà Prior chưa đoán được.
         lambda_t = self.get_lambda_t(t) * prior_scale 
-        v_pred_train = v_flow
+        
         if v_prior is not None:
+            # Target = Velocity thật - Velocity của Prior
+            v_target = v_gt - lambda_t * v_prior.detach()
+            # (Optional) Tính v_pred_full chỉ để visualize nếu cần, không dùng tính loss trực tiếp
             v_pred_train = v_flow + lambda_t * v_prior.detach()
+        else:
+            v_target = v_gt
+            v_pred_train = v_flow
         
         # 5. SYNC GUIDANCE (FIXED LOGIC)
         sync_loss_train = torch.tensor(0.0, device=device)
         
         if self.use_sync_guidance and self.sync_head is not None:
-            # Pooling Text Features (Mean Pool over valid tokens)
             text_valid_mask = (~text_mask).unsqueeze(-1).float()
             text_pooled = (text_features * text_valid_mask).sum(1) / text_valid_mask.sum(1).clamp(min=1)
 
-            # Positive Score: (Latent Đúng, Text Đúng)
-            # Pass text_pooled vào SyncHead
+            # Positive Score
             sync_score_pos = self.sync_head(latent_t, text_pooled, valid_mask)
             
-            # === FIX: Negative Sampling bằng cách tráo Text ===
+            # Negative Score: Shuffle Text
             with torch.no_grad():
                 shuffled_idx = torch.randperm(B)
-                shuffled_text = text_pooled[shuffled_idx] # Tráo text
+                shuffled_text = text_pooled[shuffled_idx]
             
-            # Negative Score: (Latent Đúng, Text Sai)
-            # Giữ nguyên valid_mask của latent -> Không bị lệch mask
             sync_score_neg = self.sync_head(latent_t, shuffled_text, valid_mask)
             
-            # Tính Mean per sample
             score_pos = (sync_score_pos * valid_mask.float()).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)
             score_neg = (sync_score_neg * valid_mask.float()).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)
             
-            # Contrastive Margin Loss
             margin = 0.5
             loss_per_sample = F.relu(margin + score_neg - score_pos)
             sync_loss_train = loss_per_sample.mean()
             
         # 6. TOTAL LOSS
-        flow_loss = self.flow_loss_fn(v_pred_train, v_gt, mask=valid_mask)        
+        # Tính Loss trên v_target (Residual)
+        flow_loss = self.flow_loss_fn(v_flow, v_target, mask=valid_mask)        
         total_loss = flow_loss + self.W_PRIOR * prior_loss + self.W_SYNC * sync_loss_train + self.W_LENGTH * length_loss
         
         result = {
@@ -221,7 +221,6 @@ class LatentFlowMatcher(nn.Module):
         latent = torch.randn(B, T, self.latent_dim, device=device)
         dt = 1.0 / num_steps
         
-        # Prepare Text cho Sync
         text_valid_mask = (~text_mask).unsqueeze(-1).float()
         text_pooled = (text_features * text_valid_mask).sum(1) / text_valid_mask.sum(1).clamp(min=1)
         
@@ -229,7 +228,6 @@ class LatentFlowMatcher(nn.Module):
             t_val = step / num_steps
             t = torch.full((B,), t_val, device=device)
             
-            # Enable Gradient for Guidance
             latent_grad = latent.detach().requires_grad_(True)
             
             v_flow = self.flow_block(latent_grad, t, text_features, 
@@ -242,21 +240,24 @@ class LatentFlowMatcher(nn.Module):
                     v_prior = self.ssm_prior(latent_grad.detach(), t, text_features, mask=valid_mask)
             
             lambda_t = self.get_lambda_t(t)
+            # Inference vẫn phải cộng Prior vào (Consistency)
             v_pred = v_flow + lambda_t * v_prior if v_prior is not None else v_flow
             
             # === SYNC GUIDANCE ===
-            # Chỉ guide ở đoạn giữa (0.2 -> 0.8) khi pose đã hình thành nhưng chưa hoàn thiện
             if self.use_sync_guidance and self.sync_head is not None and 0.2 < t_val < 0.8:
-                # Tính score (truyền cả Latent + Text)
                 sync_score_pred = self.sync_head(latent_grad, text_pooled, valid_mask)
                 total_score = (sync_score_pred * valid_mask.float()).sum() / valid_mask.sum().clamp(min=1)
                 
-                # Gradient Ascent
                 sync_grad = torch.autograd.grad(total_score, latent_grad)[0]
                 
-                # === FIX: CLAMP GRADIENT ===
-                # Chặn gradient quá lớn gây vỡ hình (artifacts)
-                sync_grad = torch.clamp(sync_grad, -0.1, 0.1)
+                # === FIX 8: ADAPTIVE CLAMP ===
+                with torch.no_grad():
+                    # Tính độ lớn trung bình của vận tốc để clamp phù hợp
+                    v_mag = v_pred.norm(dim=-1, keepdim=True).mean()
+                    # Clamp tối đa 0.1, hoặc 10% magnitude hiện tại
+                    clamp_val = min(0.1, max(0.01, v_mag.item() * 0.1))
+                
+                sync_grad = torch.clamp(sync_grad, -clamp_val, clamp_val)
                 
                 guidance_force = self.gamma_guidance * sync_grad.detach()
                 v_pred = v_pred + guidance_force * valid_mask.unsqueeze(-1).float()

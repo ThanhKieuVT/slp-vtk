@@ -93,7 +93,6 @@ def validate(model, ae, val_loader, device, latent_scale):
             
             gt_latent = ae.encode(poses) / latent_scale
             
-            # Validate luôn dùng prior_scale=1.0 để test performance thật
             losses = model(batch_dict, gt_latent, pose_gt=poses.detach(), mode="train", prior_scale=1.0)
             
             for k in metrics:
@@ -123,6 +122,8 @@ def parse_args():
     p.add_argument("--W_SYNC", type=float, default=0.1)
     p.add_argument("--W_LENGTH", type=float, default=0.01)
     p.add_argument("--W_PRIOR", type=float, default=0.1)
+    # === FIX 5: Configurable Warmup ===
+    p.add_argument("--prior_warmup_epochs", type=int, default=5, help="Epochs to warmup prior")
     return p.parse_args()
 
 def main():
@@ -132,7 +133,6 @@ def main():
 
     print(f"🚀 Training Config: Data={args.data_dir} | AE={args.ae_ckpt} | Batch={args.batch_size}")
 
-    # 1. LOAD DATA
     print("⏳ Loading data...")
     train_dataset = SignLanguageDataset(data_dir=args.data_dir, split="train", max_seq_len=args.max_seq_len)
     
@@ -151,19 +151,16 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2, collate_fn=collate_fn, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=2, collate_fn=collate_fn)
 
-    # 2. MODELS
     ae = UnifiedPoseAutoencoder(latent_dim=args.latent_dim, hidden_dim=args.ae_hidden_dim).to(device)
     flow_matcher = LatentFlowMatcher(
         latent_dim=args.latent_dim, hidden_dim=args.hidden_dim,
         W_SYNC=args.W_SYNC, W_LENGTH=args.W_LENGTH, W_PRIOR=args.W_PRIOR
     ).to(device)
 
-    # Load AE
     ck = torch.load(args.ae_ckpt, map_location=device)
     ae.load_state_dict(ck.get("model_state_dict", ck), strict=False)
     ae.eval()
 
-    # 3. SCALE & RESUME
     start_epoch = 0
     best_val_loss = float('inf')
     latent_scale = 1.0
@@ -180,24 +177,21 @@ def main():
     
     print(f"📏 Latent Scale: {latent_scale:.6f}")
 
-    # 4. TRAIN SETUP
     optimizer = torch.optim.AdamW(flow_matcher.parameters(), lr=args.lr, weight_decay=1e-6)
     scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-7)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     writer = SummaryWriter(log_dir=os.path.join(args.save_dir, "logs"))
     patience_counter = 0
     
-    # === CONFIG WARMUP ===
-    PRIOR_WARMUP_EPOCHS = 5
+    # === FIX 5 ===
+    PRIOR_WARMUP_EPOCHS = args.prior_warmup_epochs
 
-    # 5. LOOP
     print("\n🏋️ START TRAINING")
     for epoch in range(start_epoch, args.epochs):
         flow_matcher.train()
         ae.eval()
         
-        # === CALCULATE PRIOR SCALE ===
-        # 5 Epoch đầu: Tắt Prior để Flow học ổn định trước
+        # Warmup Logic
         current_prior_scale = 0.0 if epoch < PRIOR_WARMUP_EPOCHS else 1.0
         
         metrics = {"total": 0.0, "flow": 0.0, "length": 0.0, "sync": 0.0, "prior": 0.0}
@@ -215,7 +209,6 @@ def main():
                 optimizer.zero_grad()
                 
                 with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                    # Truyền prior_scale vào
                     losses = flow_matcher(
                         batch=batch_dict,
                         gt_latent=gt_latent,
@@ -225,8 +218,22 @@ def main():
                     )
                     total_loss = losses["total"]
                 
+                # === FIX 7: NaN Debugging ===
                 if torch.isnan(total_loss):
-                    print("⚠️ NaN Loss!"); continue
+                    print(f"\n⚠️ NaN Loss at Ep {epoch} Batch {n_batches}!")
+                    print(f"   Flow: {losses.get('flow', 'N/A')} | Prior: {losses.get('prior', 'N/A')}")
+                    
+                    debug_path = os.path.join(args.save_dir, f"nan_debug_ep{epoch}_b{n_batches}.pt")
+                    torch.save({
+                        'batch': batch_dict,
+                        'gt_latent': gt_latent,
+                        'losses': losses
+                    }, debug_path)
+                    print(f"   🛑 Saved debug info to {debug_path}")
+                    
+                    # Zero grad & skip step
+                    optimizer.zero_grad()
+                    continue
                 
                 scaler.scale(total_loss).backward()
                 scaler.unscale_(optimizer)
@@ -238,11 +245,12 @@ def main():
                 n_batches += 1
                 pbar.set_postfix({"L": f"{metrics['total']/n_batches:.4f}", "F": f"{metrics['flow']/n_batches:.3f}"})
                 
-            except Exception as e: continue
+            except Exception as e:
+                print(f"Error: {e}") 
+                continue
         
         if n_batches == 0: continue
         
-        # Log & Validate
         for k in metrics: writer.add_scalar(f"Train/{k}", metrics[k]/n_batches, epoch)
         
         val_res = validate(flow_matcher, ae, val_loader, device, latent_scale)
