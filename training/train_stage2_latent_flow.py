@@ -41,9 +41,17 @@ def estimate_scale_factor(encoder, dataloader, device, max_samples=1024):
     print("Computing latent scale factor...")
     with torch.no_grad():
         for batch in dataloader:
+            # Sửa lỗi logic ở đây tương tự prepare_batch
+            if isinstance(batch, dict):
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor): batch[k] = v.to(device)
+            elif isinstance(batch, (list, tuple)):
+                batch = [x.to(device) if isinstance(x, torch.Tensor) else x for x in batch]
+            
             poses = extract_poses(batch)
             if poses is None: continue
-            poses = poses.to(device)
+            
+            # poses đã ở trên device
             z = encoder.encode(poses)
             latents.append(z.detach().cpu())
             seen += z.shape[0]
@@ -58,22 +66,32 @@ def estimate_scale_factor(encoder, dataloader, device, max_samples=1024):
     scale = float(latents.abs().quantile(0.95))
     return max(scale, 1e-6)
 
+# === FIX QUAN TRỌNG: Đảo thứ tự to(device) ===
 def prepare_batch(batch, device):
     if isinstance(batch, dict):
+        # 1. Chuyển TOÀN BỘ dict lên GPU trước
+        for k, v in batch.items():
+            if isinstance(v, torch.Tensor):
+                batch[k] = v.to(device)
+        
+        # 2. Sau đó mới lấy poses (lúc này poses đã là GPU tensor)
         poses = extract_poses(batch)
+        
+        # 3. Tạo seq_lengths nếu thiếu (trên GPU)
         if "seq_lengths" not in batch and poses is not None:
             B, T, _ = poses.shape
-            batch["seq_lengths"] = torch.full((B,), T, dtype=torch.long)
-        for k, v in batch.items():
-            if isinstance(v, torch.Tensor): batch[k] = v.to(device)
+            batch["seq_lengths"] = torch.full((B,), T, device=device, dtype=torch.long)
+            
         return poses, batch
     else:
+        # Trường hợp Tuple/List
         if len(batch) < 3: return None, None
         poses = batch[0].to(device)
         if len(batch) >= 4: seq_lens = batch[3].to(device)
         else:
             B, T, _ = poses.shape
             seq_lens = torch.full((B,), T, device=device, dtype=torch.long)
+        
         return poses, {
             'text_tokens': batch[1].to(device),
             'attention_mask': batch[2].to(device),
@@ -122,7 +140,6 @@ def parse_args():
     p.add_argument("--W_SYNC", type=float, default=0.1)
     p.add_argument("--W_LENGTH", type=float, default=0.01)
     p.add_argument("--W_PRIOR", type=float, default=0.1)
-    # === FIX 5: Configurable Warmup ===
     p.add_argument("--prior_warmup_epochs", type=int, default=5, help="Epochs to warmup prior")
     return p.parse_args()
 
@@ -160,15 +177,28 @@ def main():
     ck = torch.load(args.ae_ckpt, map_location=device)
     ae.load_state_dict(ck.get("model_state_dict", ck), strict=False)
     ae.eval()
+    
+    # 1. Khởi tạo Optimizer TRƯỚC
+    optimizer = torch.optim.AdamW(flow_matcher.parameters(), lr=args.lr, weight_decay=1e-6)
 
+    # 2. Sau đó mới Load Checkpoint (Resume)
     start_epoch = 0
     best_val_loss = float('inf')
     latent_scale = 1.0
-    
+
     if args.flow_ckpt and os.path.exists(args.flow_ckpt):
         print(f"🔄 Resuming: {args.flow_ckpt}")
         ck = torch.load(args.flow_ckpt, map_location=device)
+        
         flow_matcher.load_state_dict(ck['model_state_dict'], strict=False)
+        
+        if 'optimizer_state_dict' in ck:
+            try:
+                optimizer.load_state_dict(ck['optimizer_state_dict'])
+                print("   ✅ Optimizer state loaded!")
+            except:
+                print("   ⚠️ Could not load optimizer state (architecture mismatch?), starting fresh.")
+
         start_epoch = ck.get("epoch", 0)
         latent_scale = float(ck.get("latent_scale_factor", 1.0))
         best_val_loss = float(ck.get("val_loss", float('inf')))
@@ -177,13 +207,15 @@ def main():
     
     print(f"📏 Latent Scale: {latent_scale:.6f}")
 
-    optimizer = torch.optim.AdamW(flow_matcher.parameters(), lr=args.lr, weight_decay=1e-6)
     scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-7)
+    # Update scheduler về đúng epoch hiện tại
+    if start_epoch > 0:
+        scheduler.step(start_epoch) 
+        
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     writer = SummaryWriter(log_dir=os.path.join(args.save_dir, "logs"))
     patience_counter = 0
     
-    # === FIX 5 ===
     PRIOR_WARMUP_EPOCHS = args.prior_warmup_epochs
 
     print("\n🏋️ START TRAINING")
@@ -191,7 +223,6 @@ def main():
         flow_matcher.train()
         ae.eval()
         
-        # Warmup Logic
         current_prior_scale = 0.0 if epoch < PRIOR_WARMUP_EPOCHS else 1.0
         
         metrics = {"total": 0.0, "flow": 0.0, "length": 0.0, "sync": 0.0, "prior": 0.0}
@@ -218,20 +249,8 @@ def main():
                     )
                     total_loss = losses["total"]
                 
-                # === FIX 7: NaN Debugging ===
                 if torch.isnan(total_loss):
                     print(f"\n⚠️ NaN Loss at Ep {epoch} Batch {n_batches}!")
-                    print(f"   Flow: {losses.get('flow', 'N/A')} | Prior: {losses.get('prior', 'N/A')}")
-                    
-                    debug_path = os.path.join(args.save_dir, f"nan_debug_ep{epoch}_b{n_batches}.pt")
-                    torch.save({
-                        'batch': batch_dict,
-                        'gt_latent': gt_latent,
-                        'losses': losses
-                    }, debug_path)
-                    print(f"   🛑 Saved debug info to {debug_path}")
-                    
-                    # Zero grad & skip step
                     optimizer.zero_grad()
                     continue
                 
@@ -246,6 +265,7 @@ def main():
                 pbar.set_postfix({"L": f"{metrics['total']/n_batches:.4f}", "F": f"{metrics['flow']/n_batches:.3f}"})
                 
             except Exception as e:
+                # In lỗi chi tiết để debug nếu còn lỗi
                 print(f"Error: {e}") 
                 continue
         
