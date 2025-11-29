@@ -159,20 +159,8 @@ def main():
         # B. Generate Latent (Inference)
         # Số bước inference (50 steps là chuẩn cho Flow Matching)
         with torch.no_grad():
-            gen_latent = flow_matcher(
-                batch=None, 
-                gt_latent=None,
-                mode='inference',
-                num_inference_steps=50,
-                # Cần truyền features đã encode vào hàm inference_forward (thông qua wrapper hoặc gọi trực tiếp)
-                # Lưu ý: Hàm forward của LatentFlowMatcher trong code mới gọi _inference_forward
-                # nhưng nó mong đợi batch có text_tokens. 
-                # Ta sẽ gọi trực tiếp _inference_forward để linh hoạt
-            )
-            
-            # Gọi trực tiếp hàm inference nội bộ
             gen_latent = flow_matcher._inference_forward(
-                batch=None,
+                batch=None,  # Hàm này không cần batch nếu đã có text_features
                 text_features=text_features,
                 text_mask=text_mask,
                 num_steps=50
