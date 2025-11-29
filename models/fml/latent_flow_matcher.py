@@ -195,7 +195,7 @@ class LatentFlowMatcher(nn.Module):
         if return_attn_weights: result['attn_weights'] = attn_weights
         return result
     
-    def _inference_forward(self, batch, text_features, text_mask, num_steps=50):
+   def _inference_forward(self, batch, text_features, text_mask, num_steps=50):
         device = text_features.device
         B = text_features.shape[0]
         
@@ -218,35 +218,44 @@ class LatentFlowMatcher(nn.Module):
             t_val = step / num_steps
             t = torch.full((B,), t_val, device=device)
             
-            latent_grad = latent.detach().requires_grad_(True)
-            
-            v_flow = self.flow_block(latent_grad, t, text_features, 
+            # 1. Flow & Prior (Chạy chế độ no_grad để tiết kiệm VRAM)
+            # Lưu ý: Ta tách latent_grad ra sau
+            v_flow = self.flow_block(latent, t, text_features, 
                                    text_attn_mask=text_mask, 
                                    pose_attn_mask=pose_padding_mask)
             
             v_prior = None
             if self.use_ssm_prior and self.ssm_prior is not None:
                 with torch.no_grad():
-                    v_prior = self.ssm_prior(latent_grad.detach(), t, text_features, mask=valid_mask)
+                    v_prior = self.ssm_prior(latent, t, text_features, mask=valid_mask)
             
             lambda_t = self.get_lambda_t(t)
             v_pred = v_flow + lambda_t * v_prior if v_prior is not None else v_flow
             
+            # 2. Sync Guidance (CẦN Gradient -> Bật enable_grad cục bộ)
             if self.use_sync_guidance and self.sync_head is not None and 0.2 < t_val < 0.8:
-                sync_score_pred = self.sync_head(latent_grad, text_pooled, valid_mask)
-                total_score = (sync_score_pred * valid_mask.float()).sum() / valid_mask.sum().clamp(min=1)
+                with torch.enable_grad(): # <--- QUAN TRỌNG: Bật grad tạm thời
+                    latent_grad = latent.detach().requires_grad_(True)
+                    
+                    sync_score_pred = self.sync_head(latent_grad, text_pooled, valid_mask)
+                    total_score = (sync_score_pred * valid_mask.float()).sum() / valid_mask.sum().clamp(min=1)
+                    
+                    # Tính đạo hàm
+                    sync_grad = torch.autograd.grad(total_score, latent_grad)[0]
                 
-                sync_grad = torch.autograd.grad(total_score, latent_grad)[0]
+                # --- Hết đoạn cần grad, quay lại tính toán thường ---
                 
                 with torch.no_grad():
+                    # Adaptive Clamp
                     v_mag = v_pred.norm(dim=-1, keepdim=True).mean()
                     clamp_val = min(0.1, max(0.01, v_mag.item() * 0.1))
-                
-                sync_grad = torch.clamp(sync_grad, -clamp_val, clamp_val)
-                
-                guidance_force = self.gamma_guidance * sync_grad.detach()
-                v_pred = v_pred + guidance_force * valid_mask.unsqueeze(-1).float()
+                    
+                    sync_grad = torch.clamp(sync_grad, -clamp_val, clamp_val)
+                    
+                    guidance_force = self.gamma_guidance * sync_grad.detach()
+                    v_pred = v_pred + guidance_force * valid_mask.unsqueeze(-1).float()
 
+            # 3. Update Latent (Euler step)
             with torch.no_grad():
                 latent = latent + dt * v_pred
                 latent = latent * valid_mask.unsqueeze(-1).float()
