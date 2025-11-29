@@ -4,57 +4,54 @@ import numpy as np
 
 
 class SyncGuidanceHead(nn.Module):
-    """
-    Sync Guidance Head: Học correlation giữa manual (tay) và NMM (mặt) trong latent
-    """
-    
-    def __init__(
-        self,
-        latent_dim=256,
-        hidden_dim=256,
-        dropout=0.1
-    ):
+    def __init__(self, latent_dim, hidden_dim, dropout=0.1):
         super().__init__()
-        self.latent_dim = latent_dim
-        
-        # Project latent to manual and NMM features
-        self.manual_proj = nn.Sequential(
+        # Nhánh xử lý Latent Pose
+        self.pose_proj = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim // 2)
+            nn.GELU(),
+            nn.Dropout(dropout)
         )
         
-        self.nmm_proj = nn.Sequential(
-            nn.Linear(latent_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim // 2)
+        # Nhánh xử lý Text (Lưu ý: hidden_dim của Text Projector bên ngoài là 512)
+        # Ta giả định input text_features đã có dim = 512 từ LatentFlowMatcher
+        self.text_proj = nn.Sequential(
+            nn.Linear(512, hidden_dim), # 512 khớp với hidden_dim của LatentFlowMatcher
+            nn.GELU(),
+            nn.Dropout(dropout)
         )
         
-        # Correlation predictor
-        self.corr_predictor = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Tanh()  # Output [-1, 1]
+        # Fusion & Score
+        self.score_net = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1) # Output score scalar tại mỗi timestep
         )
-    
-    def forward(self, latent, mask=None):
+
+    def forward(self, latent, text, mask=None):
         """
-        Predict sync quality (correlation) từ latent
+        latent: [B, T, D]
+        text:   [B, D] (Global text feature) hoặc [B, T, D] (nếu đã expand)
+        mask:   [B, T] (True = Valid)
         """
-        manual_feat = self.manual_proj(latent)  # [B, T, hidden_dim//2]
-        nmm_feat = self.nmm_proj(latent)  # [B, T, hidden_dim//2]
+        # 1. Project Features
+        h_pose = self.pose_proj(latent) # [B, T, H]
         
-        combined = torch.cat([manual_feat, nmm_feat], dim=-1)  # [B, T, hidden_dim]
+        # Expand Text nếu cần để khớp với Time
+        if text.dim() == 2:
+            h_text = self.text_proj(text).unsqueeze(1).expand(-1, latent.size(1), -1) # [B, T, H]
+        else:
+            h_text = self.text_proj(text)
+
+        # 2. Concat & Predict
+        cat_feat = torch.cat([h_pose, h_text], dim=-1) # [B, T, 2H]
+        scores = self.score_net(cat_feat).squeeze(-1)  # [B, T]
         
-        corr_pred = self.corr_predictor(combined).squeeze(-1)  # [B, T]
-        
+        # 3. Masking (Gán score cực thấp cho phần padding để không ảnh hưởng max/mean)
         if mask is not None:
-            corr_pred = corr_pred * mask.float()
-        
-        return corr_pred
+            scores = scores * mask.float()
+            
+        return scores
     
     def compute_loss(self, latent, pose_gt, mask=None):
         """

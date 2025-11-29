@@ -3,40 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BertModel
 
-# ==============================================================================
-# ROBUST IMPORT
-# ==============================================================================
-try:
-    from .flow_matching import FlowMatchingBlock, FlowMatchingScheduler, FlowMatchingLoss
-    from .mamba_prior import SimpleSSMPrior
-    from .sync_guidance import SyncGuidanceHead
-except ImportError:
-    try:
-        from models.fml.flow_matching import FlowMatchingBlock, FlowMatchingScheduler, FlowMatchingLoss
-    except ImportError:
-        print("⚠️ Warning: Using dummy FlowMatching classes")
-        class FlowMatchingBlock(nn.Module):
-            def __init__(self, *args, **kwargs): super().__init__()
-            def forward(self, x, *args, **kwargs): return x
-        
-        class FlowMatchingScheduler:
-            def sample_timesteps(self, b, device): return torch.rand(b, device=device)
-            def add_noise(self, x, t): return x, torch.zeros_like(x), torch.zeros_like(x)
-        
-        class FlowMatchingLoss(nn.Module):
-            def forward(self, *args, **kwargs): return torch.tensor(0.0)
-    
-    class SimpleSSMPrior(nn.Module):
-        def __init__(self, *args, **kwargs): super().__init__()
-        def forward(self, x, *args, **kwargs): return None
-    
-    class SyncGuidanceHead(nn.Module):
-        def __init__(self, *args, **kwargs): super().__init__()
-        def forward(self, x, *args, **kwargs): return None
+# Import các module vệ tinh
+from .flow_matching import FlowMatchingBlock, FlowMatchingScheduler, FlowMatchingLoss
+from .mamba_prior import SimpleSSMPrior
+from .sync_guidance import SyncGuidanceHead  # <-- Load class mới sửa
 
-# ==============================================================================
-# LENGTH PREDICTOR
-# ==============================================================================
 class LengthPredictor(nn.Module):
     def __init__(self, input_dim, hidden_dim=256):
         super().__init__()
@@ -46,34 +17,38 @@ class LengthPredictor(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
+            nn.Linear(hidden_dim, 1) 
         )
-    
-    def forward(self, text_features, padding_mask=None):
-        """
-        Args:
-            text_features: [B, L, D]
-            padding_mask: [B, L] where True=Padding, False=Valid
-        """
-        if padding_mask is not None:
-            valid_mask = (~padding_mask).float().unsqueeze(-1)  # True → Valid
-            pooled = (text_features * valid_mask).sum(1) / valid_mask.sum(1).clamp(min=1)
-        else:
-            pooled = text_features.mean(1)
-        return self.net(pooled).squeeze(-1)
 
-# ==============================================================================
-# MAIN MODEL (FIXED VERSION)
-# ==============================================================================
+    def forward(self, text_features, mask=None):
+        if mask is not None:
+            valid_mask = (~mask).float().unsqueeze(-1) 
+            pooled_text = (text_features * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)
+        else:
+            pooled_text = text_features.mean(dim=1) 
+        pred_length = self.net(pooled_text)
+        return pred_length.squeeze(-1) 
+
 class LatentFlowMatcher(nn.Module):
-    def __init__(self, latent_dim=256, text_encoder_name='bert-base-multilingual-cased',
-                 hidden_dim=512, num_flow_layers=6, num_prior_layers=4, num_heads=8,
-                 dropout=0.1, use_ssm_prior=True, use_sync_guidance=True,
-                 lambda_prior=0.1, gamma_guidance=0.01, lambda_anneal=True,
-                 W_PRIOR=0.05, W_SYNC=0.1, W_LENGTH=0.1,
-                 sync_margin=0.2, clamp_scale=8.0):  # ✅ NEW: Configurable params
+    def __init__(
+        self,
+        latent_dim=256,
+        text_encoder_name='bert-base-multilingual-cased',
+        hidden_dim=512,
+        num_flow_layers=6,
+        num_prior_layers=4,
+        num_heads=8,
+        dropout=0.1,
+        use_ssm_prior=True,
+        use_sync_guidance=True,
+        lambda_prior=0.1,
+        gamma_guidance=0.01,
+        lambda_anneal=True,
+        W_PRIOR=0.1,
+        W_SYNC=0.1,
+        W_LENGTH=1.0
+    ):
         super().__init__()
-        
         self.latent_dim = latent_dim
         self.use_ssm_prior = use_ssm_prior
         self.use_sync_guidance = use_sync_guidance
@@ -81,285 +56,214 @@ class LatentFlowMatcher(nn.Module):
         self.gamma_guidance = gamma_guidance
         self.lambda_anneal = lambda_anneal
         
-        # Loss weights
+        # Loss Weights
         self.W_PRIOR = W_PRIOR
         self.W_SYNC = W_SYNC
         self.W_LENGTH = W_LENGTH
-        
-        # ✅ FIX 1: Configurable hyperparameters
-        self.sync_margin = sync_margin  # Margin for contrastive loss
-        self.clamp_scale = clamp_scale  # Latent clamping range
-        
-        # Text Encoder (frozen)
-        print(f"Loading Text Encoder: {text_encoder_name}...")
+        self.LENGTH_SCALE = 120.0 
+
+        # Text Encoder (Frozen)
         self.text_encoder = BertModel.from_pretrained(text_encoder_name)
         for param in self.text_encoder.parameters():
             param.requires_grad = False
-        
+            
         text_dim = self.text_encoder.config.hidden_size
-        self.text_proj = nn.Linear(text_dim, hidden_dim)
+        self.text_proj = nn.Linear(text_dim, hidden_dim) 
         
-        # Length Predictor
-        self.length_predictor = LengthPredictor(hidden_dim)
+        self.length_predictor = LengthPredictor(input_dim=hidden_dim)
         self.length_loss_fn = nn.SmoothL1Loss()
         
-        # Flow Matching
         self.scheduler = FlowMatchingScheduler()
+        
         self.flow_block = FlowMatchingBlock(
             data_dim=latent_dim,
-            condition_dim=hidden_dim,
+            condition_dim=hidden_dim, 
             hidden_dim=hidden_dim,
             num_layers=num_flow_layers,
             num_heads=num_heads,
             dropout=dropout
         )
         
-        # Optional modules
-        self.ssm_prior = None
-        if self.use_ssm_prior:
-            try:
-                self.ssm_prior = SimpleSSMPrior(latent_dim, hidden_dim, num_prior_layers, num_heads, dropout)
-            except (NameError, TypeError):
-                print("⚠️ SSM Prior not available")
-                self.use_ssm_prior = False
+        if use_ssm_prior:
+            self.ssm_prior = SimpleSSMPrior(latent_dim, hidden_dim, num_prior_layers, num_heads, dropout)
+        else:
+            self.ssm_prior = None
         
-        self.sync_head = None
-        if self.use_sync_guidance:
-            try:
-                self.sync_head = SyncGuidanceHead(latent_dim, hidden_dim // 2, dropout)
-            except (NameError, TypeError):
-                print("⚠️ Sync Guidance not available")
-                self.use_sync_guidance = False
+        if use_sync_guidance:
+            # Hidden dim // 2 để chuẩn bị cho phép concat bên trong SyncHead
+            self.sync_head = SyncGuidanceHead(latent_dim, hidden_dim // 2, dropout)
+        else:
+            self.sync_head = None
         
         self.flow_loss_fn = FlowMatchingLoss()
-    
+
     def encode_text(self, text_tokens, attention_mask):
-        """
-        Args:
-            attention_mask: BERT format (1=Valid, 0=Padding)
-        Returns:
-            text_features: [B, L, H]
-            padding_mask: [B, L] (True=Padding, False=Valid) - PyTorch convention
-        """
         self.text_encoder.eval()
         with torch.no_grad():
             outputs = self.text_encoder(text_tokens, attention_mask=attention_mask)
-        
-        text_features = self.text_proj(outputs.last_hidden_state)
-        # Convert BERT mask (1=Valid) → PyTorch mask (True=Padding)
-        padding_mask = ~attention_mask.bool()
-        
-        return text_features, padding_mask
+        text_features = self.text_proj(outputs.last_hidden_state) 
+        text_padding_mask = ~attention_mask.bool()
+        return text_features, text_padding_mask
     
     def get_lambda_t(self, t):
-        """Annealing schedule for prior weight"""
         if self.lambda_anneal:
             return self.lambda_prior * (1 - t.float().view(-1, 1, 1))
-        return self.lambda_prior
+        else:
+            return torch.full((t.shape[0], 1, 1), self.lambda_prior, device=t.device)
     
-    def forward(self, batch, gt_latent=None, pose_gt=None, mode='train',
-                num_inference_steps=50, latent_scale=1.0, return_attn_weights=False):
-        
-        text_features, text_padding_mask = self.encode_text(
-            batch['text_tokens'], batch['attention_mask']
-        )
+    # === FIX: Thêm tham số prior_scale ===
+    def forward(self, batch, gt_latent, pose_gt=None, mode='train', num_inference_steps=50, return_attn_weights=False, prior_scale=1.0):
+        text_features, text_mask = self.encode_text(batch['text_tokens'], batch['attention_mask'])
         
         if mode == 'train':
-            return self._train_forward(
-                batch, text_features, text_padding_mask, gt_latent, pose_gt, return_attn_weights
-            )
+            return self._train_forward(batch, text_features, text_mask, gt_latent, pose_gt, return_attn_weights, prior_scale)
         else:
-            return self._inference_forward(
-                batch, text_features, text_padding_mask, num_inference_steps, latent_scale
-            )
+            return self._inference_forward(batch, text_features, text_mask, num_inference_steps)
     
-    def _train_forward(self, batch, text_features, text_padding_mask, gt_latent, pose_gt, return_attn_weights):
+    def _train_forward(self, batch, text_features, text_mask, gt_latent, pose_gt=None, return_attn_weights=False, prior_scale=1.0):
         device = text_features.device
         B, T, D = gt_latent.shape
         
-        # 1. Length Prediction
-        pred_length = self.length_predictor(text_features, text_padding_mask)
-        target_length = batch['seq_lengths'].float().to(device)
-        length_loss = self.length_loss_fn(pred_length, target_length)
+        # 1. LENGTH LOSS
+        pred_length = self.length_predictor(text_features.detach(), text_mask)
+        target_length = batch['seq_lengths'].float()
+        length_loss = self.length_loss_fn(pred_length / self.LENGTH_SCALE, target_length / self.LENGTH_SCALE)
         
-        # 2. Flow Matching Setup
+        # 2. SETUP FLOW
         t = self.scheduler.sample_timesteps(B, device)
+        seq_lengths = batch['seq_lengths']
+        valid_mask = torch.arange(T, device=device)[None, :] < seq_lengths[:, None]
+        pose_padding_mask = ~valid_mask
         
-        # Pose mask: True=Valid, False=Padding
-        seq_valid_mask = torch.arange(T, device=device)[None, :] < batch['seq_lengths'][:, None]
-        pose_padding_mask = ~seq_valid_mask  # Convert to PyTorch convention
+        latent_t, v_gt, latent_0 = self.scheduler.add_noise(gt_latent, t)
         
-        # Add noise (discard x0 to save memory)
-        latent_t, v_gt, _ = self.scheduler.add_noise(gt_latent, t)
+        # 3. PRIOR (With Warmup)
+        v_prior = None
+        prior_loss = torch.tensor(0.0, device=device)
         
-        # 3. Predict velocity
+        if self.use_ssm_prior and self.ssm_prior is not None:
+            v_prior = self.ssm_prior(latent_t, t, text_features, mask=valid_mask)
+            # Prior tự học target của nó
+            prior_loss_raw = (v_prior - v_gt.detach()) ** 2
+            prior_loss = (prior_loss_raw * valid_mask.unsqueeze(-1)).sum() / (valid_mask.sum() * D).clamp(min=1)
+        
+        # 4. FLOW MATCHING
         flow_output = self.flow_block(
-            latent_t, t, text_features,
-            text_attn_mask=text_padding_mask,
-            pose_attn_mask=pose_padding_mask,
+            latent_t, t, text_features, 
+            text_attn_mask=text_mask, 
+            pose_attn_mask=pose_padding_mask, 
             return_attn=return_attn_weights
         )
+        if return_attn_weights: v_flow, attn_weights = flow_output
+        else: v_flow = flow_output
         
-        v_flow, attn_weights = (flow_output if return_attn_weights else (flow_output, None))
+        # === FIX: Apply prior_scale (Warmup) ===
+        lambda_t = self.get_lambda_t(t) * prior_scale 
+        v_pred_train = v_flow
+        if v_prior is not None:
+            v_pred_train = v_flow + lambda_t * v_prior.detach()
         
-        # 4. Prior integration
-        v_prior = None
-        if self.use_ssm_prior and self.ssm_prior is not None:
-            prior_out = self.ssm_prior(
-                latent_t.detach(), t, text_features, mask=seq_valid_mask
-            )
-            if prior_out is not None:
-                v_prior = prior_out
+        # 5. SYNC GUIDANCE (FIXED LOGIC)
+        sync_loss_train = torch.tensor(0.0, device=device)
         
-        lambda_t = self.get_lambda_t(t)
-        v_pred = v_flow + lambda_t * v_prior if v_prior is not None else v_flow
-        
-        # 5. Flow loss (main objective)
-        flow_loss = self.flow_loss_fn(v_pred, v_gt, mask=seq_valid_mask)
-        
-        # ✅ FIX 2: IMPROVED Prior Regularization Loss
-        # Purpose: Encourage flow to align with prior (regularization)
-        prior_loss = torch.tensor(0.0, device=device)
-        if v_prior is not None and self.W_PRIOR > 0:
-            # MSE between flow prediction and prior prediction
-            # Detach prior to avoid backprop through SSM (SSM trains separately if needed)
-            prior_diff = F.mse_loss(v_flow, v_prior.detach(), reduction='none')
-            prior_diff = prior_diff * seq_valid_mask.unsqueeze(-1).float()
-            prior_loss = prior_diff.sum() / (seq_valid_mask.sum() * D).clamp(min=1)
-        
-        # ✅ FIX 3: IMPROVED Sync Guidance Loss with Time-Shift Negatives
-        sync_loss = torch.tensor(0.0, device=device)
-        if self.use_sync_guidance and self.sync_head is not None and self.W_SYNC > 0:
-            # Positive: current latent
-            sync_pos = self.sync_head(latent_t, seq_valid_mask)
+        if self.use_sync_guidance and self.sync_head is not None:
+            # Pooling Text Features (Mean Pool over valid tokens)
+            text_valid_mask = (~text_mask).unsqueeze(-1).float()
+            text_pooled = (text_features * text_valid_mask).sum(1) / text_valid_mask.sum(1).clamp(min=1)
+
+            # Positive Score: (Latent Đúng, Text Đúng)
+            # Pass text_pooled vào SyncHead
+            sync_score_pos = self.sync_head(latent_t, text_pooled, valid_mask)
             
-            if sync_pos is not None:
-                # ✅ SAFER Negative: Time-shifted latent (better than permutation)
-                with torch.no_grad():
-                    # Random shift between 1 and T//4
-                    max_shift = max(1, T // 4)
-                    shifts = torch.randint(1, max_shift + 1, (B,), device=device)
-                    
-                    # Apply time-shift to each sample
-                    latent_neg = torch.stack([
-                        torch.roll(latent_t[i], shifts=shifts[i].item(), dims=0)
-                        for i in range(B)
-                    ])
-                    
-                    # Mask stays the same (temporal structure matters)
-                    mask_neg = seq_valid_mask
-                
-                sync_neg = self.sync_head(latent_neg, mask_neg)
-                
-                if sync_neg is not None:
-                    # Contrastive loss: encourage positive > negative + margin
-                    def masked_mean(val, m):
-                        return (val * m.float()).sum() / m.sum().clamp(min=1)
-                    
-                    pos_score = masked_mean(sync_pos.sum(dim=-1), seq_valid_mask)
-                    neg_score = masked_mean(sync_neg.sum(dim=-1), mask_neg)
-                    
-                    # Hinge loss with configurable margin
-                    sync_loss = F.relu(self.sync_margin - pos_score + neg_score)
-        
-        # 8. Total loss
-        total_loss = (
-            flow_loss +
-            self.W_PRIOR * prior_loss +
-            self.W_SYNC * sync_loss +
-            self.W_LENGTH * length_loss
-        )
+            # === FIX: Negative Sampling bằng cách tráo Text ===
+            with torch.no_grad():
+                shuffled_idx = torch.randperm(B)
+                shuffled_text = text_pooled[shuffled_idx] # Tráo text
+            
+            # Negative Score: (Latent Đúng, Text Sai)
+            # Giữ nguyên valid_mask của latent -> Không bị lệch mask
+            sync_score_neg = self.sync_head(latent_t, shuffled_text, valid_mask)
+            
+            # Tính Mean per sample
+            score_pos = (sync_score_pos * valid_mask.float()).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)
+            score_neg = (sync_score_neg * valid_mask.float()).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1)
+            
+            # Contrastive Margin Loss
+            margin = 0.5
+            loss_per_sample = F.relu(margin + score_neg - score_pos)
+            sync_loss_train = loss_per_sample.mean()
+            
+        # 6. TOTAL LOSS
+        flow_loss = self.flow_loss_fn(v_pred_train, v_gt, mask=valid_mask)        
+        total_loss = flow_loss + self.W_PRIOR * prior_loss + self.W_SYNC * sync_loss_train + self.W_LENGTH * length_loss
         
         result = {
-            'total': total_loss,
-            'flow': flow_loss,
-            'prior': prior_loss,
-            'sync': sync_loss,
-            'length': length_loss
+            'total': total_loss, 'flow': flow_loss, 
+            'prior': prior_loss, 'sync': sync_loss_train, 
+            'length': length_loss 
         }
-        
-        if return_attn_weights:
-            result['attn_weights'] = attn_weights
-        
+        if return_attn_weights: result['attn_weights'] = attn_weights
         return result
     
-    def _inference_forward(self, batch, text_features, text_padding_mask, num_steps, latent_scale):
+    def _inference_forward(self, batch, text_features, text_mask, num_steps=50):
         device = text_features.device
         B = text_features.shape[0]
         
-        # Predict sequence length
-        if batch is not None and 'seq_lengths' in batch:
-            target_lengths = batch['seq_lengths'].long()
-        else:
-            with torch.no_grad():
-                pred_len = self.length_predictor(text_features, text_padding_mask)
-                target_lengths = pred_len.round().long().clamp(min=20, max=400)
-        
+        with torch.no_grad():
+            pred_len_norm = self.length_predictor(text_features, text_mask)
+            pred_len = pred_len_norm * self.LENGTH_SCALE 
+            target_lengths = pred_len.round().long().clamp(min=10, max=400)
+            
         T = target_lengths.max().item()
+        valid_mask = torch.arange(T, device=device)[None, :] < target_lengths[:, None]
+        pose_padding_mask = ~valid_mask
         
-        # Create masks
-        seq_valid_mask = torch.arange(T, device=device)[None, :] < target_lengths[:, None]
-        pose_padding_mask = ~seq_valid_mask
-        
-        # Initialize latent
         latent = torch.randn(B, T, self.latent_dim, device=device)
         dt = 1.0 / num_steps
         
-        # ✅ FIX 4: Dynamic clamping based on latent_scale
-        clamp_min = -self.clamp_scale * latent_scale
-        clamp_max = self.clamp_scale * latent_scale
+        # Prepare Text cho Sync
+        text_valid_mask = (~text_mask).unsqueeze(-1).float()
+        text_pooled = (text_features * text_valid_mask).sum(1) / text_valid_mask.sum(1).clamp(min=1)
         
-        # ODE solve
         for step in range(num_steps):
             t_val = step / num_steps
             t = torch.full((B,), t_val, device=device)
             
-            latent_in = latent.detach()
+            # Enable Gradient for Guidance
+            latent_grad = latent.detach().requires_grad_(True)
             
-            # Enable gradient only when needed for guidance
-            use_guidance = (
-                self.use_sync_guidance and 
-                self.sync_head is not None and 
-                0.1 < t_val < 0.9
-            )
+            v_flow = self.flow_block(latent_grad, t, text_features, 
+                                   text_attn_mask=text_mask, 
+                                   pose_attn_mask=pose_padding_mask)
             
-            if use_guidance:
-                latent_in.requires_grad_(True)
-            
-            # Flow prediction
-            v_flow = self.flow_block(
-                latent_in, t, text_features,
-                text_attn_mask=text_padding_mask,
-                pose_attn_mask=pose_padding_mask
-            )
-            
-            # Prior prediction
             v_prior = None
             if self.use_ssm_prior and self.ssm_prior is not None:
                 with torch.no_grad():
-                    prior_out = self.ssm_prior(latent_in, t, text_features, mask=seq_valid_mask)
-                    if prior_out is not None:
-                        v_prior = prior_out
+                    v_prior = self.ssm_prior(latent_grad.detach(), t, text_features, mask=valid_mask)
             
-            # Combine flow and prior
             lambda_t = self.get_lambda_t(t)
-            v_final = v_flow + lambda_t * v_prior if v_prior is not None else v_flow
+            v_pred = v_flow + lambda_t * v_prior if v_prior is not None else v_flow
             
-            # Sync guidance with gradient
-            if use_guidance:
-                sync_out = self.sync_head(latent_in, seq_valid_mask)
-                if sync_out is not None:
-                    with torch.enable_grad():
-                        guidance_score = sync_out.mean()
-                        sync_grad = torch.autograd.grad(guidance_score, latent_in)[0]
-                    v_final = v_final + self.gamma_guidance * sync_grad.detach()
-            
-            # Update latent
+            # === SYNC GUIDANCE ===
+            # Chỉ guide ở đoạn giữa (0.2 -> 0.8) khi pose đã hình thành nhưng chưa hoàn thiện
+            if self.use_sync_guidance and self.sync_head is not None and 0.2 < t_val < 0.8:
+                # Tính score (truyền cả Latent + Text)
+                sync_score_pred = self.sync_head(latent_grad, text_pooled, valid_mask)
+                total_score = (sync_score_pred * valid_mask.float()).sum() / valid_mask.sum().clamp(min=1)
+                
+                # Gradient Ascent
+                sync_grad = torch.autograd.grad(total_score, latent_grad)[0]
+                
+                # === FIX: CLAMP GRADIENT ===
+                # Chặn gradient quá lớn gây vỡ hình (artifacts)
+                sync_grad = torch.clamp(sync_grad, -0.1, 0.1)
+                
+                guidance_force = self.gamma_guidance * sync_grad.detach()
+                v_pred = v_pred + guidance_force * valid_mask.unsqueeze(-1).float()
+
             with torch.no_grad():
-                latent = latent + v_final.detach() * dt
-                # Mask padding positions
-                latent = latent * seq_valid_mask.unsqueeze(-1).float()
-                # ✅ FIX 4: Dynamic clamping
-                latent = torch.clamp(latent, clamp_min, clamp_max)
+                latent = latent + dt * v_pred
+                latent = latent * valid_mask.unsqueeze(-1).float()
+                latent = latent.clamp(-10.0, 10.0)
         
-        return latent * latent_scale
+        return latent
