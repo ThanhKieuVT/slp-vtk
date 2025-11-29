@@ -5,7 +5,7 @@ import torch
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
-from matplotlib.collections import LineCollection
+from matplotlib.lines import Line2D
 from torch.utils.data import DataLoader
 
 # Thêm đường dẫn project
@@ -25,143 +25,152 @@ def denormalize(pose, mean, std):
     """Đưa pose về giá trị gốc"""
     return pose * std + mean
 
-class SkeletonVisualizer:
-    def __init__(self, keypoint_dim=214):
-        # Định nghĩa các kết nối (Indices nối với nhau). 
-        # LƯU Ý: Đây là giả định cấu trúc 214 điểm thường gặp (Body + Face + Hands).
-        # Nếu bộ dữ liệu của bạn khác, bạn có thể cần điều chỉnh các số này.
-        
-        # Giả định: Body (0-50?), Hand L, Hand R...
-        # Để an toàn và đẹp, ta sẽ vẽ các đường nối cho Bàn Tay (thường chuẩn giống nhau)
-        # và Thân mình cơ bản.
-        
-        # Cấu trúc bàn tay chuẩn (21 điểm mỗi tay):
-        # Wrist -> Thumb(1-4), Index(5-8), Middle(9-12), Ring(13-16), Pinky(17-20)
-        self.hand_connections = [
-            (0, 1), (1, 2), (2, 3), (3, 4),         # Thumb
-            (0, 5), (5, 6), (6, 7), (7, 8),         # Index
-            (0, 9), (9, 10), (10, 11), (11, 12),    # Middle
-            (0, 13), (13, 14), (14, 15), (15, 16),  # Ring
-            (0, 17), (17, 18), (18, 19), (19, 20)   # Pinky
-        ]
-        
-        # Cấu trúc thân mình cơ bản (Body) - Giả định OpenPose/SMPL
-        # Đây là ví dụ, có thể cần sửa tùy dataset
-        self.body_connections = [
-            (0, 1), (1, 2), (2, 3), (3, 4), # Spine/Neck?
-            (2, 5), (5, 6), (6, 7),         # R Arm
-            (2, 8), (8, 9), (9, 10)         # L Arm
-        ]
+# --- DEFINITIONS TỪ visualize_single_pose.py ---
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
+    (0, 9), (9, 10), (10, 11), (11, 12), (0, 13), (13, 14), (14, 15), (15, 16),
+    (0, 17), (17, 18), (18, 19), (19, 20)
+]
+POSE_CONNECTIONS_UPPER_BODY = [
+    (0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8),
+    (9, 10), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
+    (11, 23), (12, 24), (23, 24)
+]
+MOUTH_OUTER_LIP = list(zip(range(0, 11), range(1, 12))) + [(11, 0)]
+MOUTH_INNER_LIP = list(zip(range(12, 19), range(13, 20))) + [(19, 12)]
+MOUTH_CONNECTIONS_20 = MOUTH_OUTER_LIP + MOUTH_INNER_LIP
 
-    def create_animation(self, real_pose, gen_pose, text, save_path):
-        """
-        real_pose, gen_pose: [T, N_points, 2] (Dữ liệu đã reshape về 2D)
-        """
-        frames = len(real_pose)
+ALL_CONNECTIONS = []
+ALL_CONNECTIONS.extend([
+    {'indices': (s, e), 'offset': 0, 'color': 'gray', 'lw': 2}
+    for (s, e) in POSE_CONNECTIONS_UPPER_BODY
+])
+ALL_CONNECTIONS.extend([
+    {'indices': (s, e), 'offset': 33, 'color': 'blue', 'lw': 1.5}
+    for (s, e) in HAND_CONNECTIONS
+])
+# Nối cổ tay vào body (dự đoán index 15/16 của body nối với gốc hand 0)
+ALL_CONNECTIONS.append({'indices': (15, 0), 'offset': (0, 33), 'color': 'blue', 'lw': 2}) 
+ALL_CONNECTIONS.extend([
+    {'indices': (s, e), 'offset': 54, 'color': 'green', 'lw': 1.5}
+    for (s, e) in HAND_CONNECTIONS
+])
+ALL_CONNECTIONS.append({'indices': (16, 0), 'offset': (0, 54), 'color': 'green', 'lw': 2})
+ALL_CONNECTIONS.extend([
+    {'indices': (s, e), 'offset': 75, 'color': 'red', 'lw': 1}
+    for (s, e) in MOUTH_CONNECTIONS_20
+])
+
+# Indices để plot scatter
+MANUAL_UPPER_BODY_IDXS = list(range(23))
+LEFT_HAND_IDXS = list(range(33, 54))
+RIGHT_HAND_IDXS = list(range(54, 75))
+MOUTH_IDXS = list(range(75, 95))
+PLOT_IDXS = MANUAL_UPPER_BODY_IDXS + LEFT_HAND_IDXS + RIGHT_HAND_IDXS + MOUTH_IDXS
+VALID_POINT_THRESHOLD = 0.1
+
+class SpecificSkeletonVisualizer:
+    def prepare_data(self, pose_214):
+        """Chuyển đổi từ [T, 214] sang format [T, 95, 2] dùng cho vẽ"""
+        # Logic lấy từ load_and_prepare_pose của bạn
+        manual_150 = pose_214[:, :150]
+        manual_kps = manual_150.reshape(-1, 75, 2)
         
-        # Setup Figure
+        # Bỏ qua đoạn giữa, lấy mouth
+        mouth_40 = pose_214[:, 174:] 
+        mouth_kps = mouth_40.reshape(-1, 20, 2)
+        
+        all_kps = np.concatenate([manual_kps, mouth_kps], axis=1) # [T, 95, 2]
+        return all_kps
+
+    def create_animation(self, real_pose_raw, gen_pose_raw, text, save_path):
+        # 1. Prepare Data
+        real_kps = self.prepare_data(real_pose_raw)
+        gen_kps = self.prepare_data(gen_pose_raw)
+        
+        T = len(real_kps)
+        
+        # 2. Setup Figure
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-        fig.suptitle(f"Prompt: {text[:60]}...", fontsize=12)
-        
+        fig.suptitle(f"Text: {text[:60]}...", fontsize=12)
         ax1.set_title("Ground Truth")
         ax2.set_title("Generated (Flow)")
-        
-        # Tự động tính giới hạn khung hình để zoom vào người
-        all_data = np.concatenate([real_pose, gen_pose], axis=0) # [2T, N, 2]
-        # Loại bỏ điểm 0 (padding)
-        valid_mask = (all_data.sum(axis=-1) != 0)
-        if valid_mask.sum() > 0:
-            valid_data = all_data[valid_mask]
-            min_x, max_x = valid_data[:, 0].min(), valid_data[:, 0].max()
-            min_y, max_y = valid_data[:, 1].min(), valid_data[:, 1].max()
+
+        # Tính giới hạn khung hình dựa trên dữ liệu thật
+        all_valid_points = real_kps[:, PLOT_IDXS]
+        # Lọc điểm 0
+        valid_mask = np.sum(np.abs(all_valid_points), axis=2) > VALID_POINT_THRESHOLD
+        if valid_mask.any():
+            valid_vals = all_valid_points[valid_mask]
+            min_vals = np.min(valid_vals, axis=0)
+            max_vals = np.max(valid_vals, axis=0)
+            pad = 0.2
             
-            # Thêm padding
-            pad = 0.1
-            ax1.set_xlim(min_x - pad, max_x + pad)
-            ax1.set_ylim(max_y + pad, min_y - pad) # Đảo ngược trục Y cho ảnh pose
-            ax2.set_xlim(min_x - pad, max_x + pad)
-            ax2.set_ylim(max_y + pad, min_y - pad)
+            # Set limit chung cho cả 2 hình
+            for ax in [ax1, ax2]:
+                ax.set_xlim(min_vals[0] - pad, max_vals[0] + pad)
+                ax.set_ylim(max_vals[1] + pad, min_vals[1] - pad) # Invert Y axis
+                ax.set_aspect('equal')
+                ax.axis('off')
         else:
-            ax1.set_xlim(-1, 1); ax1.set_ylim(1, -1)
-            ax2.set_xlim(-1, 1); ax2.set_ylim(1, -1)
+            for ax in [ax1, ax2]:
+                ax.set_xlim(-1, 1); ax.set_ylim(1, -1); ax.axis('off')
 
-        # Plot elements
-        # Scatter cho các khớp
-        scat1 = ax1.scatter([], [], s=10, c='black', zorder=2)
-        scat2 = ax2.scatter([], [], s=10, c='black', zorder=2)
-        
-        # Lines cho xương (dùng LineCollection cho nhanh)
-        lines1_body = LineCollection([], colors='gray', linewidths=2)
-        lines1_lhand = LineCollection([], colors='green', linewidths=1.5) # Left Hand Green (giống ảnh mẫu)
-        lines1_rhand = LineCollection([], colors='blue', linewidths=1.5)  # Right Hand Blue
-        
-        lines2_body = LineCollection([], colors='gray', linewidths=2)
-        lines2_lhand = LineCollection([], colors='green', linewidths=1.5)
-        lines2_rhand = LineCollection([], colors='blue', linewidths=1.5)
-        
-        # Add collections
-        for ax, lines in zip([ax1, ax2], 
-                             [[lines1_body, lines1_lhand, lines1_rhand], 
-                              [lines2_body, lines2_lhand, lines2_rhand]]):
-            for l in lines: ax.add_collection(l)
+        # 3. Setup Artists (Lines & Scatters) cho cả 2 axes
+        def init_artists(ax):
+            lines = []
+            for item in ALL_CONNECTIONS:
+                line = Line2D([], [], color=item['color'], lw=item['lw'], alpha=0.8)
+                ax.add_line(line)
+                lines.append({'line': line, 'item': item})
+            
+            scatter = ax.scatter([], [], s=2, c='black', alpha=0.4)
+            return lines, scatter
 
-        def get_lines(pose_frame):
-            # Hàm này cần logic cắt index cụ thể của dataset bạn
-            # Giả định format phổ biến: 
-            # Body (0-50?), Hand_L (range A), Hand_R (range B)
-            # Vì mình không biết index chính xác, mình sẽ thử đoán dựa trên 214 điểm
-            # Nếu 214 = 70 (body+face) + 21 (L) + 21 (R) + ...?
-            
-            # TẠM THỜI: Vẽ scatter màu mè phân biệt tay/người trước nếu chưa biết nối
-            # Nhưng để thử nối tay (thường nằm ở cuối hoặc cụm 21 điểm)
-            
-            # Giả sử 21 điểm cuối là Tay Phải, 21 điểm sát cuối là Tay Trái
-            # Cần chỉnh lại offset này nếu dataset khác
-            n_points = pose_frame.shape[0]
-            
-            # Hand Indices Assumption (Thay đổi số này nếu cần)
-            idx_r_hand_start = n_points - 21
-            idx_l_hand_start = n_points - 42 
-            
-            segments_l = []
-            segments_r = []
-            
-            # Create Hand Segments
-            for (start, end) in self.hand_connections:
-                # Left Hand
-                p1_l = pose_frame[idx_l_hand_start + start]
-                p2_l = pose_frame[idx_l_hand_start + end]
-                if np.sum(p1_l) != 0 and np.sum(p2_l) != 0: # Bỏ qua điểm 0
-                    segments_l.append([p1_l, p2_l])
+        lines1, scat1 = init_artists(ax1)
+        lines2, scat2 = init_artists(ax2)
+
+        def update_frame(kps_frame, lines_dict, scat_obj):
+            # Update Lines
+            for obj in lines_dict:
+                item = obj['item']
+                line = obj['line']
+                (s, e) = item['indices']
+                offset = item['offset']
                 
-                # Right Hand
-                p1_r = pose_frame[idx_r_hand_start + start]
-                p2_r = pose_frame[idx_r_hand_start + end]
-                if np.sum(p1_r) != 0 and np.sum(p2_r) != 0:
-                    segments_r.append([p1_r, p2_r])
-
-            return [], segments_l, segments_r # Body để trống nếu chưa biết index
+                if isinstance(offset, (tuple, list)):
+                    idx_start, idx_end = s + offset[0], e + offset[1]
+                else:
+                    idx_start, idx_end = s + offset, e + offset
+                
+                p1 = kps_frame[idx_start]
+                p2 = kps_frame[idx_end]
+                
+                # Check threshold để không vẽ đường về gốc 0,0
+                if np.sum(np.abs(p1)) > VALID_POINT_THRESHOLD and np.sum(np.abs(p2)) > VALID_POINT_THRESHOLD:
+                    line.set_data([p1[0], p2[0]], [p1[1], p2[1]])
+                else:
+                    line.set_data([], [])
+            
+            # Update Scatter
+            points_to_plot = kps_frame[PLOT_IDXS]
+            # Chỉ vẽ điểm valid
+            valid_pts = points_to_plot[np.sum(np.abs(points_to_plot), axis=1) > VALID_POINT_THRESHOLD]
+            scat_obj.set_offsets(valid_pts)
+            
+            return [obj['line'] for obj in lines_dict] + [scat_obj]
 
         def update(frame):
-            # REAL
-            p1 = real_pose[frame]
-            scat1.set_offsets(p1)
-            _, l_segs1, r_segs1 = get_lines(p1)
-            lines1_lhand.set_segments(l_segs1)
-            lines1_rhand.set_segments(r_segs1)
+            artists1 = update_frame(real_kps[frame], lines1, scat1)
             
-            # GEN
-            if frame < len(gen_pose):
-                p2 = gen_pose[frame]
-                scat2.set_offsets(p2)
-                _, l_segs2, r_segs2 = get_lines(p2)
-                lines2_lhand.set_segments(l_segs2)
-                lines2_rhand.set_segments(r_segs2)
+            # Xử lý độ dài lệch nhau (nếu Gen ngắn hơn Real)
+            idx_gen = min(frame, len(gen_kps) - 1)
+            artists2 = update_frame(gen_kps[idx_gen], lines2, scat2)
             
-            return scat1, scat2, lines1_lhand, lines1_rhand, lines2_lhand, lines2_rhand
+            return artists1 + artists2
 
-        ani = animation.FuncAnimation(fig, update, frames=frames, interval=40, blit=True)
-        ani.save(save_path, fps=25, extra_args=['-vcodec', 'libx264'])
+        ani = animation.FuncAnimation(fig, update, frames=T, blit=True, interval=40)
+        ani.save(save_path, writer='ffmpeg', fps=25)
         plt.close()
 
 
@@ -188,6 +197,7 @@ def main():
     # Load Stats
     stats_path = os.path.join(args.data_dir, "normalization_stats.npz")
     if not os.path.exists(stats_path):
+        print("⚠️ No stats found, visual might be wrong scale.")
         mean, std = 0, 1
     else:
         stats = np.load(stats_path)
@@ -214,8 +224,8 @@ def main():
     latent_scale = float(flow_ckpt.get("latent_scale_factor", 1.0))
     print(f"📏 Scale: {latent_scale:.4f}")
 
-    # Visualizer
-    visualizer = SkeletonVisualizer()
+    # Visualizer MỚI
+    visualizer = SpecificSkeletonVisualizer()
 
     # Get random indices
     indices = np.random.choice(len(dataset), size=min(len(dataset), args.num_samples), replace=False)
@@ -235,8 +245,8 @@ def main():
         # Encode Text
         text_features, text_mask = flow_matcher.encode_text(text_tokens, attention_mask)
         
-        # Inference (Fix lỗi batch=None trước đó)
-        # Sử dụng hàm _inference_forward đã sửa có enable_grad
+        # Inference
+        # FIX: Gọi hàm _inference_forward với enable_grad để Sync Guidance hoạt động
         gen_latent = flow_matcher._inference_forward(
             batch=None, 
             text_features=text_features, 
@@ -252,23 +262,20 @@ def main():
         real_pose_denorm = denormalize(pose_gt, mean, std)
         gen_pose_denorm = denormalize(gen_pose, mean, std)
         
-        # RESHAPE TỪ [T, 214] -> [T, 107, 2] (Giả định 2D)
-        # Nếu data 214 điểm là (X,Y) phẳng
-        try:
-            real_pose_reshaped = real_pose_denorm.reshape(real_pose_denorm.shape[0], -1, 2)
-            gen_pose_reshaped = gen_pose_denorm.reshape(gen_pose_denorm.shape[0], -1, 2)
-        except:
-            print(f"⚠️ Cannot reshape pose {real_pose_denorm.shape}. Skipping visualization.")
-            continue
-
         # Save
         save_path_base = os.path.join(args.output_dir, f"sample_{i}_{video_id}")
         
+        # Save raw npz để debug thêm nếu cần
+        np.savez(f"{save_path_base}.npz", real=real_pose_denorm, gen=gen_pose_denorm, text=text)
+
         try:
-            visualizer.create_animation(real_pose_reshaped, gen_pose_reshaped, text, f"{save_path_base}.mp4")
+            # Truyền thẳng pose [T, 214] vào visualizer
+            visualizer.create_animation(real_pose_denorm, gen_pose_denorm, text, f"{save_path_base}.mp4")
             print(f"   [{i+1}] 🎥 Video: {save_path_base}.mp4")
         except Exception as e:
             print(f"   ⚠️ Render error: {e}")
+            import traceback
+            traceback.print_exc()
 
     print("✅ Done!")
 
