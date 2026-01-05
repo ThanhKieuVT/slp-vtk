@@ -16,7 +16,7 @@ class FlowMatchingScheduler:
         return (1 - t) * x0 + t * x1
     
     def get_velocity(self, x0, x1):
-        # OT-Flow: velocity is constant, independent of t
+        # OT-Flow: velocity is constant
         return x1 - x0
     
     def add_noise(self, x1, t):
@@ -34,98 +34,68 @@ class FlowMatchingLoss(nn.Module):
         loss = (v_pred - v_gt) ** 2
         
         if mask is not None:
+            # Mask: True=Valid, False=Padding
             loss = loss * mask.unsqueeze(-1).float()
             num_elements = mask.sum() * v_pred.shape[-1]
             return loss.sum() / num_elements.clamp(min=1)
-        
-        return loss.mean()
+        else:
+            return loss.mean()
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.dim = dim
-    
+
     def forward(self, x):
         device = x.device
-        T = x.shape[1]
         half_dim = self.dim // 2
         emb = math.log(10000) / (half_dim - 1)
         emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        pos = torch.arange(T, device=device).float()
-        emb = pos[:, None] * emb[None, :]
-        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
-        return emb[None, :, :]
-
-class TimestepEmbedding(nn.Module):
-    """Sinusoidal Timestep Embedding (DDPM-style)"""
-    def __init__(self, dim):
-        super().__init__()
-        self.dim = dim
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.SiLU(),
-            nn.Linear(dim * 4, dim)
-        )
-    
-    def forward(self, t):
-        # Sinusoidal encoding
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=t.device) * -emb)
-        emb = t[:, None] * emb[None, :]
-        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
-        return self.mlp(emb)
+        emb = x[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
 
 class CrossAttentionLayer(nn.Module):
-    """Pre-LN Cross-Attention with FFN"""
-    def __init__(self, d_model, nhead, dim_feedforward=None, dropout=0.1):
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1):
         super().__init__()
-        if dim_feedforward is None:
-            dim_feedforward = d_model * 4
-            
-        # Cross-Attention
-        self.multihead_attn = nn.MultiheadAttention(
-            d_model, nhead, dropout=dropout, batch_first=True
-        )
-        self.norm1 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        
-        # Feed-Forward Network
+        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(dim_feedforward, d_model),
-            nn.Dropout(dropout)
+            nn.Linear(dim_feedforward, d_model)
         )
-        self.norm2 = nn.LayerNorm(d_model)
-    
-    def forward(self, query, key, value, key_padding_mask=None):
-        # Pre-LN Cross-Attention
-        q_norm = self.norm1(query)
-        attn_output, attn_weights = self.multihead_attn(
-            q_norm, key, value, key_padding_mask=key_padding_mask
+        self.norm_ffn = nn.LayerNorm(d_model)
+
+    def forward(self, tgt, memory, memory_key_padding_mask=None, key_padding_mask=None):
+        # Cross Attention
+        attn_out, attn_weights = self.multihead_attn(
+            tgt, memory, memory, 
+            key_padding_mask=key_padding_mask 
         )
-        query = query + self.dropout1(attn_output)
+        tgt = self.norm(tgt + self.dropout(attn_out))
         
-        # Pre-LN FFN
-        query = query + self.ffn(self.norm2(query))
-        
-        return query, attn_weights
+        # FFN
+        ffn_out = self.ffn(tgt)
+        tgt = self.norm_ffn(tgt + self.dropout(ffn_out))
+        return tgt, attn_weights
 
 class FlowMatchingBlock(nn.Module):
-    def __init__(self, data_dim=256, condition_dim=512, hidden_dim=512, 
-                 num_layers=6, num_heads=8, dropout=0.1):
+    def __init__(self, data_dim, hidden_dim, condition_dim, num_layers=4, num_heads=4, dropout=0.1):
         super().__init__()
         
-        # Input Projections
+        # Embeddings
+        self.time_embed = nn.Sequential(
+            SinusoidalPosEmb(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        
         self.input_proj = nn.Linear(data_dim, hidden_dim)
-        
-        # Improved Time Embedding
-        self.time_embed = TimestepEmbedding(hidden_dim)
-        
-        # Positional Embedding
-        self.pos_emb = SinusoidalPosEmb(hidden_dim)
+        self.pos_emb = SinusoidalPosEmb(hidden_dim) # Simple fixed pos emb
         
         # Transformer Layers
         self.layers = nn.ModuleList()
@@ -147,25 +117,35 @@ class FlowMatchingBlock(nn.Module):
                 pose_attn_mask=None, return_attn=False):
         B, T, _ = z_t.shape
         
-        # Time embedding (improved with sinusoidal encoding)
+        # Time embedding
         t_emb = self.time_embed(t).unsqueeze(1)  # [B, 1, H]
         
         # Initial embeddings
-        x = self.input_proj(z_t) + t_emb + self.pos_emb(z_t)[:, :T, :]
+        pos_emb = self.pos_emb(torch.arange(T, device=z_t.device).float()) # [T, H]
+        x = self.input_proj(z_t) + t_emb + pos_emb.unsqueeze(0)
         
-        # Transformer blocks
-        all_attn = []
-        for layer in self.layers:
-            # Self-Attention (pose sequence)
-            x = layer['self_attn_block'](x, src_key_padding_mask=pose_attn_mask)
+        # ✅ FIX QUAN TRỌNG: Đảo Mask cho PyTorch Transformer
+        # PyTorch quy ước: True = Padding (Ignore), False = Keep
+        # Dataset quy ước: True = Valid, False = Padding
+        # => Cần lấy phủ định (~) của mask
+        
+        torch_pose_mask = None
+        if pose_attn_mask is not None:
+            torch_pose_mask = ~pose_attn_mask.bool() # True ở vị trí Padding
             
-            # Cross-Attention (pose ← text)
+        torch_text_mask = None
+        if text_attn_mask is not None:
+            torch_text_mask = ~text_attn_mask.bool() # True ở vị trí Padding
+
+        # Transformer blocks
+        for layer in self.layers:
+            # Self-Attention
+            x = layer['self_attn_block'](x, src_key_padding_mask=torch_pose_mask)
+            
+            # Cross-Attention
             x, attn = layer['cross_attn'](
-                x, condition, condition, key_padding_mask=text_attn_mask
+                x, condition, 
+                key_padding_mask=torch_text_mask 
             )
-            if return_attn:
-                all_attn.append(attn.cpu())
-        
-        # Output
-        out = self.output_proj(x)
-        return (out, all_attn) if return_attn else out
+            
+        return self.output_proj(x)

@@ -1,5 +1,6 @@
 """
 Training Script cho Stage 1: Autoencoder
+✅ FIXED: max_seq_len = 400, grouped normalization support
 """
 import os
 import argparse
@@ -36,11 +37,18 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
         
         # Mask out padding
         loss = loss * pose_mask.unsqueeze(-1).float()
-        loss = loss.sum() / pose_mask.sum().clamp(min=1)
+        
+        # ✅ Scale Loss đúng chuẩn MSE
+        num_features = poses.shape[-1]  # 214
+        total_valid_elements = pose_mask.sum().clamp(min=1) * num_features
+        
+        loss = loss.sum() / total_valid_elements
         
         # Backward
         optimizer.zero_grad()
         loss.backward()
+        
+        # Gradient Clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         
@@ -71,8 +79,15 @@ def validate(model, dataloader, device):
                 poses,
                 reduction='none'
             )
+            
+            # Mask out padding
             loss = loss * pose_mask.unsqueeze(-1).float()
-            loss = loss.sum() / pose_mask.sum().clamp(min=1)
+            
+            # Scale Loss
+            num_features = poses.shape[-1]
+            total_valid_elements = pose_mask.sum().clamp(min=1) * num_features
+            
+            loss = loss.sum() / total_valid_elements
             
             total_loss += loss.item()
             num_batches += 1
@@ -99,7 +114,7 @@ def main():
                         help='Latent dimension')
     parser.add_argument('--hidden_dim', type=int, default=512,
                         help='Hidden dimension')
-    parser.add_argument('--max_seq_len', type=int, default=120,
+    parser.add_argument('--max_seq_len', type=int, default=400,  # ✅ FIXED: 120 → 400
                         help='Max sequence length')
     parser.add_argument('--resume_from', type=str, default=None,
                         help='Resume từ checkpoint')
@@ -113,23 +128,30 @@ def main():
     # Create output dir
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Datasets
+    # ✅ Datasets với max_seq_len = 400
+    stats_file = os.path.join(args.data_dir, "normalization_stats.npz")
+    
     train_dataset = SignLanguageDataset(
         data_dir=args.data_dir,
         split='train',
-        max_seq_len=args.max_seq_len
+        max_seq_len=args.max_seq_len  # ✅ Use argument
     )
+    
+    val_stats = stats_file if os.path.exists(stats_file) else None
+    if val_stats is None:
+        print("⚠️ Warning: normalization_stats.npz not found for validation/test.")
+    
     val_dataset = SignLanguageDataset(
         data_dir=args.data_dir,
         split='dev',
-        max_seq_len=args.max_seq_len,
-        stats_path=os.path.join(args.data_dir, "normalization_stats.npz")
+        max_seq_len=args.max_seq_len,  # ✅ Use argument
+        stats_path=val_stats
     )
     test_dataset = SignLanguageDataset(
         data_dir=args.data_dir,
         split='test',
-        max_seq_len=args.max_seq_len,
-        stats_path=os.path.join(args.data_dir, "normalization_stats.npz")
+        max_seq_len=args.max_seq_len,  # ✅ Use argument
+        stats_path=val_stats
     )
     
     train_loader = DataLoader(
@@ -204,6 +226,7 @@ def main():
     print(f"Train samples: {len(train_dataset)}")
     print(f"Val samples: {len(val_dataset)}")
     print(f"Test samples: {len(test_dataset)}")
+    print(f"Max seq len: {args.max_seq_len}")  # ✅ Log max_seq_len
     print(f"{'='*50}\n")
     
     for epoch in range(start_epoch, args.num_epochs):
@@ -231,6 +254,7 @@ def main():
             'train_loss': train_loss,
             'val_loss': val_loss,
             'best_val_loss': best_val_loss,
+            'max_seq_len': args.max_seq_len,  # ✅ Save max_seq_len
         }
         
         # Save latest
@@ -260,4 +284,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
