@@ -9,7 +9,8 @@ import glob
 try:
     sys.path.append(os.getcwd()) 
     from models.fml.autoencoder import UnifiedPoseAutoencoder
-    from data_preparation import denormalize_pose 
+    # Import hàm chuẩn từ data_preparation của chị
+    from data_preparation import denormalize_pose, load_sample 
 except ImportError as e:
     print(f"❌ Lỗi Import: {e}")
     print("💡 Gợi ý: Chị nhớ đặt file này ở thư mục gốc (cùng cấp với folder 'models' và file 'data_preparation.py')")
@@ -17,10 +18,10 @@ except ImportError as e:
 
 def main():
     # --- 1. CẤU HÌNH THAM SỐ ---
-    parser = argparse.ArgumentParser(description='Kiểm tra chất lượng Autoencoder (Stage 1)')
+    parser = argparse.ArgumentParser(description='Kiểm tra chất lượng Autoencoder (Stage 1) - Grouped Version')
     
     parser.add_argument('--data_dir', type=str, required=True,
-                        help='Folder chứa file normalization_stats.npz')
+                        help='Folder chứa file normalization_stats.npz và các folder poses/nmms')
     parser.add_argument('--autoencoder_checkpoint', type=str, required=True,
                         help='Đường dẫn file .pt của Autoencoder')
     parser.add_argument('--output_dir', type=str, default='check_stage1_output',
@@ -28,7 +29,7 @@ def main():
     
     parser.add_argument('--latent_dim', type=int, default=256)
     parser.add_argument('--hidden_dim', type=int, default=512)
-    parser.add_argument('--pose_dim', type=int, default=214, help='Số lượng feature của Pose')
+    parser.add_argument('--pose_dim', type=int, default=214)
 
     args = parser.parse_args()
     
@@ -54,41 +55,60 @@ def main():
         print(f"❌ Lỗi load checkpoint: {e}")
         return
 
-    # --- 3. LOAD STATS ---
+    # --- 3. LOAD & PREPARE GROUPED STATS ---
     stats_path = os.path.join(args.data_dir, "normalization_stats.npz")
     if not os.path.exists(stats_path):
-        stats_path = os.path.join(args.data_dir, "../normalization_stats.npz")
+        # Thử tìm ở thư mục cha nếu data_dir trỏ vào subfolder train/test
+        stats_path = os.path.join(os.path.dirname(args.data_dir), "normalization_stats.npz")
     
     if not os.path.exists(stats_path):
-        print(f"❌ Không tìm thấy normalization_stats.npz")
+        print(f"❌ Không tìm thấy normalization_stats.npz tại {stats_path}")
         return
         
-    stats = np.load(stats_path)
-    mean = torch.tensor(stats['mean']).float().to(device)
-    std = torch.tensor(stats['std']).float().to(device)
+    print(f"📊 Loading Grouped Stats từ: {stats_path}")
+    stats_raw = np.load(stats_path)
+    
+    # Chuyển đổi format sang dict để dùng cho hàm denormalize_pose của chị
+    stats_dict = {
+        'manual_mean': float(stats_raw['manual_mean']),
+        'manual_std': float(stats_raw['manual_std']),
+        'nmm_mean': stats_raw['nmm_mean'],
+        'nmm_std': stats_raw['nmm_std']
+    }
+
+    # Tạo tensor Full 214D để Normalize đầu vào
+    m_mean = np.full(150, stats_dict['manual_mean'])
+    m_std = np.full(150, stats_dict['manual_std'])
+    full_mean = torch.tensor(np.concatenate([m_mean, stats_dict['nmm_mean']])).float().to(device)
+    full_std = torch.tensor(np.concatenate([m_std, stats_dict['nmm_std']])).float().to(device)
 
     # --- 4. TÌM & LOAD FILE DATA MẪU ---
-    npy_files = glob.glob(os.path.join(args.data_dir, "**/*.npy"), recursive=True)
-    valid_files = [f for f in npy_files if all(k not in f for k in ["stats", "output", "check"])]
-    
-    if not valid_files:
-        print("❌ Không tìm thấy file dữ liệu nào!")
+    # Quét trong folder poses để lấy video_id
+    poses_dir = os.path.join(args.data_dir, "poses")
+    if not os.path.exists(poses_dir):
+        poses_dir = args.data_dir # Fallback
+        
+    npy_files = glob.glob(os.path.join(poses_dir, "*.npz"))
+    if not npy_files:
+        print(f"❌ Không tìm thấy file .npz nào trong {poses_dir}")
         return
 
-    sample_file = valid_files[0]
-    print(f"✅ Đã chọn file mẫu: {sample_file}")
+    sample_id = os.path.basename(npy_files[0]).replace('.npz', '')
+    print(f"🔍 Đang test với Video ID: {sample_id}")
     
-    real_pose_np = np.load(sample_file)
-    real_pose_np = np.nan_to_num(real_pose_np) # Xử lý NaN rác
+    # Dùng hàm load_sample chuẩn của chị để lấy đủ 214D
+    real_pose_np, T = load_sample(sample_id, args.data_dir)
+    
+    if real_pose_np is None:
+        print("❌ Lỗi load_sample. Vui lòng check đường dẫn data_dir!")
+        return
 
-    if real_pose_np.shape[-1] != args.pose_dim:
-        print(f"⚠️ Cảnh báo: Shape file ({real_pose_np.shape[-1]}) khác với cấu hình pose_dim ({args.pose_dim})")
-        # Tự động điều chỉnh nếu chị lỡ nhập sai pose_dim
-        # real_pose_np = real_pose_np[:, :args.pose_dim] 
+    real_pose_np = np.nan_to_num(real_pose_np)
 
     # --- 5. NORMALIZE & INFERENCE ---
     real_pose = torch.tensor(real_pose_np, dtype=torch.float32).to(device)
-    real_pose_norm = (real_pose - mean) / (std + 1e-6)
+    # Normalize: (X - Mean) / Std
+    real_pose_norm = (real_pose - full_mean) / (full_std + 1e-8)
     real_pose_input = real_pose_norm.unsqueeze(0)
 
     print("🔄 Đang chạy qua Autoencoder...")
@@ -97,33 +117,33 @@ def main():
 
     # --- 6. DENORMALIZE & EVALUATE ---
     recon_np = recon_norm.squeeze(0).cpu().numpy()
-    recon_final = denormalize_pose(recon_np, stats['mean'], stats['std']) 
+    # Dùng hàm của chị để giải chuẩn hóa theo nhóm
+    recon_final = denormalize_pose(recon_np, stats_dict) 
 
-    # TÍNH TOÁN MSE (CÀNG NHỎ CÀNG TỐT)
+    # Tính MSE trên giá trị gốc
     mse = np.mean((real_pose_np - recon_final)**2)
     
     # --- 7. LƯU KẾT QUẢ ---
-    real_save_path = os.path.join(args.output_dir, "original_sample.npy")
-    recon_save_path = os.path.join(args.output_dir, "reconstructed_sample.npy")
+    real_save_path = os.path.join(args.output_dir, f"{sample_id}_orig.npy")
+    recon_save_path = os.path.join(args.output_dir, f"{sample_id}_recon.npy")
     
     np.save(real_save_path, real_pose_np)
     np.save(recon_save_path, recon_final)
     
     print("\n" + "="*50)
-    print(f"📊 KẾT QUẢ KIỂM TRA:")
-    print(f"   🔹 MSE Error: {mse:.8f}")
+    print(f"📊 KẾT QUẢ KIỂM TRA (MSE): {mse:.8f}")
     if mse < 0.001:
-        print("   🔹 Đánh giá: RẤT TỐT (Hầu như không mất thông tin)")
+        print("✅ Đánh giá: RẤT TỐT (Stage 1 hoàn hảo)")
     elif mse < 0.01:
-        print("   🔹 Đánh giá: TỐT (Có thể dùng cho Stage 2)")
+        print("⚠️ Đánh giá: TẠM ỔN (Có thể mất chi tiết nhỏ)")
     else:
-        print("   🔹 Đánh giá: CẢNH BÁO (Tái tạo kém, cần train thêm)")
-    
-    print("-" * 50)
-    print(f"   📁 Files đã lưu tại: {args.output_dir}")
+        print("❌ Đánh giá: KÉM (Cần kiểm tra lại Normalize hoặc Training)")
     print("="*50)
-    print(f"\n👉 Chạy lệnh này để xem video so sánh:")
-    print(f"python training/visualize_single_pose.py --npy_path {recon_save_path} --output_video check_ae_result.mp4")
+    
+    print(f"\n👉 1. File gốc: {real_save_path}")
+    print(f"👉 2. File tái tạo: {recon_save_path}")
+    print(f"\n💡 Chạy lệnh visualize để xem video:")
+    print(f"python training/visualize_single_pose.py --npy_path {recon_save_path} --output_video {sample_id}_check.mp4")
 
 if __name__ == '__main__':
     main()
