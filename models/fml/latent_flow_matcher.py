@@ -115,7 +115,12 @@ class LatentFlowMatcher(nn.Module):
             self.ssm_prior = None
 
         if use_sync_guidance and SyncGuidanceHead:
-            self.sync_head = SyncGuidanceHead(latent_dim, hidden_dim // 2, dropout)
+            self.sync_head = SyncGuidanceHead(
+                latent_dim=latent_dim, 
+                hidden_dim=hidden_dim // 2, 
+                dropout=dropout,
+                text_dim=hidden_dim  # <--- THÊM DÒNG NÀY
+            )
         else:
             self.sync_head = None
         

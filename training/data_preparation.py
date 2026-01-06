@@ -620,8 +620,8 @@ if __name__ == "__main__":
     print("="*60)
     
     # Step 1: Compute stats
-    DATA_DIR = "path/to/processed_data/data"
-    PHOENIX_ROOT = "path/to/PHOENIX-2014-T"
+    DATA_DIR = "/Users/kieuvo/Learn/Research/SL/Implement/SignFML/slp-vtk/data/RWTH/PHOENIX-2014-T-release-v3/processed_data"
+    PHOENIX_ROOT = "/Users/kieuvo/Learn/Research/SL/Implement/SignFML/slp-vtk/data/RWTH/PHOENIX-2014-T-release-v3/PHOENIX-2014-T"
     
     print("\n1. Computing normalization stats...")
     stats = compute_normalization_stats(DATA_DIR, split='train')
