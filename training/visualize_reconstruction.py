@@ -1,3 +1,9 @@
+import numpy as np
+import cv2
+import argparse
+import os
+from tqdm import tqdm
+
 # --- 1. TOPOLOGY & STYLE (MATCHING check_extraction_result.py) ---
 # Colors (Hex -> BGR)
 # COLOR_L = "#156551" (RGB: 21, 101, 81) -> BGR: (81, 101, 21)
