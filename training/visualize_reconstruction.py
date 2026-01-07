@@ -1,114 +1,56 @@
-import numpy as np
-import cv2
-import argparse
-import os
-from tqdm import tqdm
+# --- 1. TOPOLOGY & STYLE (MATCHING check_extraction_result.py) ---
+# Colors (Hex -> BGR)
+# COLOR_L = "#156551" (RGB: 21, 101, 81) -> BGR: (81, 101, 21)
+# COLOR_R = '#156551' -> Same
+# COLOR_C = '#000000' -> (0, 0, 0)
+# Mouth = '#c0392b' (RGB: 192, 57, 43) -> BGR: (43, 57, 192)
 
-# --- 1. TOPOLOGY DEFINITION (From visualize_single_pose.py) ---
-# Indices in the 95-point array:
-# 0-22: Upper Body (subset of std 25)
-# 23-32: Gap (unused)
-# 33-53: Left Hand (21 points)
-# 54-74: Right Hand (21 points)
-# 75-94: Mouth (20 points)
-
-# Basic Connections
-HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
-    (0, 9), (9, 10), (10, 11), (11, 12), (0, 13), (13, 14), (14, 15), (15, 16),
-    (0, 17), (17, 18), (18, 19), (19, 20)
-]
-
-POSE_CONNECTIONS_UPPER_BODY = [
-    (0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8),
-    (9, 10), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
-    (11, 23), (12, 24), (23, 24)
-]
-
-# Mouth Connections
-MOUTH_OUTER_LIP = list(zip(range(0, 11), range(1, 12))) + [(11, 0)]
-MOUTH_INNER_LIP = list(zip(range(12, 19), range(13, 20))) + [(19, 12)]
-MOUTH_CONNECTIONS_20 = MOUTH_OUTER_LIP + MOUTH_INNER_LIP
-
-# Define Drawing Rules: (indices_list, offset, color_bgr, thickness)
-# User Request: "Thân đen (Body Black), cánh tay và bàn tay màu xanh (Arms/Hands Green)"
-# On White Background
-COLOR_BODY = (0, 0, 0)         # Black
-COLOR_HAND = (0, 150, 0)       # Darker Green (visible on white)
-COLOR_MOUTH = (0, 0, 255)      # Red
-COLOR_EYES = (0, 0, 0)         # Black
+C_SIDE = (81, 101, 21)   # Dark Teal
+C_TRUNK = (0, 0, 0)      # Black
+C_MOUTH = (43, 57, 192)  # Dark Red
 
 DRAW_RULES = []
 
-# 1. Upper Body (Indices 0-22)
-# We need to separate Arms from Torso if user wants "Arms" green.
-# OpenPose 25: 
-# Torso/Head: 0,1,8, 15,16,17,18 (Eyes/Ears)
-# Arms: 2->3->4 (Right), 5->6->7 (Left)
-# Legs: 9->10->11 (Right), 12->13->14 (Left) -- Data might not have legs, strictly Upper Body.
+# --- Body (Torso & Arms) ---
+# Left Arm (11->13->15)
+DRAW_RULES.append({'idx': (11, 13), 'off': 0, 'color': C_SIDE, 'lw': 3})
+DRAW_RULES.append({'idx': (13, 15), 'off': 0, 'color': C_SIDE, 'lw': 3})
+# Right Arm (12->14->16)
+DRAW_RULES.append({'idx': (12, 14), 'off': 0, 'color': C_SIDE, 'lw': 3})
+DRAW_RULES.append({'idx': (14, 16), 'off': 0, 'color': C_SIDE, 'lw': 3})
 
-# Re-defining rules to separate colors
-# Torso + Head
-TORSO_HEAD_CONNECTIONS = [
-    (0, 1), (1, 8), (1, 2), (1, 5), # Neck to extensions
-    (0, 15), (0, 16), (15, 17), (16, 18), # Face
-    (8, 9), (8, 12) # Hips
+# Torso Box (11-12-24-23-11)
+for pair in [(11, 12), (11, 23), (12, 24), (23, 24)]:
+    DRAW_RULES.append({'idx': pair, 'off': 0, 'color': C_TRUNK, 'lw': 2})
+
+# Face (0..10)
+FACE_PAIRS = [(0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8), (9, 10)]
+for pair in FACE_PAIRS:
+    DRAW_RULES.append({'idx': pair, 'off': 0, 'color': C_TRUNK, 'lw': 2})
+
+# --- Hands ---
+HAND_CONNECTIONS = [
+     (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
+     (0, 9), (9, 10), (10, 11), (11, 12), (0, 13), (13, 14), (14, 15), (15, 16),
+     (0, 17), (17, 18), (18, 19), (19, 20)
 ]
-# Arms
-ARM_CONNECTIONS = [
-    (2, 3), (3, 4), # Right Shoulder->Elbow->Wrist
-    (5, 6), (6, 7)  # Left Shoulder->Elbow->Wrist
-]
+# Left Hand (33+)
+DRAW_RULES.extend([{'idx': (s, e), 'off': 33, 'color': C_SIDE, 'lw': 2} for (s, e) in HAND_CONNECTIONS])
+# Connect Body L_Wrist(15) -> L_Hand_Root(0+33)
+DRAW_RULES.append({'idx': (15, 0), 'off': (0, 33), 'color': C_SIDE, 'lw': 3})
 
-# Note: The original POSE_CONNECTIONS_UPPER_BODY had a mix.
-# Let's map specifically:
+# Right Hand (54+)
+DRAW_RULES.extend([{'idx': (s, e), 'off': 54, 'color': C_SIDE, 'lw': 2} for (s, e) in HAND_CONNECTIONS])
+# Connect Body R_Wrist(16) -> R_Hand_Root(0+54)
+DRAW_RULES.append({'idx': (16, 0), 'off': (0, 54), 'color': C_SIDE, 'lw': 3})
 
-# Body (Torso/Head) -> Black
-DRAW_RULES.extend([
-    {'idx': (s, e), 'off': 0, 'color': COLOR_BODY, 'lw': 3}
-    for (s, e) in TORSO_HEAD_CONNECTIONS
-])
+# --- Mouth ---
+MOUTH_CONNECTIONS = list(zip(range(0, 19), range(1, 20))) + [(19, 0)]
+DRAW_RULES.extend([{'idx': (s, e), 'off': 75, 'color': C_MOUTH, 'lw': 2} for (s, e) in MOUTH_CONNECTIONS])
 
-# Arms -> Green
-DRAW_RULES.extend([
-    {'idx': (s, e), 'off': 0, 'color': COLOR_HAND, 'lw': 3}
-    for (s, e) in ARM_CONNECTIONS
-])
-
-# 2. Left Hand (Index 33+) -> Green
-DRAW_RULES.extend([
-    {'idx': (s, e), 'off': 33, 'color': COLOR_HAND, 'lw': 2}
-    for (s, e) in HAND_CONNECTIONS
-])
-
-# 3. Connection: Body Left Wrist (7) -> Left Hand Root (33)
-# Note: Body index 7 is Left Wrist in OpenPose?
-# Wait, previous code used (15,0) and (16,0). In OpenPose 25, 4 is Right Wrist, 7 is Left Wrist.
-# But `visualize_single_pose.py` used 15 and 16? 
-# Let's double check standard OpenPose 25 vs COCO 18 vs Body 25.
-# If `visualize_single_pose.py` used 15/16, it implied 15=Leye, 16=Reye for Body_25? No.
-# Actually `visualize_single_pose.py` explicitly connected (15,0) with offset.
-# Let's stick to connecting "Wrist" to "Hand Root". 
-# If the previous code worked for topology, I will trust the user wants 'Arms' green.
-# I will assume indices 4 and 7 are wrists if standard, OR use the explicit connection indices from before.
-# Previous code: Body(15) -> Hand(0). 
-# Let's make this connection GREEN.
-DRAW_RULES.append({'idx': (15, 0), 'off': (0, 33), 'color': COLOR_HAND, 'lw': 3})
-
-# 4. Right Hand (Index 54+) -> Green
-DRAW_RULES.extend([
-    {'idx': (s, e), 'off': 54, 'color': COLOR_HAND, 'lw': 2}
-    for (s, e) in HAND_CONNECTIONS
-])
-# Connection Body(16) -> Hand(0)
-DRAW_RULES.append({'idx': (16, 0), 'off': (0, 54), 'color': COLOR_HAND, 'lw': 3})
-
-# 5. Mouth (Index 75+) -> Red
-DRAW_RULES.extend([
-    {'idx': (s, e), 'off': 75, 'color': COLOR_MOUTH, 'lw': 2}
-    for (s, e) in MOUTH_CONNECTIONS_20
-])
-
+# Joints to scatter (Dots)
+JOINTS_SIDE = [13, 15] + [33+i for i in range(21)] + [14, 16] + [54+i for i in range(21)]
+JOINTS_TRUNK = [0, 11, 12, 23, 24] # Head + Shoulders + Hips
 
 def load_and_prepare_pose_95(pose_214):
     manual_150 = pose_214[:150]
@@ -117,48 +59,61 @@ def load_and_prepare_pose_95(pose_214):
     mouth_kps = mouth_40.reshape(20, 2)
     return np.concatenate([manual_kps, mouth_kps], axis=0)
 
-def get_crop_params(kps_seq, padding_ratio=0.1):
+def get_torso_zoom_params(kps_seq):
     """
-    Calculate crop using Percentiles to ignore outliers (the cause of 'small' skeleton).
+    Smart Zoom focusing on Torso (indices 11, 12, 23, 24) to keep frame stable.
     """
-    # Filter only non-zero points
-    valid_mask = np.sum(np.abs(kps_seq), axis=2) > 0.01
-    valid_points = kps_seq[valid_mask]
-
-    if len(valid_points) == 0:
-        return 0, 0, 1.0, 1.0
-
-    # Use 5th and 95th percentiles to determine "Core" bounding box
-    # This prevents one flying hand from shrinking the whole view
-    min_x = np.percentile(valid_points[:, 0], 2)
-    max_x = np.percentile(valid_points[:, 0], 98) 
-    min_y = np.percentile(valid_points[:, 1], 2)
-    max_y = np.percentile(valid_points[:, 1], 98)
+    # Torso indices in 95-point array: 11, 12, 23, 24
+    torso_indices = [11, 12, 23, 24]
     
-    width = max_x - min_x
-    height = max_y - min_y
+    # Collect valid torso points across sequence
+    # Shape: [T, 4, 2]
+    torso_pts = kps_seq[:, torso_indices, :]
     
-    # Enforce a minimum size to prevent super zoom on empty frames
-    if width < 0.1: width = 0.5
-    if height < 0.1: height = 0.5
-
-    pad_x = width * padding_ratio
-    pad_y = height * padding_ratio
+    # Filter valid
+    valid = torso_pts[np.sum(np.abs(torso_pts), axis=2) > 0.01]
     
-    return min_x - pad_x, min_y - pad_y, max_x + pad_x, max_y + pad_y
+    if len(valid) == 0:
+        # Fallback to all points
+        valid = kps_seq[np.sum(np.abs(kps_seq), axis=2) > 0.01]
+        if len(valid) == 0: return 0.5, 0.5, 0.5 # Default
+    
+    min_xy = np.min(valid, axis=0)
+    max_xy = np.max(valid, axis=0)
+    
+    ctr_x = (min_xy[0] + max_xy[0]) / 2
+    ctr_y = (min_xy[1] + max_xy[1]) / 2
+    
+    # Height of torso
+    h = max_xy[1] - min_xy[1]
+    
+    # Radius = 1.6 * Height (Slightly zoomed out to include hands)
+    if h < 0.1: h = 0.5
+    radius = h * 1.5 
+    
+    return ctr_x, ctr_y, radius
 
-def draw_skeleton_cv2(canvas, kps_95, min_x, min_y, scale_w, scale_h):
+def draw_skeleton_cv2(canvas, kps_95, ctr_x, ctr_y, radius):
     H, W, _ = canvas.shape
     
+    # Scale to fit 'radius' in canvas half-height
+    # View window: [ctr-r, ctr+r]
+    # Scale factor: (H/2) / r ? No.
+    # We want 2*r to cover the Canvas Height (approx)
+    
+    # Let's say H maps to 2*radius (+ padding)
+    scale = H / (2 * radius * 1.2) # 1.2 for extra margin
+    
     def transform(pt):
-        px = int((pt[0] - min_x) * scale_w * W)
-        py = int((pt[1] - min_y) * scale_h * H)
+        # Center pt relative to ctr
+        # x' = (pt.x - ctr.x) * scale + W/2
+        # y' = (pt.y - ctr.y) * scale + H/2
+        px = int((pt[0] - ctr_x) * scale + W/2)
+        py = int((pt[1] - ctr_y) * scale + H/2)
         return (px, py)
 
     VALID_THRESH = 0.01
-    # Max length squared (filter long lines)
-    # Reduced to 30% of screen to be stricter
-    MAX_LEN_SQ = (0.3 * min(W, H))**2
+    MAX_LEN_SQ = (0.5 * min(W, H))**2 # Artifact filter
 
     # Draw Lines
     for rule in DRAW_RULES:
@@ -171,37 +126,46 @@ def draw_skeleton_cv2(canvas, kps_95, min_x, min_y, scale_w, scale_h):
         real_e = e + (off[1] if isinstance(off, tuple) else off)
         
         if real_s >= len(kps_95) or real_e >= len(kps_95): continue
-        
         p1, p2 = kps_95[real_s], kps_95[real_e]
         
-        # Strict Valid Check
-        if np.sum(np.abs(p1)) < VALID_THRESH or np.sum(np.abs(p2)) < VALID_THRESH:
-            continue
-            
+        if np.sum(np.abs(p1)) < VALID_THRESH or np.sum(np.abs(p2)) < VALID_THRESH: continue
         t1, t2 = transform(p1), transform(p2)
         
-        # Check Artifact Distance
-        if (t1[0]-t2[0])**2 + (t1[1]-t2[1])**2 > MAX_LEN_SQ:
-            continue
-            
+        if (t1[0]-t2[0])**2 + (t1[1]-t2[1])**2 > MAX_LEN_SQ: continue
+        
         cv2.line(canvas, t1, t2, color, th, cv2.LINE_AA)
 
-    # Draw Points (Only for Face/Eyes?)
-    # User requested specific style. Usually Skeleton lines are enough.
-    # But Face landmarks needing dots?
-    # Let's draw dots ONLY for Eyes/Nose (Black) and Mouth (Red)
-    # Hiding dots for Body/Hands to look cleaner (like Image 3)
-    
-    # Nose (0) + Eyes (15,16,17,18)
-    for i in [0, 15, 16, 17, 18]:
+    # Draw Dots (Replicating check_extraction_result.py style)
+    # Side Joints (Teal)
+    for i in JOINTS_SIDE:
         if i < len(kps_95) and np.sum(np.abs(kps_95[i])) > VALID_THRESH:
-            # Check if point is isolated? (Optional)
-            cv2.circle(canvas, transform(kps_95[i]), 3, COLOR_EYES, -1, cv2.LINE_AA)
+            cv2.circle(canvas, transform(kps_95[i]), 3, C_SIDE, -1, cv2.LINE_AA)
             
-    # Mouth (75+)
-    for i in range(75, 95):
+    # Trunk Joints (Black) - Slightly larger
+    for i in JOINTS_TRUNK:
         if i < len(kps_95) and np.sum(np.abs(kps_95[i])) > VALID_THRESH:
-             cv2.circle(canvas, transform(kps_95[i]), 1, COLOR_MOUTH, -1, cv2.LINE_AA)
+            cv2.circle(canvas, transform(kps_95[i]), 4, C_TRUNK, -1, cv2.LINE_AA)
+            
+    # Eyes (Using Face indices 2 and 5? In 75-point, eyes are 15,16?)
+    # check_extraction_result uses manual indices? 
+    # It says: scatters[3] -> eyes. Logic: kps[frame, 2] and kps[frame, 5]?
+    # Wait, check_extraction_result.py lines 150-151: kps[2] & kps[5].
+    # In my 75-point mapping, 2 is R_Shoulder? No.
+    # Op 25: 0=Nose, 1=Neck, 2=RShoulder.
+    # Wait, check_extraction_result.py FACE_PAIRS uses (0,1), (1,2)... 
+    # This implies indices 0,1,2,3,4,5,6,7,8,9,10 are FACE?
+    # IF check_extraction_result assumes first 11 points are Face, then my 75-point load is wrong?
+    # NO. `load_and_prepare_pose` in check_extraction_result simply reshapes 75->(75,2).
+    # IF indices 2 and 5 are eyes, then the topology is NOT OpenPose 25.
+    # It might be the "Sign Language Dataset" customized topology.
+    # BUT, I must follow what `check_extraction_result.py` does visually.
+    # It draws circles at indices 2 and 5 (Black, Large).
+    
+    # Let's map 2 and 5 as Eyes based on that file.
+    for i in [2, 5]:
+         if i < len(kps_95) and np.sum(np.abs(kps_95[i])) > VALID_THRESH:
+            cv2.circle(canvas, transform(kps_95[i]), 5, (0,0,0), -1, cv2.LINE_AA)
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -221,15 +185,9 @@ def main():
     gt_kps = [load_and_prepare_pose_95(f) for f in gt_raw[:L]]
     rc_kps = [load_and_prepare_pose_95(f) for f in recon_raw[:L]]
     
-    # Crop based on GT percentile to ignore outliers
-    min_x, min_y, max_x, max_y = get_crop_params(np.array(gt_kps), padding_ratio=0.1)
+    # Calculate Center and Radius based on GT Torso
+    ctr_x, ctr_y, radius = get_torso_zoom_params(np.array(gt_kps))
     
-    # Square aspect ratio
-    center_x, center_y = (min_x + max_x)/2, (min_y + max_y)/2
-    max_dim = max(max_x - min_x, max_y - min_y)
-    min_x, min_y = center_x - max_dim/2, center_y - max_dim/2
-    scale = 1.0 / (max_dim + 1e-6)
-
     H, W = 512, 512
     writer = cv2.VideoWriter(args.output, cv2.VideoWriter_fourcc(*'mp4v'), 25, (W*2, H))
 
@@ -237,8 +195,8 @@ def main():
         f_gt = np.ones((H, W, 3), dtype=np.uint8) * 255
         f_rc = np.ones((H, W, 3), dtype=np.uint8) * 255
         
-        draw_skeleton_cv2(f_gt, gt_kps[t], min_x, min_y, scale, scale)
-        draw_skeleton_cv2(f_rc, rc_kps[t], min_x, min_y, scale, scale)
+        draw_skeleton_cv2(f_gt, gt_kps[t], ctr_x, ctr_y, radius)
+        draw_skeleton_cv2(f_rc, rc_kps[t], ctr_x, ctr_y, radius)
         
         cv2.putText(f_gt, "GROUND TRUTH", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
         cv2.putText(f_rc, "RECONSTRUCTED", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
