@@ -4,30 +4,75 @@ import argparse
 from tqdm import tqdm
 
 # --- 1. ĐỊNH NGHĨA KẾT NỐI XƯƠNG (TOPOLOGY) ---
-# Dựa trên cấu trúc 75 điểm (OpenPose/Sign Language Datasets)
-# 0-8: Body, 9-24: Right Hand? (Cần check kỹ dataset, đây là cấu trúc phổ biến)
-# Tuy nhiên, để an toàn, ta vẽ theo cấu trúc chuẩn OpenPose 25 body + Hands
+# Cấu trúc 75 điểm: Body (25) + Left Hand (21) + Right Hand (21) + Face (8)
+# Indices: 0-24 (Body), 25-45 (Left Hand), 46-66 (Right Hand), 67-74 (Face landmarks)
 
-# Body chain (đơn giản hóa để không bị rối)
+# Body connections (OpenPose 25-point body model)
 BODY_CONNECTIONS = [
-    (0,1), (1,2), (2,3), (3,4),       # Left Arm
-    (1,5), (5,6), (6,7),              # Right Arm
-    (1,8), (8,9), (9,10), (10,11),    # Torso & Left Leg
-    (8,12), (12,13), (13,14),         # Right Leg
-    (0,15), (0,16), (15,17), (16,18)  # Face contour/Eyes
+    # Spine and neck
+    (0, 1),    # Nose -> Neck
+    (1, 2),    # Neck -> Right Shoulder
+    (1, 5),    # Neck -> Left Shoulder
+    (1, 8),    # Neck -> Mid Hip
+    
+    # Right arm
+    (2, 3),    # Right Shoulder -> Right Elbow
+    (3, 4),    # Right Elbow -> Right Wrist
+    
+    # Left arm
+    (5, 6),    # Left Shoulder -> Left Elbow
+    (6, 7),    # Left Elbow -> Left Wrist
+    
+    # Right leg
+    (8, 9),    # Mid Hip -> Right Hip
+    (9, 10),   # Right Hip -> Right Knee
+    (10, 11),  # Right Knee -> Right Ankle
+    
+    # Left leg
+    (8, 12),   # Mid Hip -> Left Hip
+    (12, 13),  # Left Hip -> Left Knee
+    (13, 14),  # Left Knee -> Left Ankle
+    
+    # Face
+    (0, 15),   # Nose -> Right Eye
+    (0, 16),   # Nose -> Left Eye
+    (15, 17),  # Right Eye -> Right Ear
+    (16, 18),  # Left Eye -> Left Ear
 ]
 
-# Hand chains (Cấu trúc bàn tay chuẩn)
-# Left Hand (bắt đầu từ điểm cổ tay - index tuỳ dataset, thường là nối tiếp body)
-# Giả sử cấu trúc 75 điểm: 0-14 (Body), 15-18 (Head), 
-# 25-45 (Left Hand), 46-66 (Right Hand) -> Đây là giả định phổ biến.
-# NHƯNG code data_prep của bạn gộp chung. 
-# Tôi sẽ dùng logic vẽ đoạn thẳng liền kề cho phần tay để đảm bảo hiện hình.
+# Hand connections (21 points per hand - MediaPipe/OpenPose hand model)
+# Each finger: Wrist(0) -> MCP -> PIP -> DIP -> TIP
+def get_hand_connections(offset=0):
+    """Generate hand skeleton connections with given offset"""
+    connections = []
+    # Wrist to palm base
+    connections.extend([
+        (0+offset, 1+offset), (0+offset, 5+offset), (0+offset, 9+offset),
+        (0+offset, 13+offset), (0+offset, 17+offset)
+    ])
+    # Thumb (4 points)
+    connections.extend([(1+offset, 2+offset), (2+offset, 3+offset), (3+offset, 4+offset)])
+    # Index finger (4 points)
+    connections.extend([(5+offset, 6+offset), (6+offset, 7+offset), (7+offset, 8+offset)])
+    # Middle finger (4 points)
+    connections.extend([(9+offset, 10+offset), (10+offset, 11+offset), (11+offset, 12+offset)])
+    # Ring finger (4 points)
+    connections.extend([(13+offset, 14+offset), (14+offset, 15+offset), (15+offset, 16+offset)])
+    # Pinky (4 points)
+    connections.extend([(17+offset, 18+offset), (18+offset, 19+offset), (19+offset, 20+offset)])
+    return connections
+
+# Left hand: indices 25-45 (21 points)
+LEFT_HAND_CONNECTIONS = get_hand_connections(offset=25)
+
+# Right hand: indices 46-66 (21 points)
+RIGHT_HAND_CONNECTIONS = get_hand_connections(offset=46)
 
 def get_skeleton_topology():
+    """Return all skeleton connections"""
     edges = list(BODY_CONNECTIONS)
-    # Thêm các đường nối tay (dựa trên index giả định cho vector 75 điểm)
-    # Nếu topology sai, nó sẽ nối lung tung, nhưng ít nhất sẽ hiện hình để bạn debug.
+    edges.extend(LEFT_HAND_CONNECTIONS)
+    edges.extend(RIGHT_HAND_CONNECTIONS)
     return edges
 
 # --- 2. HÀM XỬ LÝ DỮ LIỆU ---
@@ -91,44 +136,70 @@ def robust_normalize_to_canvas(points, W=512, H=512, padding=50):
 # --- 3. HÀM VẼ (STYLE OPENPOSE) ---
 
 def draw_pose(canvas, body, mouth, is_gt=True):
-    # Màu sắc (BGR)
+    """Draw pose skeleton with proper topology"""
+    # Màu sắc (BGR) - Softer colors for better visual
     if is_gt:
-        c_body = (0, 255, 0)     # Green
-        c_hand = (0, 0, 255)     # Red
-        c_face = (255, 255, 255) # White
+        c_body = (100, 255, 100)     # Light Green
+        c_hand = (255, 100, 100)     # Light Blue
+        c_face = (200, 200, 200)     # Light Gray
         label = "GROUND TRUTH"
     else:
-        c_body = (0, 255, 255)   # Yellow
-        c_hand = (255, 0, 255)   # Purple
-        c_face = (0, 165, 255)   # Orange
+        c_body = (100, 255, 255)     # Light Yellow
+        c_hand = (255, 100, 255)     # Light Purple
+        c_face = (150, 200, 255)     # Light Orange
         label = "RECONSTRUCTION"
 
-    # 1. Vẽ Body (Nối dây)
-    # Lưu ý: Vì topology dataset này khá đặc thù, ta sẽ vẽ các điểm trước
-    # Để an toàn: Vẽ tất cả các điểm body thành chấm tròn
+    # Get all skeleton connections
+    skeleton_edges = get_skeleton_topology()
+    
+    # 1. Draw skeleton lines first (so points appear on top)
+    for (i, j) in skeleton_edges:
+        # Check if both points are valid
+        if i >= len(body) or j >= len(body):
+            continue
+        
+        pt1 = body[i]
+        pt2 = body[j]
+        
+        # Skip if either point is invalid
+        if pt1[0] < 0 or pt2[0] < 0:
+            continue
+        
+        # Determine color based on connection type
+        if i >= 25 or j >= 25:  # Hand connections
+            color = c_hand
+            thickness = 1
+        else:  # Body connections
+            color = c_body
+            thickness = 2
+        
+        # Draw line
+        cv2.line(canvas, 
+                (int(pt1[0]), int(pt1[1])), 
+                (int(pt2[0]), int(pt2[1])), 
+                color, thickness, cv2.LINE_AA)
+    
+    # 2. Draw keypoints on top of lines
     for i, pt in enumerate(body):
-        if pt[0] < 0: continue # Bỏ qua điểm invalid
+        if pt[0] < 0: continue  # Skip invalid points
         
-        # Phân biệt màu tay và người (giả định index > 20 là tay)
-        color = c_hand if i > 20 else c_body
-        cv2.circle(canvas, (int(pt[0]), int(pt[1])), 3, color, -1)
+        # Determine color and size based on point type
+        if i >= 25:  # Hand points
+            color = c_hand
+            radius = 2
+        else:  # Body points
+            color = c_body
+            radius = 3
         
-        # Thử nối điểm i với i+1 (Heuristic đơn giản để tạo hình liền mạch)
-        # Chỉ nối nếu điểm tiếp theo cũng valid và không quá xa (tránh nối từ tay nọ sang chân kia)
-        if i + 1 < len(body):
-            pt_next = body[i+1]
-            if pt_next[0] > 0:
-                dist = np.linalg.norm(pt - pt_next)
-                if dist < 100: # Ngưỡng khoảng cách pixel
-                    cv2.line(canvas, (int(pt[0]), int(pt[1])), (int(pt_next[0]), int(pt_next[1])), color, 2)
-
-    # 2. Vẽ Mouth (Chấm nhỏ)
+        cv2.circle(canvas, (int(pt[0]), int(pt[1])), radius, color, -1, cv2.LINE_AA)
+    
+    # 3. Draw mouth points
     for pt in mouth:
         if pt[0] < 0: continue
-        cv2.circle(canvas, (int(pt[0]), int(pt[1])), 1, c_face, -1)
-
-    # 3. Text Label
-    cv2.putText(canvas, label, (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, c_body, 2)
+        cv2.circle(canvas, (int(pt[0]), int(pt[1])), 1, c_face, -1, cv2.LINE_AA)
+    
+    # 4. Text Label (smaller and cleaner)
+    cv2.putText(canvas, label, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, c_body, 1, cv2.LINE_AA)
 
 def main():
     parser = argparse.ArgumentParser()
