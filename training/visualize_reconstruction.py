@@ -4,25 +4,20 @@ import argparse
 import os
 from tqdm import tqdm
 
-# --- 1. ĐỊNH NGHĨA KHỚP NỐI (SKELETON TOPOLOGY) ---
-# Dựa trên chuẩn OpenPose thường dùng cho Phoenix/How2Sign (75 points)
-# 0-24: Body, 25-45: Left Hand, 46-66: Right Hand
-
-# Body (OpenPose 25)
+# --- 1. BẢN ĐỒ XƯƠNG CHUẨN (PHOENIX-14T / OPENPOSE) ---
+# Body: 25 điểm (0-24)
 BODY_EDGES = [
-    (1, 0), (1, 2), (1, 5),   # Neck -> Nose, R-Shoulder, L-Shoulder
-    (2, 3), (3, 4),           # R-Arm
-    (5, 6), (6, 7),           # L-Arm
-    (1, 8), (8, 9), (8, 12),  # Neck->MidHip, MidHip->R-Hip, MidHip->L-Hip
-    (9, 10), (10, 11),        # R-Leg
-    (12, 13), (13, 14),       # L-Leg
-    (0, 15), (0, 16),         # Nose -> Eyes
-    (15, 17), (16, 18),       # Ears
-    (11, 24), (11, 22), (22, 23), # R-Foot details
-    (14, 21), (14, 19), (19, 20)  # L-Foot details
+    (1, 0), (1, 2), (1, 5),   # Cổ->Mũi, Vai Phải, Vai Trái
+    (2, 3), (3, 4),           # Cánh tay phải
+    (5, 6), (6, 7),           # Cánh tay trái
+    (1, 8), (8, 9), (8, 12),  # Thân trên -> Hông
+    (9, 10), (10, 11),        # Chân phải
+    (12, 13), (13, 14),       # Chân trái
+    (0, 15), (0, 16),         # Mắt
+    (15, 17), (16, 18)        # Tai
 ]
 
-# Hand (21 points: Wrist=0, Thumb=1-4, Index=5-8...)
+# Hand: 21 điểm (Gốc=0, Ngón cái=1-4, Trỏ=5-8...)
 HAND_EDGES = [
     (0, 1), (1, 2), (2, 3), (3, 4),      # Thumb
     (0, 5), (5, 6), (6, 7), (7, 8),      # Index
@@ -31,129 +26,130 @@ HAND_EDGES = [
     (0, 17), (17, 18), (18, 19), (19, 20)  # Pinky
 ]
 
-def scale_to_canvas(pose, W=512, H=512, padding=50):
+def auto_scale_pose(pose, W=512, H=512, padding=50):
     """
-    Tự động scale pose để vừa khít khung hình 512x512
-    pose: [75, 2]
+    Tự động phóng to/thu nhỏ pose để vừa khít khung hình 512x512
     """
-    # Lọc các điểm (0,0) (điểm ẩn/nhiễu) ra khỏi việc tính min/max
-    valid_points = pose[np.sum(pose, axis=1) != 0]
+    # Lọc bỏ các điểm (0,0) (điểm bị che khuất/không có)
+    valid_mask = np.sum(pose, axis=1) != 0
+    valid_points = pose[valid_mask]
     
     if len(valid_points) == 0:
-        return pose # Không có điểm nào valid
-        
+        return pose # Không có điểm nào để vẽ
+
+    # Tìm hộp bao (Bounding Box)
     min_x, min_y = np.min(valid_points, axis=0)
     max_x, max_y = np.max(valid_points, axis=0)
     
-    # Kích thước thật của pose
     pose_w = max_x - min_x
     pose_h = max_y - min_y
     
-    # Tỉ lệ scale
+    # Tính tỉ lệ scale để fit vào khung hình (trừ padding)
     scale_x = (W - 2*padding) / (pose_w + 1e-6)
     scale_y = (H - 2*padding) / (pose_h + 1e-6)
-    scale = min(scale_x, scale_y)
+    scale = min(scale_x, scale_y) # Giữ tỉ lệ khung hình (aspect ratio)
     
-    # Scale và Center
+    # Scale và dịch chuyển về giữa
     pose_scaled = (pose - [min_x, min_y]) * scale
     
     # Căn giữa
-    offset_x = (W - pose_w * scale) / 2
-    offset_y = (H - pose_h * scale) / 2
+    new_w = pose_w * scale
+    new_h = pose_h * scale
+    offset_x = (W - new_w) / 2
+    offset_y = (H - new_h) / 2
     
     return pose_scaled + [offset_x, offset_y]
 
-def draw_skeleton(frame, keypoints, color_body=(0, 255, 0), color_lhand=(0, 0, 255), color_rhand=(255, 0, 0)):
+def draw_pose_on_canvas(canvas, keypoints, is_gt=True):
     """
-    Vẽ khung xương lên frame
+    Vẽ khung xương lên nền đen
     keypoints: [75, 2]
     """
-    # 1. Tách bộ phận
+    # Tách bộ phận (Dựa trên cấu trúc 75 điểm: 25 Body + 21 LHand + 21 RHand)
+    # Lưu ý: Index có thể thay đổi tùy bộ data, nhưng đây là cấu trúc phổ biến nhất
     body = keypoints[0:25]
     l_hand = keypoints[25:46]
     r_hand = keypoints[46:67]
     
-    # Hàm phụ vẽ line
-    def draw_connections(points, edges, color, thickness=2):
+    # Màu sắc: GT (Xanh lá), Recon (Đỏ/Cam)
+    color_body = (0, 255, 0) if is_gt else (0, 0, 255)       # Body
+    color_lhand = (0, 200, 200) if is_gt else (0, 165, 255) # Tay Trái (Vàng/Cam)
+    color_rhand = (200, 200, 0) if is_gt else (255, 0, 255) # Tay Phải (Xanh lơ/Tím)
+
+    # Hàm vẽ đường nối
+    def draw_lines(points, edges, color, thick=2):
         for u, v in edges:
             if u < len(points) and v < len(points):
                 pt1 = tuple(points[u].astype(int))
                 pt2 = tuple(points[v].astype(int))
-                # Chỉ vẽ nếu không phải điểm (0,0) hoặc điểm ngoài khung
+                # Không vẽ nếu điểm là (0,0) hoặc bay ra ngoài khung
                 if pt1 != (0,0) and pt2 != (0,0):
-                     cv2.line(frame, pt1, pt2, color, thickness)
-                     cv2.circle(frame, pt1, 2, color, -1)
+                    cv2.line(canvas, pt1, pt2, color, thick)
+                    # Vẽ khớp tròn nhỏ
+                    cv2.circle(canvas, pt1, 2, color, -1)
 
-    # 2. Vẽ Body (Xanh Lá)
-    draw_connections(body, BODY_EDGES, color_body, thickness=2)
-    
-    # 3. Vẽ Tay Trái (Đỏ - Red)
-    draw_connections(l_hand, HAND_EDGES, color_lhand, thickness=1)
-
-    # 4. Vẽ Tay Phải (Xanh Dương - Blue)
-    draw_connections(r_hand, HAND_EDGES, color_rhand, thickness=1)
-
-    return frame
+    draw_lines(body, BODY_EDGES, color_body, 2)
+    draw_lines(l_hand, HAND_EDGES, color_lhand, 1)
+    draw_lines(r_hand, HAND_EDGES, color_rhand, 1)
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--original', type=str, required=True)
-    parser.add_argument('--reconstructed', type=str, required=True)
-    parser.add_argument('--output', type=str, default='comparison_result.mp4')
+    parser.add_argument('--gt_path', type=str, required=True, help='Path file gốc .npy')
+    parser.add_argument('--recon_path', type=str, required=True, help='Path file tái tạo .npy')
+    parser.add_argument('--output_video', type=str, default='comparison_video.mp4')
     args = parser.parse_args()
     
-    # Load data [T, 214]
-    gt = np.load(args.original)
-    rec = np.load(args.reconstructed)
+    # 1. Load Data
+    print(f"📂 Loading: {args.gt_path}")
+    gt_data = np.load(args.gt_path)
+    print(f"📂 Loading: {args.recon_path}")
+    recon_data = np.load(args.recon_path)
     
-    T = len(gt)
-    H, W = 512, 512
+    # 2. Xử lý độ dài lệch nhau (Cắt theo cái ngắn nhất)
+    len_gt = len(gt_data)
+    len_recon = len(recon_data)
+    min_len = min(len_gt, len_recon)
     
-    # Reshape về [T, 75, 2] (Chỉ lấy 150 chiều đầu Manual Pose)
-    gt_pose = gt[:, :150].reshape(-1, 75, 2)
-    rec_pose = rec[:, :150].reshape(-1, 75, 2)
+    if len_gt != len_recon:
+        print(f"⚠️ Cảnh báo: Độ dài lệch nhau (GT={len_gt}, Rec={len_recon}). Sẽ cắt về {min_len} frames.")
     
-    # --- AUTO-SCALE ---
-    # Kiểm tra xem dữ liệu là pixel (0-256) hay norm (-2.0 đến 2.0)
-    # Nếu là norm, ta cần denormalize "giả" để nó hiện lên hình được
-    is_normalized = np.max(np.abs(gt_pose)) < 10.0
-    print(f"📊 Data Type detected: {'Normalized' if is_normalized else 'Pixel Coordinates'}")
-
-    # Init Video Writer
+    # 3. Chuẩn bị Video Writer
+    H, W = 512, 512 # Kích thước mỗi khung hình
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(args.output, fourcc, 25, (W*2, H))
+    # Video đầu ra sẽ rộng gấp đôi (Side-by-side)
+    out = cv2.VideoWriter(args.output_video, fourcc, 25, (W * 2, H))
     
-    print("🎬 Rendering video...")
-    for t in tqdm(range(T)):
+    print(f"🎬 Đang render video ({min_len} frames)...")
+    
+    # 4. Vòng lặp vẽ
+    for t in tqdm(range(min_len)):
+        # Lấy data frame t & reshape về [75, 2] (Chỉ lấy 150 chiều đầu)
+        pose_gt = gt_data[t, :150].reshape(-1, 2)
+        pose_rec = recon_data[t, :150].reshape(-1, 2)
+        
+        # Auto Scale để fit vào khung hình 512x512
+        pose_gt_scaled = auto_scale_pose(pose_gt, W, H)
+        pose_rec_scaled = auto_scale_pose(pose_rec, W, H)
+        
         # Tạo canvas đen
         canvas_gt = np.zeros((H, W, 3), dtype=np.uint8)
         canvas_rec = np.zeros((H, W, 3), dtype=np.uint8)
         
-        # Lấy frame t
-        p_gt = gt_pose[t].copy()
-        p_rec = rec_pose[t].copy()
-        
-        # Nếu data normalized -> Scale theo min/max của chính frame đó (hoặc global) để fit vào 512x512
-        # Ở đây dùng hàm scale_to_canvas để luôn đảm bảo hình nằm giữa
-        p_gt = scale_to_canvas(p_gt, W, H)
-        p_rec = scale_to_canvas(p_rec, W, H)
-        
         # Vẽ
-        # GT: Body Xanh, Tay Đỏ/Xanh Dương
-        draw_skeleton(canvas_gt, p_gt)
-        # Rec: Body Vàng, Tay Đỏ/Xanh Dương (để phân biệt)
-        draw_skeleton(canvas_rec, p_rec, color_body=(0, 255, 255)) 
+        draw_pose_on_canvas(canvas_gt, pose_gt_scaled, is_gt=True)
+        draw_pose_on_canvas(canvas_rec, pose_rec_scaled, is_gt=False)
         
-        # Thêm Text
-        cv2.putText(canvas_gt, "Original (GT)", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        cv2.putText(canvas_rec, "Reconstructed", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        # Thêm nhãn
+        cv2.putText(canvas_gt, "GROUND TRUTH", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(canvas_rec, "RECONSTRUCTED", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        cv2.putText(canvas_gt, f"Frame: {t}/{min_len}", (20, H-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
         
-        # Ghép
-        frame = np.hstack([canvas_gt, canvas_rec])
-        out.write(frame)
+        # Ghép 2 khung hình
+        final_frame = np.hstack([canvas_gt, canvas_rec])
+        out.write(final_frame)
         
     out.release()
-    print(f"✅ Xong! Video lưu tại: {args.output}")
+    print(f"\n✅ Xong! Video đã lưu tại: {args.output_video}")
 
 if __name__ == '__main__':
     main()
