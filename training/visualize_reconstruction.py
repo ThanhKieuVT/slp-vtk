@@ -1,6 +1,6 @@
 """
 Script: Visualize Original vs Reconstructed Pose
-Tạo video side-by-side để so sánh
+✅ FIXED: TypeError with tuple comparison
 """
 
 import numpy as np
@@ -9,33 +9,22 @@ import argparse
 import os
 from tqdm import tqdm
 
-# Phoenix-2014T keypoint connections (75 keypoints = 25*3: body, left_hand, right_hand)
+# Phoenix-2014T keypoint connections
 BODY_CONNECTIONS = [
-    # Torso
     (0, 1), (1, 2), (2, 3), (3, 4),  # Spine
-    # Left arm
-    (1, 5), (5, 6), (6, 7),
-    # Right arm
-    (1, 8), (8, 9), (9, 10),
-    # Left leg
-    (0, 11), (11, 12), (12, 13),
-    # Right leg
-    (0, 14), (14, 15), (15, 16),
-    # Head
-    (0, 17), (17, 18), (18, 19), (19, 20),
+    (1, 5), (5, 6), (6, 7),  # Left arm
+    (1, 8), (8, 9), (9, 10),  # Right arm
+    (0, 11), (11, 12), (12, 13),  # Left leg
+    (0, 14), (14, 15), (15, 16),  # Right leg
+    (0, 17), (17, 18), (18, 19), (19, 20),  # Head
 ]
 
 HAND_CONNECTIONS = [
-    # Thumb
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    # Index
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    # Middle
-    (0, 9), (9, 10), (10, 11), (11, 12),
-    # Ring
-    (0, 13), (13, 14), (14, 15), (15, 16),
-    # Pinky
-    (0, 17), (17, 18), (18, 19), (19, 20),
+    (0, 1), (1, 2), (2, 3), (3, 4),  # Thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),  # Index
+    (0, 9), (9, 10), (10, 11), (11, 12),  # Middle
+    (0, 13), (13, 14), (14, 15), (15, 16),  # Ring
+    (0, 17), (17, 18), (18, 19), (19, 20),  # Pinky
 ]
 
 
@@ -47,6 +36,11 @@ def normalize_coords(coords, width, height):
     return coords_norm.astype(np.int32)
 
 
+def is_valid_point(pt_array):
+    """Check if a point is valid (both x and y > 0)"""
+    return pt_array[0] > 0 and pt_array[1] > 0
+
+
 def draw_skeleton(frame, keypoints, color=(0, 255, 0), radius=3):
     """
     Draw skeleton on frame
@@ -54,48 +48,62 @@ def draw_skeleton(frame, keypoints, color=(0, 255, 0), radius=3):
     """
     # Split into body, left_hand, right_hand
     body = keypoints[:25]
-    left_hand = keypoints[25:46]
-    right_hand = keypoints[46:67]
+    left_hand = keypoints[25:46] if len(keypoints) > 25 else []
+    right_hand = keypoints[46:67] if len(keypoints) > 46 else []
     
-    # Draw body
-    for connection in BODY_CONNECTIONS:
-        if connection[0] < len(body) and connection[1] < len(body):
-            pt1_arr = body[connection[0]]
-            pt2_arr = body[connection[1]]
-            # Check if both points are valid (not zero or negative)
-            if pt1_arr[0] > 0 and pt1_arr[1] > 0 and pt2_arr[0] > 0 and pt2_arr[1] > 0:
-                pt1 = (int(pt1_arr[0]), int(pt1_arr[1]))
-                pt2 = (int(pt2_arr[0]), int(pt2_arr[1]))
-                cv2.line(frame, pt1, pt2, color, 2)
+    # Draw body connections
+    for i, j in BODY_CONNECTIONS:
+        if i < len(body) and j < len(body):
+            pt1 = body[i]
+            pt2 = body[j]
+            if is_valid_point(pt1) and is_valid_point(pt2):
+                cv2.line(frame, 
+                        (int(pt1[0]), int(pt1[1])), 
+                        (int(pt2[0]), int(pt2[1])), 
+                        color, 2)
     
-    # Draw hands
-    for hand, hand_keypoints in [("left", left_hand), ("right", right_hand)]:
-        for connection in HAND_CONNECTIONS:
-            if connection[0] < len(hand_keypoints) and connection[1] < len(hand_keypoints):
-                pt1_arr = hand_keypoints[connection[0]]
-                pt2_arr = hand_keypoints[connection[1]]
-                if pt1_arr[0] > 0 and pt1_arr[1] > 0 and pt2_arr[0] > 0 and pt2_arr[1] > 0:
-                    pt1 = (int(pt1_arr[0]), int(pt1_arr[1]))
-                    pt2 = (int(pt2_arr[0]), int(pt2_arr[1]))
-                    cv2.line(frame, pt1, pt2, color, 1)
+    # Draw left hand connections
+    if len(left_hand) > 0:
+        for i, j in HAND_CONNECTIONS:
+            if i < len(left_hand) and j < len(left_hand):
+                pt1 = left_hand[i]
+                pt2 = left_hand[j]
+                if is_valid_point(pt1) and is_valid_point(pt2):
+                    cv2.line(frame,
+                            (int(pt1[0]), int(pt1[1])),
+                            (int(pt2[0]), int(pt2[1])),
+                            color, 1)
+    
+    # Draw right hand connections
+    if len(right_hand) > 0:
+        for i, j in HAND_CONNECTIONS:
+            if i < len(right_hand) and j < len(right_hand):
+                pt1 = right_hand[i]
+                pt2 = right_hand[j]
+                if is_valid_point(pt1) and is_valid_point(pt2):
+                    cv2.line(frame,
+                            (int(pt1[0]), int(pt1[1])),
+                            (int(pt2[0]), int(pt2[1])),
+                            color, 1)
     
     # Draw keypoints
     for kp in keypoints:
-        if kp[0] > 0 and kp[1] > 0:
+        if is_valid_point(kp):
             cv2.circle(frame, (int(kp[0]), int(kp[1])), radius, color, -1)
     
     return frame
 
 
 def create_comparison_video(original_path, reconstructed_path, output_video, fps=25):
-    """
-    Create side-by-side comparison video
-    """
+    """Create side-by-side comparison video"""
     # Load data
-    original = np.load(original_path)  # [T, 214]
-    reconstructed = np.load(reconstructed_path)  # [T, 214]
+    print("📂 Loading data...")
+    original = np.load(original_path)
+    reconstructed = np.load(reconstructed_path)
     
     T = len(original)
+    print(f"   Frames: {T}")
+    print(f"   Shape: {original.shape}")
     
     # Extract manual features (150 dims = 75 keypoints * 2)
     original_kp = original[:, :150].reshape(T, 75, 2)
@@ -103,12 +111,16 @@ def create_comparison_video(original_path, reconstructed_path, output_video, fps
     
     # Video settings
     width, height = 640, 480
-    frame_width = width * 2  # Side by side
+    frame_width = width * 2
     
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_video, fourcc, fps, (frame_width, height))
     
-    print(f"Creating video with {T} frames...")
+    if not out.isOpened():
+        print("❌ Failed to open video writer!")
+        return
+    
+    print(f"🎬 Creating video with {T} frames...")
     
     for t in tqdm(range(T)):
         # Create blank frames
@@ -205,7 +217,7 @@ def main():
         compute_per_frame_error(args.original, args.reconstructed)
     
     print("\n✅ Done!")
-    print(f"💡 Play video: vlc {args.output_video}")
+    print(f"💡 Download video to view: {args.output_video}")
 
 
 if __name__ == '__main__':
