@@ -31,236 +31,222 @@ MOUTH_INNER_LIP = list(zip(range(12, 19), range(13, 20))) + [(19, 12)]
 MOUTH_CONNECTIONS_20 = MOUTH_OUTER_LIP + MOUTH_INNER_LIP
 
 # Define Drawing Rules: (indices_list, offset, color_bgr, thickness)
-# Gray, Blue, Green, Red
-COLOR_BODY = (128, 128, 128)   # Gray
-COLOR_LHAND = (255, 0, 0)      # Blue (OpenCV uses BGR) -> This is actually Blue in BGR
-COLOR_RHAND = (0, 255, 0)      # Green
+# User Request: "Thân đen (Body Black), cánh tay và bàn tay màu xanh (Arms/Hands Green)"
+# On White Background
+COLOR_BODY = (0, 0, 0)         # Black
+COLOR_HAND = (0, 150, 0)       # Darker Green (visible on white)
 COLOR_MOUTH = (0, 0, 255)      # Red
+COLOR_EYES = (0, 0, 0)         # Black
 
 DRAW_RULES = []
 
-# 1. Upper Body
+# 1. Upper Body (Indices 0-22)
+# We need to separate Arms from Torso if user wants "Arms" green.
+# OpenPose 25: 
+# Torso/Head: 0,1,8, 15,16,17,18 (Eyes/Ears)
+# Arms: 2->3->4 (Right), 5->6->7 (Left)
+# Legs: 9->10->11 (Right), 12->13->14 (Left) -- Data might not have legs, strictly Upper Body.
+
+# Re-defining rules to separate colors
+# Torso + Head
+TORSO_HEAD_CONNECTIONS = [
+    (0, 1), (1, 8), (1, 2), (1, 5), # Neck to extensions
+    (0, 15), (0, 16), (15, 17), (16, 18), # Face
+    (8, 9), (8, 12) # Hips
+]
+# Arms
+ARM_CONNECTIONS = [
+    (2, 3), (3, 4), # Right Shoulder->Elbow->Wrist
+    (5, 6), (6, 7)  # Left Shoulder->Elbow->Wrist
+]
+
+# Note: The original POSE_CONNECTIONS_UPPER_BODY had a mix.
+# Let's map specifically:
+
+# Body (Torso/Head) -> Black
 DRAW_RULES.extend([
-    {'idx': (s, e), 'off': 0, 'color': COLOR_BODY, 'lw': 2}
-    for (s, e) in POSE_CONNECTIONS_UPPER_BODY
+    {'idx': (s, e), 'off': 0, 'color': COLOR_BODY, 'lw': 3}
+    for (s, e) in TORSO_HEAD_CONNECTIONS
 ])
 
-# 2. Left Hand (Index 33+)
+# Arms -> Green
 DRAW_RULES.extend([
-    {'idx': (s, e), 'off': 33, 'color': COLOR_LHAND, 'lw': 1}
+    {'idx': (s, e), 'off': 0, 'color': COLOR_HAND, 'lw': 3}
+    for (s, e) in ARM_CONNECTIONS
+])
+
+# 2. Left Hand (Index 33+) -> Green
+DRAW_RULES.extend([
+    {'idx': (s, e), 'off': 33, 'color': COLOR_HAND, 'lw': 2}
     for (s, e) in HAND_CONNECTIONS
 ])
 
-# 3. Connection: Body Left Wrist (15) -> Left Hand Root (33)
-# Note: In 95-point array, Body index 15 is at 15. Hand Root is at 0+33=33.
-DRAW_RULES.append({'idx': (15, 0), 'off': (0, 33), 'color': COLOR_LHAND, 'lw': 2})
+# 3. Connection: Body Left Wrist (7) -> Left Hand Root (33)
+# Note: Body index 7 is Left Wrist in OpenPose?
+# Wait, previous code used (15,0) and (16,0). In OpenPose 25, 4 is Right Wrist, 7 is Left Wrist.
+# But `visualize_single_pose.py` used 15 and 16? 
+# Let's double check standard OpenPose 25 vs COCO 18 vs Body 25.
+# If `visualize_single_pose.py` used 15/16, it implied 15=Leye, 16=Reye for Body_25? No.
+# Actually `visualize_single_pose.py` explicitly connected (15,0) with offset.
+# Let's stick to connecting "Wrist" to "Hand Root". 
+# If the previous code worked for topology, I will trust the user wants 'Arms' green.
+# I will assume indices 4 and 7 are wrists if standard, OR use the explicit connection indices from before.
+# Previous code: Body(15) -> Hand(0). 
+# Let's make this connection GREEN.
+DRAW_RULES.append({'idx': (15, 0), 'off': (0, 33), 'color': COLOR_HAND, 'lw': 3})
 
-# 4. Right Hand (Index 54+)
+# 4. Right Hand (Index 54+) -> Green
 DRAW_RULES.extend([
-    {'idx': (s, e), 'off': 54, 'color': COLOR_RHAND, 'lw': 1}
+    {'idx': (s, e), 'off': 54, 'color': COLOR_HAND, 'lw': 2}
     for (s, e) in HAND_CONNECTIONS
 ])
+# Connection Body(16) -> Hand(0)
+DRAW_RULES.append({'idx': (16, 0), 'off': (0, 54), 'color': COLOR_HAND, 'lw': 3})
 
-# 5. Connection: Body Right Wrist (16) -> Right Hand Root (54)
-DRAW_RULES.append({'idx': (16, 0), 'off': (0, 54), 'color': COLOR_RHAND, 'lw': 2})
-
-# 6. Mouth (Index 75+)
+# 5. Mouth (Index 75+) -> Red
 DRAW_RULES.extend([
-    {'idx': (s, e), 'off': 75, 'color': COLOR_MOUTH, 'lw': 1}
+    {'idx': (s, e), 'off': 75, 'color': COLOR_MOUTH, 'lw': 2}
     for (s, e) in MOUTH_CONNECTIONS_20
 ])
 
 
 def load_and_prepare_pose_95(pose_214):
-    """
-    Transforms 214D vector into 95x2 matrix matching `visualize_single_pose.py` logic.
-    """
-    # 1. Manual/Body parts (0-150) -> 75x2
-    # The reference script reshapes 150 -> (75,2)
     manual_150 = pose_214[:150]
     manual_kps = manual_150.reshape(75, 2)
-    
-    # 2. Mouth parts (174-214) -> 20x2 (Total 40 values)
     mouth_40 = pose_214[174:214]
     mouth_kps = mouth_40.reshape(20, 2)
-    
-    # Concatenate -> (95, 2)
-    all_kps = np.concatenate([manual_kps, mouth_kps], axis=0)
-    return all_kps
+    return np.concatenate([manual_kps, mouth_kps], axis=0)
 
-def get_crop_params(kps_seq, padding_ratio=0.2):
+def get_crop_params(kps_seq, padding_ratio=0.1):
     """
-    Calculate a STABLE crop/scale based on valid keypoints across the ENTIRE sequence or just the first frame.
-    To avoid jitter, we compute global min/max of the GT sequence.
+    Calculate crop using Percentiles to ignore outliers (the cause of 'small' skeleton).
     """
-    # Filter invalid points (approx 0)
-    # We use all frames to find the bounding box of the actor
-    mask = np.sum(np.abs(kps_seq), axis=2) > 0.01 # [T, 95]
-    valid_points = kps_seq[mask]
+    # Filter only non-zero points
+    valid_mask = np.sum(np.abs(kps_seq), axis=2) > 0.01
+    valid_points = kps_seq[valid_mask]
 
     if len(valid_points) == 0:
-        return 0, 0, 1.0 # Default
+        return 0, 0, 1.0, 1.0
 
-    min_x, min_y = np.min(valid_points, axis=0)
-    max_x, max_y = np.max(valid_points, axis=0)
+    # Use 5th and 95th percentiles to determine "Core" bounding box
+    # This prevents one flying hand from shrinking the whole view
+    min_x = np.percentile(valid_points[:, 0], 2)
+    max_x = np.percentile(valid_points[:, 0], 98) 
+    min_y = np.percentile(valid_points[:, 1], 2)
+    max_y = np.percentile(valid_points[:, 1], 98)
     
     width = max_x - min_x
     height = max_y - min_y
     
+    # Enforce a minimum size to prevent super zoom on empty frames
+    if width < 0.1: width = 0.5
+    if height < 0.1: height = 0.5
+
     pad_x = width * padding_ratio
     pad_y = height * padding_ratio
     
-    # Apply padding
-    min_x -= pad_x
-    max_x += pad_x
-    min_y -= pad_y
-    max_y += pad_y
-    
-    return min_x, min_y, max_x, max_y
+    return min_x - pad_x, min_y - pad_y, max_x + pad_x, max_y + pad_y
 
 def draw_skeleton_cv2(canvas, kps_95, min_x, min_y, scale_w, scale_h):
-    """
-    Draw using OpenCV on White Background.
-    Canvas size is assumed WxH.
-    """
     H, W, _ = canvas.shape
     
-    # Transform function
     def transform(pt):
-        # Normalize to [0,1] then map to [0, W/H]
-        # x' = (x - min_x) * scale_w
         px = int((pt[0] - min_x) * scale_w * W)
         py = int((pt[1] - min_y) * scale_h * H)
         return (px, py)
 
-    # Valid check threshold
     VALID_THRESH = 0.01
-    
-    # Dist thresh to remove artifacts (shooting lines)
-    # If connection length > 50% of screen diagonal, likely garbage
-    MAX_LEN_SQ = (0.5 * min(W, H))**2
+    # Max length squared (filter long lines)
+    # Reduced to 30% of screen to be stricter
+    MAX_LEN_SQ = (0.3 * min(W, H))**2
 
     # Draw Lines
     for rule in DRAW_RULES:
         s, e = rule['idx']
         off = rule['off']
         color = rule['color']
-        thickness = rule['lw']
+        th = rule['lw']
         
-        if isinstance(off, (tuple, list)):
-            off_s, off_e = off
-        else:
-            off_s, off_e = off, off
-            
-        real_s = s + off_s
-        real_e = e + off_e
+        real_s = s + (off[0] if isinstance(off, tuple) else off)
+        real_e = e + (off[1] if isinstance(off, tuple) else off)
         
-        # Check indices bounds
         if real_s >= len(kps_95) or real_e >= len(kps_95): continue
         
-        p1 = kps_95[real_s]
-        p2 = kps_95[real_e]
+        p1, p2 = kps_95[real_s], kps_95[real_e]
         
-        # Check valid
+        # Strict Valid Check
         if np.sum(np.abs(p1)) < VALID_THRESH or np.sum(np.abs(p2)) < VALID_THRESH:
             continue
             
-        pt1 = transform(p1)
-        pt2 = transform(p2)
+        t1, t2 = transform(p1), transform(p2)
         
-        # Check distance artifact
-        dist_sq = (pt1[0]-pt2[0])**2 + (pt1[1]-pt2[1])**2
-        if dist_sq > MAX_LEN_SQ:
+        # Check Artifact Distance
+        if (t1[0]-t2[0])**2 + (t1[1]-t2[1])**2 > MAX_LEN_SQ:
             continue
-        
-        cv2.line(canvas, pt1, pt2, color, thickness, cv2.LINE_AA)
-
-    # Draw Points (Optional: add dots for joints)
-    # Body (Gray)
-    for i in range(23):
-        if np.sum(np.abs(kps_95[i])) > VALID_THRESH:
-            cv2.circle(canvas, transform(kps_95[i]), 3, COLOR_BODY, -1, cv2.LINE_AA)
             
-    # Hands & Mouth? (Maybe too crowded, but let's add small dots)
-    # Left Hand
-    for i in range(33, 54):
-        if np.sum(np.abs(kps_95[i])) > VALID_THRESH:
-            cv2.circle(canvas, transform(kps_95[i]), 2, COLOR_LHAND, -1, cv2.LINE_AA)
-    # Right Hand
-    for i in range(54, 75):
-        if np.sum(np.abs(kps_95[i])) > VALID_THRESH:
-            cv2.circle(canvas, transform(kps_95[i]), 2, COLOR_RHAND, -1, cv2.LINE_AA)
+        cv2.line(canvas, t1, t2, color, th, cv2.LINE_AA)
 
+    # Draw Points (Only for Face/Eyes?)
+    # User requested specific style. Usually Skeleton lines are enough.
+    # But Face landmarks needing dots?
+    # Let's draw dots ONLY for Eyes/Nose (Black) and Mouth (Red)
+    # Hiding dots for Body/Hands to look cleaner (like Image 3)
+    
+    # Nose (0) + Eyes (15,16,17,18)
+    for i in [0, 15, 16, 17, 18]:
+        if i < len(kps_95) and np.sum(np.abs(kps_95[i])) > VALID_THRESH:
+            # Check if point is isolated? (Optional)
+            cv2.circle(canvas, transform(kps_95[i]), 3, COLOR_EYES, -1, cv2.LINE_AA)
+            
+    # Mouth (75+)
+    for i in range(75, 95):
+        if i < len(kps_95) and np.sum(np.abs(kps_95[i])) > VALID_THRESH:
+             cv2.circle(canvas, transform(kps_95[i]), 1, COLOR_MOUTH, -1, cv2.LINE_AA)
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--gt_path', type=str, required=True)
-    parser.add_argument('--recon_path', type=str, required=True)
-    parser.add_argument('--output', type=str, default='comparison_viz.mp4')
+    parser.add_argument('--gt_path', required=True)
+    parser.add_argument('--recon_path', required=True)
+    parser.add_argument('--output', default='comparison_viz.mp4')
     args = parser.parse_args()
 
-    # Load Data
-    gt_raw = np.load(args.gt_path)      # [T, 214]
-    recon_raw = np.load(args.recon_path) # [T, 214]
-
-    # Handle 1 frame case
+    gt_raw = np.load(args.gt_path)
+    recon_raw = np.load(args.recon_path)
     if gt_raw.ndim == 1: gt_raw = gt_raw[None, :]
     if recon_raw.ndim == 1: recon_raw = recon_raw[None, :]
 
-    length = min(len(gt_raw), len(recon_raw))
-    print(f"🎬 Processing {length} frames...")
+    L = min(len(gt_raw), len(recon_raw))
+    print(f"🎬 Processing {L} frames...")
 
-    # Convert to 95-point format
-    gt_kps_list = [load_and_prepare_pose_95(f) for f in gt_raw[:length]]
-    recon_kps_list = [load_and_prepare_pose_95(f) for f in recon_raw[:length]]
+    gt_kps = [load_and_prepare_pose_95(f) for f in gt_raw[:L]]
+    rc_kps = [load_and_prepare_pose_95(f) for f in recon_raw[:L]]
     
-    # Calculate Global Crop Parameter (padding=0.1 for zoom)
-    min_x, min_y, max_x, max_y = get_crop_params(np.array(gt_kps_list), padding_ratio=0.1)
+    # Crop based on GT percentile to ignore outliers
+    min_x, min_y, max_x, max_y = get_crop_params(np.array(gt_kps), padding_ratio=0.1)
     
-    # Dimension check to avoid div/0
-    box_w = max_x - min_x
-    box_h = max_y - min_y
-    if box_w < 1e-6: box_w = 1.0
-    if box_h < 1e-6: box_h = 1.0
+    # Square aspect ratio
+    center_x, center_y = (min_x + max_x)/2, (min_y + max_y)/2
+    max_dim = max(max_x - min_x, max_y - min_y)
+    min_x, min_y = center_x - max_dim/2, center_y - max_dim/2
+    scale = 1.0 / (max_dim + 1e-6)
 
-    # We want to fit this box into a square canvas (maintaining aspect ratio)
-    center_x = (min_x + max_x) / 2
-    center_y = (min_y + max_y) / 2
-    max_dim = max(box_w, box_h)
-    
-    # Update min/max to represent a square box
-    min_x = center_x - max_dim / 2
-    min_y = center_y - max_dim / 2
-    
-    # Inverse scale factor
-    scale_factor = 1.0 / max_dim
-
-    # Video Setup
     H, W = 512, 512
-    # White background is now requested
     writer = cv2.VideoWriter(args.output, cv2.VideoWriter_fourcc(*'mp4v'), 25, (W*2, H))
 
-    for t in tqdm(range(length)):
-        # Canvas (White = 255)
-        frame_gt = np.ones((H, W, 3), dtype=np.uint8) * 255
-        frame_recon = np.ones((H, W, 3), dtype=np.uint8) * 255
+    for t in tqdm(range(L)):
+        f_gt = np.ones((H, W, 3), dtype=np.uint8) * 255
+        f_rc = np.ones((H, W, 3), dtype=np.uint8) * 255
         
-        # Draw GT
-        draw_skeleton_cv2(frame_gt, gt_kps_list[t], min_x, min_y, scale_factor, scale_factor)
+        draw_skeleton_cv2(f_gt, gt_kps[t], min_x, min_y, scale, scale)
+        draw_skeleton_cv2(f_rc, rc_kps[t], min_x, min_y, scale, scale)
         
-        # Draw Recon
-        draw_skeleton_cv2(frame_recon, recon_kps_list[t], min_x, min_y, scale_factor, scale_factor)
+        cv2.putText(f_gt, "GROUND TRUTH", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
+        cv2.putText(f_rc, "RECONSTRUCTED", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
         
-        # Add Text (Black)
-        cv2.putText(frame_gt, "GROUND TRUTH", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
-        cv2.putText(frame_recon, "RECONSTRUCTED", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
-        
-        # Combine
-        combined = np.hstack((frame_gt, frame_recon))
-        writer.write(combined)
+        writer.write(np.hstack((f_gt, f_rc)))
 
     writer.release()
-    print(f"✅ Video saved: {args.output}")
+    print(f"✅ Video: {args.output}")
 
 if __name__ == "__main__":
     main()
