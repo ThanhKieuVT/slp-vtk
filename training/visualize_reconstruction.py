@@ -60,24 +60,29 @@ def draw_skeleton(frame, keypoints, color=(0, 255, 0), radius=3):
     # Draw body
     for connection in BODY_CONNECTIONS:
         if connection[0] < len(body) and connection[1] < len(body):
-            pt1 = tuple(body[connection[0]])
-            pt2 = tuple(body[connection[1]])
-            if np.all(pt1 > 0) and np.all(pt2 > 0):
+            pt1_arr = body[connection[0]]
+            pt2_arr = body[connection[1]]
+            # Check if both points are valid (not zero or negative)
+            if pt1_arr[0] > 0 and pt1_arr[1] > 0 and pt2_arr[0] > 0 and pt2_arr[1] > 0:
+                pt1 = (int(pt1_arr[0]), int(pt1_arr[1]))
+                pt2 = (int(pt2_arr[0]), int(pt2_arr[1]))
                 cv2.line(frame, pt1, pt2, color, 2)
     
     # Draw hands
     for hand, hand_keypoints in [("left", left_hand), ("right", right_hand)]:
         for connection in HAND_CONNECTIONS:
             if connection[0] < len(hand_keypoints) and connection[1] < len(hand_keypoints):
-                pt1 = tuple(hand_keypoints[connection[0]])
-                pt2 = tuple(hand_keypoints[connection[1]])
-                if np.all(pt1 > 0) and np.all(pt2 > 0):
+                pt1_arr = hand_keypoints[connection[0]]
+                pt2_arr = hand_keypoints[connection[1]]
+                if pt1_arr[0] > 0 and pt1_arr[1] > 0 and pt2_arr[0] > 0 and pt2_arr[1] > 0:
+                    pt1 = (int(pt1_arr[0]), int(pt1_arr[1]))
+                    pt2 = (int(pt2_arr[0]), int(pt2_arr[1]))
                     cv2.line(frame, pt1, pt2, color, 1)
     
     # Draw keypoints
     for kp in keypoints:
-        if np.all(kp > 0):
-            cv2.circle(frame, tuple(kp), radius, color, -1)
+        if kp[0] > 0 and kp[1] > 0:
+            cv2.circle(frame, (int(kp[0]), int(kp[1])), radius, color, -1)
     
     return frame
 
