@@ -120,7 +120,7 @@ def get_crop_params(kps_seq, padding_ratio=0.2):
 
 def draw_skeleton_cv2(canvas, kps_95, min_x, min_y, scale_w, scale_h):
     """
-    Draw using OpenCV.
+    Draw using OpenCV on White Background.
     Canvas size is assumed WxH.
     """
     H, W, _ = canvas.shape
@@ -135,6 +135,10 @@ def draw_skeleton_cv2(canvas, kps_95, min_x, min_y, scale_w, scale_h):
 
     # Valid check threshold
     VALID_THRESH = 0.01
+    
+    # Dist thresh to remove artifacts (shooting lines)
+    # If connection length > 50% of screen diagonal, likely garbage
+    MAX_LEN_SQ = (0.5 * min(W, H))**2
 
     # Draw Lines
     for rule in DRAW_RULES:
@@ -163,6 +167,11 @@ def draw_skeleton_cv2(canvas, kps_95, min_x, min_y, scale_w, scale_h):
             
         pt1 = transform(p1)
         pt2 = transform(p2)
+        
+        # Check distance artifact
+        dist_sq = (pt1[0]-pt2[0])**2 + (pt1[1]-pt2[1])**2
+        if dist_sq > MAX_LEN_SQ:
+            continue
         
         cv2.line(canvas, pt1, pt2, color, thickness, cv2.LINE_AA)
 
@@ -205,8 +214,8 @@ def main():
     gt_kps_list = [load_and_prepare_pose_95(f) for f in gt_raw[:length]]
     recon_kps_list = [load_and_prepare_pose_95(f) for f in recon_raw[:length]]
     
-    # Calculate Global Crop Parameter derived from GT (to ensure stability)
-    min_x, min_y, max_x, max_y = get_crop_params(np.array(gt_kps_list))
+    # Calculate Global Crop Parameter (padding=0.1 for zoom)
+    min_x, min_y, max_x, max_y = get_crop_params(np.array(gt_kps_list), padding_ratio=0.1)
     
     # Dimension check to avoid div/0
     box_w = max_x - min_x
@@ -215,16 +224,6 @@ def main():
     if box_h < 1e-6: box_h = 1.0
 
     # We want to fit this box into a square canvas (maintaining aspect ratio)
-    # But usually we map normalized 0..1 to W,H. 
-    # Here we map [min_x, max_x] -> [0, 1] relative to the box?
-    # Simpler: Map [min_x, max_x] to the Canvas Width with padding.
-    # To keep aspect ratio, we use the larger dimension as the 'scale' base.
-    
-    # Let's define the scaling factor to map the "box" to "canvas"
-    # Ideally, we center the box.
-    # New logic: transform returns normalized 0..1 coordinates relative to Box
-    # But we need Square Box to keep Aspect Ratio.
-    
     center_x = (min_x + max_x) / 2
     center_y = (min_y + max_y) / 2
     max_dim = max(box_w, box_h)
@@ -232,31 +231,29 @@ def main():
     # Update min/max to represent a square box
     min_x = center_x - max_dim / 2
     min_y = center_y - max_dim / 2
-    # max_x = center_x + max_dim / 2
-    # max_y = center_y + max_dim / 2
     
     # Inverse scale factor
     scale_factor = 1.0 / max_dim
 
     # Video Setup
     H, W = 512, 512
-    # Black background is standard for these visualizations
+    # White background is now requested
     writer = cv2.VideoWriter(args.output, cv2.VideoWriter_fourcc(*'mp4v'), 25, (W*2, H))
 
     for t in tqdm(range(length)):
-        # Canvas (Black)
-        frame_gt = np.zeros((H, W, 3), dtype=np.uint8)
-        frame_recon = np.zeros((H, W, 3), dtype=np.uint8)
+        # Canvas (White = 255)
+        frame_gt = np.ones((H, W, 3), dtype=np.uint8) * 255
+        frame_recon = np.ones((H, W, 3), dtype=np.uint8) * 255
         
         # Draw GT
         draw_skeleton_cv2(frame_gt, gt_kps_list[t], min_x, min_y, scale_factor, scale_factor)
         
-        # Draw Recon (Using SAME scaling params as GT for fair comparison and stability)
+        # Draw Recon
         draw_skeleton_cv2(frame_recon, recon_kps_list[t], min_x, min_y, scale_factor, scale_factor)
         
-        # Add Text
-        cv2.putText(frame_gt, "GROUND TRUTH", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-        cv2.putText(frame_recon, "RECONSTRUCTED", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        # Add Text (Black)
+        cv2.putText(frame_gt, "GROUND TRUTH", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+        cv2.putText(frame_recon, "RECONSTRUCTED", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
         
         # Combine
         combined = np.hstack((frame_gt, frame_recon))
