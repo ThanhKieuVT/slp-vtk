@@ -5,254 +5,246 @@ from matplotlib.lines import Line2D
 from scipy.signal import savgol_filter
 import pandas as pd
 import argparse
-import os
 
-# --- STYLE DEFINITION (Teal/Black/Red logic from check_extraction_result.py) ---
+# --- STYLE DEFINITION ---
 COLOR_SIDE = "#156551"   # Dark Teal
 COLOR_TRUNK = '#000000'  # Black
 COLOR_MOUTH = '#c0392b'  # Dark Red
 
-# Topology Indices (95-point format)
-# 0-10: Face
-# 11-12-23-24: Torso Box
-# 11-13-15: Left Arm, 12-14-16: Right Arm
-# 33-53: Left Hand, 54-74: Right Hand
-# 75-94: Mouth
-
+# Định nghĩa kết nối tay (20 đoạn cho 21 điểm)
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
     (0, 9), (9, 10), (10, 11), (11, 12), (0, 13), (13, 14), (14, 15), (15, 16),
     (0, 17), (17, 18), (18, 19), (19, 20)
 ]
-MOUTH_CONNECTIONS = list(zip(range(0, 19), range(1, 20))) + [(19, 0)]
+# Định nghĩa kết nối mặt (Face contour cơ bản)
 FACE_PAIRS = [(0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8), (9, 10)]
 
-# Build Connection List for Matplotlib
+# Định nghĩa kết nối Môi (Nếu có dữ liệu)
+MOUTH_CONNECTIONS = list(zip(range(0, 19), range(1, 20))) + [(19, 0)]
+
+# Build Connection List
 ALL_CONNECTIONS = []
 
-# 1. Torso & Arms (Teal Sides, Black Trunk)
-# Left Arm
+# 1. Torso & Arms
 ALL_CONNECTIONS.append({'indices': (11, 13), 'offset': 0, 'color': COLOR_SIDE, 'lw': 2.5})
 ALL_CONNECTIONS.append({'indices': (13, 15), 'offset': 0, 'color': COLOR_SIDE, 'lw': 2.5})
-# Right Arm
 ALL_CONNECTIONS.append({'indices': (12, 14), 'offset': 0, 'color': COLOR_SIDE, 'lw': 2.5})
 ALL_CONNECTIONS.append({'indices': (14, 16), 'offset': 0, 'color': COLOR_SIDE, 'lw': 2.5})
-# Torso Box (Black)
+# Torso Box
 for pair in [(11, 12), (11, 23), (12, 24), (23, 24)]:
     ALL_CONNECTIONS.append({'indices': pair, 'offset': 0, 'color': COLOR_TRUNK, 'lw': 2})
 
-# 2. Face (Black)
+# 2. Face
 for pair in FACE_PAIRS:
     ALL_CONNECTIONS.append({'indices': pair, 'offset': 0, 'color': COLOR_TRUNK, 'lw': 1.5})
 
-# 3. Hands (Teal)
-# Left Hand
+# 3. Hands 
+# Left Hand (Offset 33)
 ALL_CONNECTIONS.extend([{'indices': (s, e), 'offset': 33, 'color': COLOR_SIDE, 'lw': 1.5} for (s, e) in HAND_CONNECTIONS])
-# Connect L_Wrist(15) -> L_Hand_Root(33)
+# Kết nối cổ tay trái (15) vào gốc bàn tay trái (33 -> index 0 của hand)
 ALL_CONNECTIONS.append({'indices': (15, 0), 'offset': (0, 33), 'color': COLOR_SIDE, 'lw': 2})
 
-# Right Hand
+# Right Hand (Offset 54)
 ALL_CONNECTIONS.extend([{'indices': (s, e), 'offset': 54, 'color': COLOR_SIDE, 'lw': 1.5} for (s, e) in HAND_CONNECTIONS])
-# Connect R_Wrist(16) -> R_Hand_Root(54)
+# Kết nối cổ tay phải (16) vào gốc bàn tay phải (54 -> index 0 của hand)
 ALL_CONNECTIONS.append({'indices': (16, 0), 'offset': (0, 54), 'color': COLOR_SIDE, 'lw': 2})
 
-# 4. Mouth (Red)
+# 4. Mouth (Offset 75) - Chỉ vẽ nếu dữ liệu đủ 95 điểm
+# Nếu dữ liệu chỉ có 75 điểm (body+hands), phần này sẽ được check khi vẽ để tránh lỗi
 ALL_CONNECTIONS.extend([{'indices': (s, e), 'offset': 75, 'color': COLOR_MOUTH, 'lw': 1.5} for (s, e) in MOUTH_CONNECTIONS])
 
-# Joints to Plot (Scatter)
+# Joints to Plot
 IDX_TEAL = [13, 15] + [33+i for i in range(21)] + [14, 16] + [54+i for i in range(21)]
 IDX_BLACK = [0, 11, 12, 23, 24]
-# Eyes: Based on check_extraction_result.py, we use indices 2 and 5 (Face)
 IDX_EYES = [2, 5] 
 
-
 class DataProcessor:
-    """ Implements Interpolation, Stabilization, and Smoothing from check_extraction_result.py """
-    def process(self, pose_214):
-        # Convert 214 -> 95x2
-        manual_150 = pose_214[:150]
-        manual_kps = manual_150.reshape(75, 2)
-        mouth_40 = pose_214[174:214]
-        mouth_kps = mouth_40.reshape(20, 2)
-        kps = np.concatenate([manual_kps, mouth_kps], axis=0) # [95, 2]
-        return kps
-
     def process_sequence(self, kps_seq):
-        # kps_seq: [T, 95, 2]
+        # kps_seq: [T, N, 2]
         T = kps_seq.shape[0]
         kps_clean = kps_seq.copy()
         
-        # 1. Interpolation (Fill NaNs/Zeros)
+        # 1. Interpolation & NaN Handling
         for i in range(kps_clean.shape[1]):
             for c in range(2):
                 signal = kps_clean[:, i, c]
-                # Treat near-zero as missing
+                # Coi các điểm xấp xỉ 0 là bị mất (NaN) để Matplotlib không vẽ
                 signal[np.abs(signal) < 0.001] = np.nan
+                
+                # Nội suy để lấp khoảng trống
                 series = pd.Series(signal)
                 series = series.interpolate(method='linear', limit_direction='both')
-                series = series.fillna(0)
-                kps_clean[:, i, c] = series.to_numpy()
                 
-        # 2. Stabilization (Center Neck)
-        # Neck is average of Shoulders (11, 12)
+                # KHÔNG fillna(0) nữa. Nếu vẫn còn NaN (đầu/cuối video), để nguyên là NaN.
+                # Matplotlib sẽ tự động bỏ qua không vẽ điểm NaN -> Môi sẽ không bị bay về (0,0)
+                kps_clean[:, i, c] = series.to_numpy()
+
+        # 2. "Hàn" khớp cổ tay (Wrist Gluing)
+        # Gán tọa độ gốc bàn tay (Hand Root) bằng đúng tọa độ cổ tay (Wrist)
+        # Left: Wrist=15, HandRoot=33
+        kps_clean[:, 33, :] = kps_clean[:, 15, :] 
+        # Right: Wrist=16, HandRoot=54
+        kps_clean[:, 54, :] = kps_clean[:, 16, :]
+
+        # 3. Stabilization (Center Neck at 0,0)
         shoulder_L = kps_clean[:, 11, :]
         shoulder_R = kps_clean[:, 12, :]
         neck_center = (shoulder_L + shoulder_R) / 2 # [T, 2]
-        global_neck_mean = np.mean(neck_center, axis=0)
         
-        # Shift all points so neck is stable at global mean
-        stabilized_kps = kps_clean - neck_center[:, np.newaxis, :] + global_neck_mean
+        # Trừ tâm (nếu điểm là NaN, kết quả vẫn là NaN -> Tốt)
+        stabilized_kps = kps_clean - neck_center[:, np.newaxis, :]
         
-        # 3. Smoothing (Savgol)
+        # 4. Smoothing (Savgol)
         final_kps = stabilized_kps.copy()
-        window = 7
+        window = 15
+        poly = 3
+        
         if T > window:
             for i in range(final_kps.shape[1]):
                 for c in range(2):
+                    # Chỉ smooth nếu không có quá nhiều NaN
                     try:
-                        final_kps[:, i, c] = savgol_filter(final_kps[:, i, c], window, 2)
+                        mask = ~np.isnan(final_kps[:, i, c])
+                        if np.sum(mask) > window:
+                            final_kps[mask, i, c] = savgol_filter(final_kps[mask, i, c], window, poly)
                     except: pass
                     
         return final_kps
 
 
 def animate_poses(gt_path, recon_path, output_path):
-    # Load
-    gt_raw = np.load(gt_path)      # [T, 214]
-    recon_raw = np.load(recon_path) # [T, 214]
+    gt_data = np.load(gt_path)
+    recon_data = np.load(recon_path)
     
-    if gt_raw.ndim == 1: gt_raw = gt_raw[None, :]
-    if recon_raw.ndim == 1: recon_raw = recon_raw[None, :]
+    gt_kps = gt_data['keypoints']
+    recon_kps = recon_data['keypoints']
     
-    # Process
+    # Kiểm tra xem dữ liệu có đủ 95 điểm (có môi) hay không
+    has_mouth = gt_kps.shape[1] >= 95
+    if not has_mouth:
+        print("⚠️ Data only has 75 points. Mouth visualization will be skipped.")
+
     processor = DataProcessor()
-    
-    # Convert to 95pts
-    gt_kps = np.array([processor.process(f) for f in gt_raw])
-    recon_kps = np.array([processor.process(f) for f in recon_raw])
-    
-    # Apply Smoothing/Stabilization
     gt_kps = processor.process_sequence(gt_kps)
     recon_kps = processor.process_sequence(recon_kps)
     
-    # Sync length
     T = min(len(gt_kps), len(recon_kps))
     gt_kps = gt_kps[:T]
     recon_kps = recon_kps[:T]
     
-    # Setup Figure (Matplotlib)
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6), dpi=120)
-    # fig.patch.set_facecolor('white')
     
-    # Prepare Axes
     def setup_ax(ax, title):
         ax.set_title(title, fontsize=14, fontweight='bold', pad=10)
-        ax.invert_yaxis() # Image coord system
+        ax.invert_yaxis()
         ax.set_aspect('equal')
-        # ax.axis('off') # HIDDEN: User wants the box!
-        
-        # Show box, hide ticks
         ax.set_xticks([])
         ax.set_yticks([])
         for spine in ax.spines.values():
             spine.set_visible(True)
             spine.set_color('black')
-            spine.set_linewidth(1)
         
-        # Setup Lines
         lines = []
         for item in ALL_CONNECTIONS:
+            # Check nếu là môi (offset 75) mà dữ liệu không đủ thì skip
+            if item['offset'] == 75 and not has_mouth:
+                continue
+                
             line = Line2D([], [], color=item['color'], lw=item['lw'], solid_capstyle='round')
             ax.add_line(line)
             lines.append(line)
             
-        # Setup Scatters
-        # 0: Teal Small, 1: Black Med, 2: Eyes Large
         s_teal = ax.scatter([], [], s=15, c=COLOR_SIDE, zorder=5)
         s_black = ax.scatter([], [], s=20, c=COLOR_TRUNK, zorder=5)
         s_eyes = ax.scatter([], [], s=40, c=COLOR_TRUNK, zorder=6)
         
-        return lines, [s_teal, s_black, s_eyes]
+        # Thêm scatter cho môi nếu có
+        s_mouth = None
+        if has_mouth:
+            s_mouth = ax.scatter([], [], s=10, c=COLOR_MOUTH, zorder=6)
+        
+        return lines, [s_teal, s_black, s_eyes, s_mouth]
 
     lines1, scatters1 = setup_ax(ax1, "GROUND TRUTH")
     lines2, scatters2 = setup_ax(ax2, "RECONSTRUCTED")
     
-    # Global Zoom (Based on GT Torso)
-    # Use first few frames to determine zoom to match checking script logic
-    # Or use average of entire sequence
+    # Auto Zoom Logic
     torso_pts = gt_kps[:, [11, 12, 23, 24], :]
-    valid_torso = torso_pts[np.sum(np.abs(torso_pts), axis=2) > 0.01]
+    # Chỉ lấy các điểm không phải NaN
+    valid_mask = ~np.isnan(torso_pts).any(axis=2)
+    valid_torso = torso_pts[valid_mask]
+    
     if len(valid_torso) > 0:
-        min_xy = np.min(valid_torso, axis=0)
-        max_xy = np.max(valid_torso, axis=0)
+        min_xy = np.nanmin(valid_torso, axis=0)
+        max_xy = np.nanmax(valid_torso, axis=0)
         ctr = (min_xy + max_xy) / 2
         h = max_xy[1] - min_xy[1]
         r = h * 1.5 if h > 0.1 else 0.5
-        
-        # Apply to both
         for ax in [ax1, ax2]:
             ax.set_xlim(ctr[0] - r, ctr[0] + r)
-            ax.set_ylim(ctr[1] + r, ctr[1] - r) # Y inverted
+            ax.set_ylim(ctr[1] + r, ctr[1] - r)
     else:
-        # Fallback
         for ax in [ax1, ax2]:
             ax.set_xlim(-1, 1); ax.set_ylim(1, -1)
 
     def update(frame):
-        # Helper to update one subplot
         def update_plot(kps, lines, scatters):
             # Lines
-            for line, item in zip(lines, ALL_CONNECTIONS):
+            line_idx = 0
+            for item in ALL_CONNECTIONS:
+                if item['offset'] == 75 and not has_mouth:
+                    continue
+                
                 s, e = item['indices']
                 off = item['offset']
                 if isinstance(off, tuple): s, e = s+off[0], e+off[1]
                 else: s, e = s+off, e+off
                 
-                if s >= len(kps) or e >= len(kps): continue
+                if s >= kps.shape[0] or e >= kps.shape[0]: 
+                    line_idx += 1
+                    continue
                 
                 p1, p2 = kps[s], kps[e]
-                # Simple valid check
-                if np.sum(np.abs(p1)) > 0.01 and np.sum(np.abs(p2)) > 0.01:
-                    line.set_data([p1[0], p2[0]], [p1[1], p2[1]])
+                # Chỉ vẽ nếu cả 2 điểm không phải là NaN
+                if not np.isnan(p1).any() and not np.isnan(p2).any():
+                    lines[line_idx].set_data([p1[0], p2[0]], [p1[1], p2[1]])
                 else:
-                    line.set_data([], [])
+                    lines[line_idx].set_data([], [])
+                line_idx += 1
             
-            # Scatters
-            # Teal
-            pts_teal = kps[IDX_TEAL]
-            scatters[0].set_offsets(pts_teal[np.sum(np.abs(pts_teal), axis=1) > 0.01])
-            # Black
-            pts_black = kps[IDX_BLACK]
-            scatters[1].set_offsets(pts_black[np.sum(np.abs(pts_black), axis=1) > 0.01])
-            # Eyes
-            pts_eyes = kps[IDX_EYES]
-            scatters[2].set_offsets(pts_eyes[np.sum(np.abs(pts_eyes), axis=1) > 0.01])
+            # Scatters helper
+            def set_valid_offsets(scatter_obj, indices):
+                if scatter_obj is None: return
+                pts = kps[indices]
+                # Lọc bỏ NaN
+                valid = ~np.isnan(pts).any(axis=1)
+                scatter_obj.set_offsets(pts[valid])
+
+            set_valid_offsets(scatters[0], IDX_TEAL)
+            set_valid_offsets(scatters[1], IDX_BLACK)
+            set_valid_offsets(scatters[2], IDX_EYES)
             
-            return lines + scatters
+            if has_mouth and scatters[3] is not None:
+                # Môi là từ 75 đến 94
+                idx_mouth = list(range(75, 95))
+                set_valid_offsets(scatters[3], idx_mouth)
+            
+            return lines + [s for s in scatters if s is not None]
 
         artists = []
         artists += update_plot(gt_kps[frame], lines1, scatters1)
         artists += update_plot(recon_kps[frame], lines2, scatters2)
-        
         fig.suptitle(f'Frame {frame} / {T}', fontsize=12)
         return artists
 
     print(f"🎬 Generating Animation ({T} frames)...")
     ani = animation.FuncAnimation(fig, update, frames=T, blit=True, interval=40)
-    
-    # Save
-    # Try using ffmpeg, fall back to pillow if needed, but MP4 requested
     try:
         ani.save(output_path, writer='ffmpeg', fps=25, dpi=100)
+        print(f"✅ Video saved: {output_path}")
     except Exception as e:
-        print(f"⚠️ FFmpeg error: {e}. Trying Pillow (GIF)...")
-        gif_path = output_path.replace('.mp4', '.gif')
-        ani.save(gif_path, writer='pillow', fps=25)
-        print(f"Saved as GIF instead: {gif_path}")
-        return
-
-    print(f"✅ Video saved: {output_path}")
-    plt.close()
+        print(f"⚠️ Error: {e}")
 
 def main():
     parser = argparse.ArgumentParser()

@@ -1,7 +1,13 @@
 """
+Date: 8 JAN 2026
 Script: Check Autoencoder Reconstruction Quality (Stage 1)
 ✅ FIXED: Tương thích với grouped normalization (manual + NMM)
 Mục đích: Kiểm tra chất lượng tái tạo của Autoencoder
+
+python /Users/kieuvo/Learn/Research/SL/Implement/SignFML/slp-vtk/tools/check_clean_data.py \
+  --before_dir "/Users/kieuvo/Learn/Research/SL/Implement/SignFML/slp-vtk/data/RWTH/PHOENIX-2014-T-release-v3/processed_data/data" \
+  --after_dir "/Users/kieuvo/Learn/Research/SL/Implement/SignFML/slp-vtk/data/RWTH/PHOENIX-2014-T-release-v3/processed_data/data_clean" \
+  --sample_size 20
 """
 
 import torch
