@@ -44,6 +44,29 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
         
         loss = loss.sum() / total_valid_elements
         
+        # ✅ Velocity Loss for temporal smoothness (SOTA improvement)
+        # Compute first-order difference (velocity)
+        if poses.shape[1] > 1:  # Only if sequence has more than 1 frame
+            vel_recon = reconstructed_pose[:, 1:] - reconstructed_pose[:, :-1]  # [B, T-1, 214]
+            vel_gt = poses[:, 1:] - poses[:, :-1]  # [B, T-1, 214]
+            
+            loss_velocity = nn.functional.mse_loss(
+                vel_recon,
+                vel_gt,
+                reduction='none'
+            )  # [B, T-1, 214]
+            
+            # Mask out padding for velocity (shift mask by 1)
+            vel_mask = pose_mask[:, 1:].unsqueeze(-1).float()  # [B, T-1, 1]
+            loss_velocity = loss_velocity * vel_mask
+            
+            # Scale velocity loss
+            num_valid_vel = vel_mask.sum().clamp(min=1) * num_features
+            loss_velocity = loss_velocity.sum() / num_valid_vel
+            
+            # Combine losses (velocity weight = 0.1)
+            loss = loss + 0.1 * loss_velocity
+        
         # Backward
         optimizer.zero_grad()
         loss.backward()

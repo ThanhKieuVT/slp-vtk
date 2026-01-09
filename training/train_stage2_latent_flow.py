@@ -392,6 +392,20 @@ def main():
                 with torch.no_grad():
                     gt_latent = ae.encode(poses) / latent_scale
                 
+                # ✅ Classifier-Free Guidance (CFG) Dropout (SOTA improvement)
+                # With probability p=0.15, replace text features with zeros
+                # This enables unconditional generation for CFG at inference
+                cfg_dropout_prob = 0.15
+                if np.random.rand() < cfg_dropout_prob:
+                    # Create null embeddings
+                    if 'text_tokens' in batch_dict:
+                        # Zero out text tokens and attention mask
+                        batch_dict = {
+                            'text_tokens': torch.zeros_like(batch_dict['text_tokens']),
+                            'attention_mask': torch.zeros_like(batch_dict['attention_mask']),
+                            'seq_lengths': batch_dict['seq_lengths']
+                        }
+                
                 optimizer.zero_grad()
                 
                 with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):

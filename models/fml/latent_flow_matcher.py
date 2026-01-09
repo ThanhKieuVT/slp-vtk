@@ -197,11 +197,12 @@ class LatentFlowMatcher(nn.Module):
     @torch.no_grad()
     def sample(self, batch, steps=50, device='cuda', temperature=1.0,
                text_features=None, text_mask=None, max_seq_len=400,
-               latent_scale=1.0):
+               latent_scale=1.0, cfg_scale=1.5):
         """
-        Inference sampling
+        Inference sampling with Classifier-Free Guidance (CFG)
         
         Args:
+            cfg_scale: Guidance scale for CFG (1.0 = no guidance, 1.5-2.0 recommended)
             latent_scale: Scale factor used during training
         """
         if text_features is None:
@@ -223,15 +224,36 @@ class LatentFlowMatcher(nn.Module):
         # 3. Initialize noise
         z = torch.randn(B, T, self.latent_dim, device=device) * temperature
         
-        # 4. Euler integration
+        # ✅ Prepare null embeddings for CFG (unconditional)
+        use_cfg = cfg_scale != 1.0
+        null_text_features = None
+        null_text_mask = None
+        if use_cfg:
+            null_text_features = torch.zeros_like(text_features)
+            null_text_mask = torch.zeros_like(text_mask)
+        
+        # 4. Euler integration with CFG
         dt = 1.0 / steps
         for step in range(steps):
             t_val = step / steps
             t = torch.full((B,), t_val, device=device)
             
-            v_pred = self._compute_velocity(
+            # Conditional velocity
+            v_cond = self._compute_velocity(
                 z, t, text_features, text_mask, valid_mask
             )
+            
+            # Apply CFG if enabled
+            if use_cfg:
+                # Unconditional velocity (null text)
+                v_uncond = self._compute_velocity(
+                    z, t, null_text_features, null_text_mask, valid_mask
+                )
+                
+                # Guided velocity: v = v_uncond + cfg_scale * (v_cond - v_uncond)
+                v_pred = v_uncond + cfg_scale * (v_cond - v_uncond)
+            else:
+                v_pred = v_cond
             
             z = z + v_pred * dt
             z = z * valid_mask.unsqueeze(-1).float()
