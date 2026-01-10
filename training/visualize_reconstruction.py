@@ -1,3 +1,9 @@
+"""
+FIXED Visualization for 214D Format
+[T, 214] = 150 (manual keypoints) + 64 (NMM features)
+  - 0:150   → 75 points × 2 (Body + Hands)
+  - 150:214 → 64 NMM (17 AU + 3 Head + 4 Gaze + 40 Mouth)
+"""
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
@@ -6,289 +12,337 @@ from scipy.signal import savgol_filter
 import pandas as pd
 import argparse
 
-# --- STYLE DEFINITION ---
-COLOR_SIDE = "#156551"   # Dark Teal
-COLOR_TRUNK = '#000000'  # Black
-COLOR_MOUTH = '#c0392b'  # Dark Red
+# ===== STYLE =====
+COLOR_BODY = "#156551"   # Teal for limbs
+COLOR_TRUNK = '#000000'  # Black for torso
+COLOR_MOUTH = '#c0392b'  # Red for mouth
 
-# Định nghĩa kết nối tay (20 đoạn cho 21 điểm)
-HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
-    (0, 9), (9, 10), (10, 11), (11, 12), (0, 13), (13, 14), (14, 15), (15, 16),
-    (0, 17), (17, 18), (18, 19), (19, 20)
+# ===== MediaPipe POSE CONNECTIONS (33 landmarks) =====
+POSE_CONNECTIONS = [
+    # Face
+    (0, 1), (1, 2), (2, 3), (3, 7),
+    (0, 4), (4, 5), (5, 6), (6, 8),
+    (9, 10),  # Mouth
+    # Torso
+    (11, 12), (11, 23), (12, 24), (23, 24),
+    # Arms
+    (11, 13), (13, 15), (12, 14), (14, 16),
+    # Legs (if present)
+    (23, 25), (25, 27), (27, 29), (29, 31),
+    (24, 26), (26, 28), (28, 30), (30, 32),
+    (27, 31), (28, 32)
 ]
-# Định nghĩa kết nối mặt (Face contour cơ bản)
-FACE_PAIRS = [(0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8), (9, 10)]
 
-# Định nghĩa kết nối Môi (Nếu có dữ liệu)
-MOUTH_CONNECTIONS = list(zip(range(0, 19), range(1, 20))) + [(19, 0)]
+# ===== HAND CONNECTIONS (21 landmarks each) =====
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),      # Thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),      # Index
+    (0, 9), (9, 10), (10, 11), (11, 12), # Middle
+    (0, 13), (13, 14), (14, 15), (15, 16), # Ring
+    (0, 17), (17, 18), (18, 19), (19, 20), # Pinky
+    (5, 9), (9, 13), (13, 17)            # Palm
+]
 
-# Build Connection List
-ALL_CONNECTIONS = []
+# ===== MOUTH OUTLINE (20 points) =====
+MOUTH_CONNECTIONS = [(i, (i+1)%20) for i in range(20)]
 
-# 1. Torso & Arms
-ALL_CONNECTIONS.append({'indices': (11, 13), 'offset': 0, 'color': COLOR_SIDE, 'lw': 2.5})
-ALL_CONNECTIONS.append({'indices': (13, 15), 'offset': 0, 'color': COLOR_SIDE, 'lw': 2.5})
-ALL_CONNECTIONS.append({'indices': (12, 14), 'offset': 0, 'color': COLOR_SIDE, 'lw': 2.5})
-ALL_CONNECTIONS.append({'indices': (14, 16), 'offset': 0, 'color': COLOR_SIDE, 'lw': 2.5})
-# Torso Box
-for pair in [(11, 12), (11, 23), (12, 24), (23, 24)]:
-    ALL_CONNECTIONS.append({'indices': pair, 'offset': 0, 'color': COLOR_TRUNK, 'lw': 2})
 
-# 2. Face
-for pair in FACE_PAIRS:
-    ALL_CONNECTIONS.append({'indices': pair, 'offset': 0, 'color': COLOR_TRUNK, 'lw': 1.5})
-
-# 3. Hands 
-# Left Hand (Offset 33)
-ALL_CONNECTIONS.extend([{'indices': (s, e), 'offset': 33, 'color': COLOR_SIDE, 'lw': 1.5} for (s, e) in HAND_CONNECTIONS])
-# Kết nối cổ tay trái (15) vào gốc bàn tay trái (33 -> index 0 của hand)
-ALL_CONNECTIONS.append({'indices': (15, 0), 'offset': (0, 33), 'color': COLOR_SIDE, 'lw': 2})
-
-# Right Hand (Offset 54)
-ALL_CONNECTIONS.extend([{'indices': (s, e), 'offset': 54, 'color': COLOR_SIDE, 'lw': 1.5} for (s, e) in HAND_CONNECTIONS])
-# Kết nối cổ tay phải (16) vào gốc bàn tay phải (54 -> index 0 của hand)
-ALL_CONNECTIONS.append({'indices': (16, 0), 'offset': (0, 54), 'color': COLOR_SIDE, 'lw': 2})
-
-# 4. Mouth (Offset 75) - Chỉ vẽ nếu dữ liệu đủ 95 điểm
-ALL_CONNECTIONS.extend([{'indices': (s, e), 'offset': 75, 'color': COLOR_MOUTH, 'lw': 1.5} for (s, e) in MOUTH_CONNECTIONS])
-
-# Joints to Plot (FIXED: Use these for scatter)
-IDX_TEAL = [13, 15] + [33+i for i in range(21)] + [14, 16] + [54+i for i in range(21)]
-IDX_BLACK = [0, 11, 12, 23, 24]
-IDX_EYES = [2, 5]  # Correct eye indices for MediaPipe
-
-class DataProcessor:
-    def process_sequence(self, kps_seq):
-        # kps_seq: [T, N, 2]
-        T = kps_seq.shape[0]
-        kps_clean = kps_seq.copy()
+class PoseProcessor:
+    """Process 214D pose data"""
+    
+    def extract_keypoints(self, pose_214):
+        """
+        Extract keypoints from 214D format
         
-        # 1. Interpolation & NaN Handling
-        for i in range(kps_clean.shape[1]):
-            for c in range(2):
-                signal = kps_clean[:, i, c]
-                # Coi các điểm xấp xỉ 0 là bị mất (NaN) để Matplotlib không vẽ
-                signal[np.abs(signal) < 0.001] = np.nan
-                
-                # Nội suy để lấp khoảng trống
-                series = pd.Series(signal)
-                series = series.interpolate(method='linear', limit_direction='both')
-                
-                kps_clean[:, i, c] = series.to_numpy()
-
-        # 2. Wrist Gluing (RE-ENABLED)
-        # Gán tọa độ gốc bàn tay (Hand Root) bằng đúng tọa độ cổ tay (Wrist)
-        kps_clean[:, 33, :] = kps_clean[:, 15, :]  # Left
-        kps_clean[:, 54, :] = kps_clean[:, 16, :]  # Right
-
-        # 3. Stabilization (RE-ENABLED)
-        shoulder_L = kps_clean[:, 11, :]
-        shoulder_R = kps_clean[:, 12, :]
-        neck_center = (shoulder_L + shoulder_R) / 2
-        stabilized_kps = kps_clean - neck_center[:, np.newaxis, :]
+        Args:
+            pose_214: [T, 214]
         
-        # 4. Smoothing (Savgol)
-        final_kps = stabilized_kps.copy()
-        window = 15
-        poly = 3
+        Returns:
+            dict with:
+                'body': [T, 33, 2]
+                'left_hand': [T, 21, 2]
+                'right_hand': [T, 21, 2]
+                'mouth': [T, 20, 2]
+        """
+        T = pose_214.shape[0]
         
-        if T > window:
-            for i in range(final_kps.shape[1]):
+        # Extract manual keypoints [0:150] → reshape to [T, 75, 2]
+        manual = pose_214[:, :150].reshape(T, 75, 2)
+        
+        # Split into components (MediaPipe standard)
+        body = manual[:, :33, :]        # Pose landmarks
+        left_hand = manual[:, 33:54, :]  # Left hand (21 points)
+        right_hand = manual[:, 54:75, :] # Right hand (21 points)
+        
+        # Extract mouth from NMM [174:214] → 40 dims = 20 points × 2
+        mouth_flat = pose_214[:, 174:214]
+        mouth = mouth_flat.reshape(T, 20, 2)
+        
+        return {
+            'body': body,
+            'left_hand': left_hand,
+            'right_hand': right_hand,
+            'mouth': mouth
+        }
+    
+    def clean_and_smooth(self, keypoints_dict):
+        """Clean NaN, interpolate, smooth"""
+        
+        def process_component(kps):
+            """Process [T, N, 2] component"""
+            T, N, _ = kps.shape
+            kps_clean = kps.copy()
+            
+            # 1. Mark near-zero as NaN
+            mask = np.abs(kps_clean).sum(axis=-1) < 0.001
+            kps_clean[mask] = np.nan
+            
+            # 2. Interpolate
+            for i in range(N):
                 for c in range(2):
-                    try:
-                        signal = final_kps[:, i, c]
-                        mask = ~np.isnan(signal)
-                        if np.sum(mask) > window:
-                            # Only smooth if continuous segment is long enough
-                            final_kps[mask, i, c] = savgol_filter(signal[mask], window, poly)
-                    except:
-                        pass
-                    
-        return final_kps
-
-
-def animate_poses(gt_path, recon_path, output_path):
-    # Auto-detect and load both .npy and .npz formats
-    try:
-        gt_data = np.load(gt_path, allow_pickle=True)
-        recon_data = np.load(recon_path, allow_pickle=True)
-    except Exception as e:
-        print(f"❌ Error loading files: {e}")
-        return
-
-    # Helper to standardize to [T, N, 2]
-    def to_standard_format(data):
-        # 1. Extract array if dict
-        if isinstance(data, dict):
-            if 'keypoints' in data: kps = data['keypoints']
-            elif 'pose' in data: kps = data['pose']
-            else: kps = list(data.values())[0]
-        elif isinstance(data, np.lib.npyio.NpzFile):
-            kps = data['keypoints']
-        else:
-            kps = data
+                    series = pd.Series(kps_clean[:, i, c])
+                    series = series.interpolate(method='linear', limit_direction='both')
+                    kps_clean[:, i, c] = series.values
             
-        # 2. Check dimensions
-        if kps.ndim == 2:
-            T, D = kps.shape
+            # 3. Smooth
+            if T > 15:
+                for i in range(N):
+                    for c in range(2):
+                        try:
+                            signal = kps_clean[:, i, c]
+                            mask = ~np.isnan(signal)
+                            if mask.sum() > 15:
+                                kps_clean[mask, i, c] = savgol_filter(
+                                    signal[mask], 15, 3
+                                )
+                        except:
+                            pass
             
-            if D == 214:
-                manual_150 = kps[:, :150]
-                manual_kps = manual_150.reshape(T, 75, 2)
-                mouth_40 = kps[:, 174:]
-                mouth_kps = mouth_40.reshape(T, 20, 2)
-                kps = np.concatenate([manual_kps, mouth_kps], axis=1)
-                
-            elif D == 150:
-                 kps = kps.reshape(T, 75, 2)
-                 
-            elif D % 2 == 0:
-                 kps = kps.reshape(T, D//2, 2)
-                 
+            return kps_clean
+        
+        return {
+            key: process_component(val) 
+            for key, val in keypoints_dict.items()
+        }
+    
+    def stabilize(self, keypoints_dict):
+        """Center at neck (shoulders midpoint)"""
+        body = keypoints_dict['body']
+        
+        # Get shoulder centers
+        left_shoulder = body[:, 11, :]
+        right_shoulder = body[:, 12, :]
+        neck_center = (left_shoulder + right_shoulder) / 2  # [T, 2]
+        
+        # Subtract from all components
+        stabilized = {}
+        for key, kps in keypoints_dict.items():
+            stabilized[key] = kps - neck_center[:, np.newaxis, :]
+        
+        return stabilized
+    
+    def glue_wrists(self, keypoints_dict):
+        """Attach hands to wrists"""
+        body = keypoints_dict['body']
+        
+        # Left wrist (15) → Left hand root (0)
+        keypoints_dict['left_hand'][:, 0, :] = body[:, 15, :]
+        
+        # Right wrist (16) → Right hand root (0)
+        keypoints_dict['right_hand'][:, 0, :] = body[:, 16, :]
+        
+        return keypoints_dict
+    
+    def process(self, pose_214):
+        """Full pipeline"""
+        kps = self.extract_keypoints(pose_214)
+        kps = self.clean_and_smooth(kps)
+        kps = self.stabilize(kps)
+        kps = self.glue_wrists(kps)
         return kps
 
-    gt_kps = to_standard_format(gt_data)
-    recon_kps = to_standard_format(recon_data)
-    
-    print(f"Loaded GT shape: {gt_kps.shape}")
-    print(f"Loaded Recon shape: {recon_kps.shape}")
-    
-    has_mouth = gt_kps.shape[1] >= 95
-    if not has_mouth:
-        print("⚠️ Data only has 75 points. Mouth visualization will be skipped.")
 
-    processor = DataProcessor()
-    gt_kps = processor.process_sequence(gt_kps)
-    recon_kps = processor.process_sequence(recon_kps)
+def load_214d_data(path):
+    """Load and convert to [T, 214] format"""
+    data = np.load(path, allow_pickle=True)
     
-    T = min(len(gt_kps), len(recon_kps))
-    gt_kps = gt_kps[:T]
-    recon_kps = recon_kps[:T]
+    # Extract array
+    if isinstance(data, dict):
+        if 'keypoints' in data: arr = data['keypoints']
+        elif 'pose' in data: arr = data['pose']
+        else: arr = list(data.values())[0]
+    elif isinstance(data, np.lib.npyio.NpzFile):
+        arr = data['keypoints']
+    else:
+        arr = data
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6), dpi=120)
+    # Check if already [T, 214]
+    if arr.ndim == 2 and arr.shape[1] == 214:
+        return arr
+    
+    # If [T, 150] → pad with zeros for NMM
+    if arr.ndim == 2 and arr.shape[1] == 150:
+        T = arr.shape[0]
+        padded = np.zeros((T, 214), dtype=arr.dtype)
+        padded[:, :150] = arr
+        return padded
+    
+    # If [T, 75, 2] → reshape to [T, 150] and pad
+    if arr.ndim == 3 and arr.shape[1] == 75:
+        T = arr.shape[0]
+        manual = arr.reshape(T, 150)
+        padded = np.zeros((T, 214), dtype=arr.dtype)
+        padded[:, :150] = manual
+        return padded
+    
+    raise ValueError(f"Unknown format: {arr.shape}")
+
+
+def visualize_comparison(gt_path, recon_path, output_path, scale=2.0):
+    """
+    Main visualization function
+    
+    Args:
+        scale: Zoom factor (default 2.0 for larger pose)
+    """
+    print(f"Loading data...")
+    gt_214 = load_214d_data(gt_path)
+    recon_214 = load_214d_data(recon_path)
+    
+    print(f"GT shape: {gt_214.shape}")
+    print(f"Recon shape: {recon_214.shape}")
+    
+    # Process
+    processor = PoseProcessor()
+    gt_kps = processor.process(gt_214)
+    recon_kps = processor.process(recon_214)
+    
+    T = min(len(gt_214), len(recon_214))
+    
+    # Setup figure
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 7), dpi=120)
     
     def setup_ax(ax, title):
-        ax.set_title(title, fontsize=14, fontweight='bold', pad=10)
+        ax.set_title(title, fontsize=16, fontweight='bold', pad=15)
         ax.invert_yaxis()
         ax.set_aspect('equal')
-        ax.set_xticks([])
-        ax.set_yticks([])
-        for spine in ax.spines.values():
-            spine.set_visible(True)
-            spine.set_color('black')
+        ax.axis('off')
+        
+        # Set view limits (scaled)
+        r = 0.6 * scale  # Scale up the view
+        ax.set_xlim(-r, r)
+        ax.set_ylim(r, -r)
         
         lines = []
-        for item in ALL_CONNECTIONS:
-            if item['offset'] == 75 and gt_kps.shape[1] < 90:
-                continue
-                
-            line = Line2D([], [], color=item['color'], lw=item['lw'], solid_capstyle='round')
-            ax.add_line(line)
-            lines.append(line)
-            
-        s_teal = ax.scatter([], [], s=15, c=COLOR_SIDE, zorder=5)
-        s_black = ax.scatter([], [], s=20, c=COLOR_TRUNK, zorder=5)
-        s_eyes = ax.scatter([], [], s=40, c=COLOR_TRUNK, zorder=6)
-        s_mouth = ax.scatter([], [], s=10, c=COLOR_MOUTH, zorder=6)
-        
-        return lines, [s_teal, s_black, s_eyes, s_mouth]
-
+        scatters = []
+        return lines, scatters
+    
     lines1, scatters1 = setup_ax(ax1, "GROUND TRUTH")
     lines2, scatters2 = setup_ax(ax2, "RECONSTRUCTED")
     
-    # Auto Zoom Logic
-    valid_frame_idx = 0
-    for i in range(len(gt_kps)):
-        if not np.isnan(gt_kps[i, 11, :]).any():
-            valid_frame_idx = i
-            break
-            
-    torso_pts = gt_kps[valid_frame_idx, [11, 12, 23, 24], :]
-    if not np.isnan(torso_pts).any():
-        min_xy = np.nanmin(torso_pts, axis=0)
-        max_xy = np.nanmax(torso_pts, axis=0)
-        ctr = (min_xy + max_xy) / 2
-        h = max_xy[1] - min_xy[1]
-        r = max(h * 2.5 if h > 0.05 else 0.8, 0.4)
-        
-        for ax in [ax1, ax2]:
-            ax.set_xlim(ctr[0] - r, ctr[0] + r)
-            ax.set_ylim(ctr[1] + r, ctr[1] - r)
-    else:
-        for ax in [ax1, ax2]:
-            ax.set_xlim(-0.8, 0.8)
-            ax.set_ylim(0.8, -0.8)
-
-    def update(frame):
-        def update_plot(kps, lines, scatters):
-            # Lines
-            line_idx = 0
-            for item in ALL_CONNECTIONS:
-                if item['offset'] == 75 and kps.shape[1] < 90:
-                    continue
-                
-                s, e = item['indices']
-                off = item['offset']
-                if isinstance(off, tuple):
-                    s, e = s+off[0], e+off[1]
-                else:
-                    s, e = s+off, e+off
-                
-                if s < kps.shape[1] and e < kps.shape[1]:
-                    p1, p2 = kps[frame, s], kps[frame, e]
-                    if not (np.isnan(p1).any() or np.isnan(p2).any()):
-                        lines[line_idx].set_data([p1[0], p2[0]], [p1[1], p2[1]])
-                    else:
-                        lines[line_idx].set_data([], [])
-                line_idx += 1
-            
-            # FIXED: Use proper index lists
-            frame_kps = kps[frame]
-            valid = ~np.isnan(frame_kps).any(axis=1)
-            indices = np.arange(len(frame_kps))
-            
-            # Teal (use IDX_TEAL)
-            mask_teal = valid & np.isin(indices, IDX_TEAL)
-            scatters[0].set_offsets(frame_kps[mask_teal])
-            
-            # Black (use IDX_BLACK)
-            mask_black = valid & np.isin(indices, IDX_BLACK)
-            scatters[1].set_offsets(frame_kps[mask_black])
-            
-            # Eyes (use IDX_EYES)
-            mask_eyes = valid & np.isin(indices, IDX_EYES)
-            scatters[2].set_offsets(frame_kps[mask_eyes])
-            
-            # Mouth (indices >= 75)
-            mask_mouth = valid & (indices >= 75)
-            if has_mouth:
-                scatters[3].set_offsets(frame_kps[mask_mouth])
-            else:
-                scatters[3].set_offsets(np.zeros((0, 2)))
-
-        update_plot(gt_kps, lines1, scatters1)
-        update_plot(recon_kps, lines2, scatters2)
-        fig.suptitle(f'Frame {frame} / {T}', fontsize=12)
-        return lines1 + scatters1 + lines2 + scatters2
-
-    print(f"🎬 Generating Animation ({T} frames)...")
-    ani = animation.FuncAnimation(fig, update, frames=T, blit=True, interval=40)
-    try:
-        ani.save(output_path, writer='ffmpeg', fps=25, dpi=100)
-        print(f"✅ Video saved: {output_path}")
-    except Exception as e:
-        print(f"⚠️ Error: {e}")
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--gt_path', required=True)
-    parser.add_argument('--recon_path', required=True)
-    parser.add_argument('--output', default='comparison_viz.mp4')
-    args = parser.parse_args()
+    def draw_connections(ax, kps, connections, offset=np.array([0, 0]), 
+                        color=COLOR_BODY, lw=2):
+        """Draw skeleton connections"""
+        lines = []
+        for (i, j) in connections:
+            if i < len(kps) and j < len(kps):
+                p1, p2 = kps[i], kps[j]
+                if not (np.isnan(p1).any() or np.isnan(p2).any()):
+                    p1, p2 = p1 + offset, p2 + offset
+                    line, = ax.plot([p1[0], p2[0]], [p1[1], p2[1]], 
+                                   color=color, lw=lw, solid_capstyle='round')
+                    lines.append(line)
+        return lines
     
-    animate_poses(args.gt_path, args.recon_path, args.output)
+    def draw_keypoints(ax, kps, color=COLOR_BODY, size=30):
+        """Draw keypoints as scatter"""
+        valid = ~np.isnan(kps).any(axis=1)
+        return ax.scatter(kps[valid, 0], kps[valid, 1], 
+                         c=color, s=size, zorder=10)
+    
+    def update(frame):
+        """Update frame"""
+        # Clear previous
+        for ax in [ax1, ax2]:
+            for artist in ax.lines + ax.collections:
+                artist.remove()
+        
+        def render(ax, kps_dict):
+            """Render one frame"""
+            body = kps_dict['body'][frame]
+            left_hand = kps_dict['left_hand'][frame]
+            right_hand = kps_dict['right_hand'][frame]
+            mouth = kps_dict['mouth'][frame]
+            
+            # Draw body skeleton
+            draw_connections(ax, body, POSE_CONNECTIONS, 
+                           color=COLOR_TRUNK, lw=2.5)
+            
+            # Draw hands
+            left_wrist = body[15]
+            right_wrist = body[16]
+            
+            if not np.isnan(left_wrist).any():
+                draw_connections(ax, left_hand, HAND_CONNECTIONS,
+                               offset=np.zeros(2), color=COLOR_BODY, lw=1.5)
+                # Connect wrist to hand root
+                ax.plot([left_wrist[0], left_hand[0, 0]], 
+                       [left_wrist[1], left_hand[0, 1]],
+                       color=COLOR_BODY, lw=2, solid_capstyle='round')
+            
+            if not np.isnan(right_wrist).any():
+                draw_connections(ax, right_hand, HAND_CONNECTIONS,
+                               offset=np.zeros(2), color=COLOR_BODY, lw=1.5)
+                ax.plot([right_wrist[0], right_hand[0, 0]], 
+                       [right_wrist[1], right_hand[0, 1]],
+                       color=COLOR_BODY, lw=2, solid_capstyle='round')
+            
+            # Draw mouth (relative to face)
+            nose = body[0]
+            if not np.isnan(nose).any() and not np.isnan(mouth).all():
+                # Position mouth below nose
+                mouth_offset = nose + np.array([0, 0.05])
+                mouth_scaled = mouth * 0.3 + mouth_offset  # Scale down mouth
+                draw_connections(ax, mouth_scaled, MOUTH_CONNECTIONS,
+                               color=COLOR_MOUTH, lw=1.5)
+            
+            # Draw keypoints
+            draw_keypoints(ax, body, COLOR_TRUNK, size=40)
+            draw_keypoints(ax, left_hand, COLOR_BODY, size=20)
+            draw_keypoints(ax, right_hand, COLOR_BODY, size=20)
+            
+            # Eyes
+            if not np.isnan(body[[2, 5]]).any():
+                ax.scatter(body[[2, 5], 0], body[[2, 5], 1],
+                          c='black', s=60, zorder=15)
+        
+        render(ax1, gt_kps)
+        render(ax2, recon_kps)
+        
+        fig.suptitle(f'Frame {frame+1}/{T}', fontsize=14, y=0.98)
+        
+        return ax1.lines + ax1.collections + ax2.lines + ax2.collections
+    
+    print(f"Rendering animation ({T} frames)...")
+    ani = animation.FuncAnimation(fig, update, frames=T, 
+                                 interval=40, blit=False)
+    
+    try:
+        ani.save(output_path, writer='ffmpeg', fps=25, dpi=120,
+                metadata={'title': 'Pose Comparison'})
+        print(f"✅ Saved: {output_path}")
+    except Exception as e:
+        print(f"❌ Error saving: {e}")
+        plt.show()
+
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--gt', required=True, help='Ground truth path')
+    parser.add_argument('--recon', required=True, help='Reconstructed path')
+    parser.add_argument('--output', default='comparison_fixed.mp4')
+    parser.add_argument('--scale', type=float, default=2.0, 
+                       help='Zoom scale (default 2.0)')
+    args = parser.parse_args()
+    
+    visualize_comparison(args.gt, args.recon, args.output, args.scale)
