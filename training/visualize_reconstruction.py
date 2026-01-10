@@ -114,20 +114,46 @@ class DataProcessor:
 
 
 def animate_poses(gt_path, recon_path, output_path):
-    gt_data = np.load(gt_path, allow_pickle=True)
-    recon_data = np.load(recon_path, allow_pickle=True)
-    
-    # .npy files return numpy arrays directly
-    # .npz files return NpzFile (dict-like) objects
-    if isinstance(gt_data, np.ndarray):
-        gt_kps = gt_data  # .npy file → direct array
-    else:
-        gt_kps = gt_data['keypoints']  # .npz file → extract keypoints
-        
-    if isinstance(recon_data, np.ndarray):
-        recon_kps = recon_data  # .npy file
-    else:
-        recon_kps = recon_data['keypoints']  # .npz file
+    # Auto-detect and load both .npy and .npz formats
+    try:
+        gt_data = np.load(gt_path, allow_pickle=True)
+        recon_data = np.load(recon_path, allow_pickle=True)
+    except Exception as e:
+        print(f"❌ Error loading files: {e}")
+        return
+
+    # Helper to standardize to [T, N, 2]
+    def to_standard_format(data):
+        # 1. Extract array if dict
+        if isinstance(data, dict):
+            if 'keypoints' in data: kps = data['keypoints']
+            elif 'pose' in data: kps = data['pose']
+            else: kps = list(data.values())[0] # Try first value
+        elif isinstance(data, np.lib.npyio.NpzFile):
+            kps = data['keypoints']
+        else:
+            kps = data # Raw array
+            
+        # 2. Check dimensions
+        if kps.ndim == 2:
+            T, D = kps.shape
+            # Case A: 214 dim (Face + Body + Hands) -> [T, 75, 2] (Body+Hands only)
+            if D == 214:
+                # 0-150 is Body+Hands (75 points * 2)
+                # 150-214 is Face/Mouth (removed)
+                kps = kps[:, :150]
+                kps = kps.reshape(T, 75, 2)
+            # Case B: 150 dim (Body + Hands only) -> [T, 75, 2]
+            elif D == 150:
+                 kps = kps.reshape(T, 75, 2)
+            # Case C: Other dims -> Unknown, try reshape to [T, N, 2]
+            elif D % 2 == 0:
+                 kps = kps.reshape(T, D//2, 2)
+                 
+        return kps
+
+    gt_kps = to_standard_format(gt_data)
+    recon_kps = to_standard_format(recon_data)
     
     # Kiểm tra xem dữ liệu có đủ 95 điểm (có môi) hay không
     has_mouth = gt_kps.shape[1] >= 95
