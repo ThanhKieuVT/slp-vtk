@@ -74,7 +74,8 @@ def estimate_scale_factor(encoder, dataloader, device, max_samples=1024):
                 continue
             
             z = encoder.encode(poses)
-            latents.append(z.detach().cpu())
+            # Flatten immediately to avoid shape mismatch (varying T)
+            latents.append(z.detach().cpu().flatten())
             
             seen += z.shape[0]
             if seen >= max_samples:
@@ -84,7 +85,8 @@ def estimate_scale_factor(encoder, dataloader, device, max_samples=1024):
         print("⚠️ No latents collected, using scale=1.0")
         return 1.0
     
-    latents = torch.cat(latents, dim=0).flatten()
+    # Concatenate 1D tensors
+    latents = torch.cat(latents, dim=0)
     
     # Subsample if too large
     MAX_ELEMENTS = 1_000_000
