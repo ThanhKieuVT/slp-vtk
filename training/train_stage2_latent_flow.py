@@ -123,6 +123,10 @@ def prepare_batch(batch, device):
             
         poses = batch[0].to(device)
         
+        # ✅ Check for bad data in input
+        if torch.isnan(poses).any() or torch.isinf(poses).any():
+            return None, None
+            
         if len(batch) >= 4:
             seq_lens = batch[3].to(device)
         else:
@@ -182,259 +186,55 @@ def parse_args():
     
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--lr", type=float, default=1e-5) # Reduced LR
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--max_grad_norm", type=float, default=1.0)
-    p.add_argument("--patience", type=int, default=20)
     
-    p.add_argument("--latent_dim", type=int, default=256)
-    p.add_argument("--hidden_dim", type=int, default=512)
-    p.add_argument("--ae_hidden_dim", type=int, default=512)
-    p.add_argument("--max_seq_len", type=int, default=400)
-    
-    p.add_argument("--W_SYNC", type=float, default=0.1)
-    p.add_argument("--W_LENGTH", type=float, default=0.01)
-    p.add_argument("--W_PRIOR", type=float, default=0.1)
-    p.add_argument("--prior_warmup_epochs", type=int, default=5)
-    
-    return p.parse_args()
+    # ... (args) ...
 
-
-def main():
-    args = parse_args()
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    os.makedirs(args.save_dir, exist_ok=True)
-
-    print("="*70)
-    print("🚀 STAGE 2: LATENT FLOW MATCHER TRAINING")
-    print("="*70)
-    print(f"📁 Data: {args.data_dir}")
-    print(f"🤖 Autoencoder: {args.ae_ckpt}")
-    print(f"📦 Batch size: {args.batch_size}")
-    print(f"📏 Max seq len: {args.max_seq_len}")
-    print(f"💾 Save dir: {args.save_dir}")
-    print("="*70)
-
-    # Load datasets
-    print("\n⏳ Loading datasets...")
-    train_dataset = SignLanguageDataset(
-        data_dir=args.data_dir,
-        split="train",
-        max_seq_len=args.max_seq_len
-    )
-    
-    # Find validation split
-    val_dataset = None
-    for split in ["dev", "test", "val"]:
-        path = os.path.join(args.data_dir, split)
-        if os.path.exists(path):
-            val_dataset = SignLanguageDataset(
-                data_dir=args.data_dir,
-                split=split,
-                max_seq_len=args.max_seq_len
-            )
-            print(f"   ✅ Using '{split}' as validation set")
-            break
-    
-    if not val_dataset:
-        print("   ⚠️ No validation split found, splitting from training...")
-        full = len(train_dataset)
-        val_sz = int(full * 0.1)
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            train_dataset, [full - val_sz, val_sz]
-        )
-    
-    print(f"   📊 Train: {len(train_dataset)} samples")
-    print(f"   📊 Val: {len(val_dataset)} samples")
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=2,
-        collate_fn=collate_fn,
-        drop_last=True,
-        pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=2,
-        collate_fn=collate_fn,
-        pin_memory=True
-    )
-
-    # Load Autoencoder (frozen)
-    print("\n📦 Loading Autoencoder...")
-    ae = UnifiedPoseAutoencoder(
-        latent_dim=args.latent_dim,
-        hidden_dim=args.ae_hidden_dim
-    ).to(device)
-    
-    ae_ckpt = torch.load(args.ae_ckpt, map_location=device)
-    ae.load_state_dict(ae_ckpt.get("model_state_dict", ae_ckpt), strict=False)
-    ae.eval()
-    
-    for param in ae.parameters():
-        param.requires_grad = False
-    
-    print("   ✅ Autoencoder loaded (frozen)")
-    
-    # Initialize Flow Matcher
-    print("\n🔧 Initializing Flow Matcher...")
-    flow_matcher = LatentFlowMatcher(
-        latent_dim=args.latent_dim,
-        hidden_dim=args.hidden_dim,
-        W_SYNC=args.W_SYNC,
-        W_LENGTH=args.W_LENGTH,
-        W_PRIOR=args.W_PRIOR
-    ).to(device)
-    
-    total_params = sum(p.numel() for p in flow_matcher.parameters())
-    trainable_params = sum(p.numel() for p in flow_matcher.parameters() if p.requires_grad)
-    print(f"   📊 Total params: {total_params:,}")
-    print(f"   📊 Trainable params: {trainable_params:,}")
-    
-    # ✅ Initialize optimizer BEFORE loading checkpoint
-    optimizer = torch.optim.AdamW(
-        flow_matcher.parameters(),
-        lr=args.lr,
-        weight_decay=1e-6
-    )
-    
-    # Resume or estimate scale
-    start_epoch = 0
-    best_val_loss = float('inf')
-    latent_scale = 1.0
-    patience_counter = 0
-    
-    if args.flow_ckpt and os.path.exists(args.flow_ckpt):
-        print(f"\n📄 Resuming from: {args.flow_ckpt}")
-        ckpt = torch.load(args.flow_ckpt, map_location=device)
-        
-        flow_matcher.load_state_dict(ckpt['model_state_dict'], strict=False)
-        
-        if 'optimizer_state_dict' in ckpt:
-            try:
-                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-                print("   ✅ Optimizer state loaded")
-            except Exception as e:
-                print(f"   ⚠️ Could not load optimizer state: {e}")
-        
-        start_epoch = ckpt.get("epoch", 0)
-        latent_scale = float(ckpt.get("latent_scale_factor", 1.0))
-        best_val_loss = float(ckpt.get("val_loss", float('inf')))
-        
-        # ✅ Validation
-        if latent_scale == 1.0 and 'latent_scale_factor' not in ckpt:
-            print("   ⚠️ WARNING: latent_scale_factor not in checkpoint!")
-            print("   ⚠️ Re-estimating scale factor...")
-            latent_scale = estimate_scale_factor(ae, train_loader, device)
-        
-        print(f"   ✅ Resumed from epoch {start_epoch}")
-        print(f"   📏 Latent scale: {latent_scale:.6f}")
-        print(f"   📉 Best val loss: {best_val_loss:.4f}")
-    else:
-        print("\n📊 Estimating latent scale factor...")
-        latent_scale = estimate_scale_factor(ae, train_loader, device)
-    
-    print(f"\n📏 Final latent scale: {latent_scale:.6f}")
-    
-    # Scheduler
-    scheduler = CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=50,
-        T_mult=2,
-        eta_min=1e-7
-    )
-    
-    if start_epoch > 0:
-        for _ in range(start_epoch):
-            scheduler.step()
-    
     # Training setup
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    # scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda")) # Removed AMP
     writer = SummaryWriter(log_dir=os.path.join(args.save_dir, "logs"))
     
-    PRIOR_WARMUP_EPOCHS = args.prior_warmup_epochs
-    
-    print("\n" + "="*70)
-    print("🏋️ STARTING TRAINING")
-    print("="*70)
-    
-    for epoch in range(start_epoch, args.epochs):
-        flow_matcher.train()
-        ae.eval()
-        
-        # Prior warmup
-        current_prior_scale = 0.0 if epoch < PRIOR_WARMUP_EPOCHS else 1.0
-        
-        metrics = {
-            "total": 0.0,
-            "flow": 0.0,
-            "length": 0.0,
-            "sync": 0.0,
-            "prior": 0.0
-        }
-        n_batches = 0
-        
-        pbar = tqdm(
-            train_loader,
-            desc=f"Epoch {epoch+1}/{args.epochs} [Prior={current_prior_scale:.1f}]"
-        )
-        
-        for batch in pbar:
-            try:
-                poses, batch_dict = prepare_batch(batch, device)
-                if poses is None:
-                    continue
-                
-                # Encode to latent and scale
-                with torch.no_grad():
-                    gt_latent = ae.encode(poses) / latent_scale
-                
-                # ✅ Classifier-Free Guidance (CFG) Dropout (SOTA improvement)
-                # With probability p=0.15, replace text features with zeros
-                # This enables unconditional generation for CFG at inference
-                cfg_dropout_prob = 0.15
-                if np.random.rand() < cfg_dropout_prob:
-                    # Create null embeddings
-                    if 'text_tokens' in batch_dict:
-                        # Zero out text tokens and attention mask
-                        batch_dict = {
-                            'text_tokens': torch.zeros_like(batch_dict['text_tokens']),
-                            'attention_mask': torch.zeros_like(batch_dict['attention_mask']),
-                            'seq_lengths': batch_dict['seq_lengths']
-                        }
-                
+    # ...
+
                 optimizer.zero_grad()
                 
-                with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                    losses = flow_matcher(
-                        batch=batch_dict,
-                        gt_latent=gt_latent,
-                        pose_gt=poses.detach(),
-                        mode="train",
-                        prior_scale=current_prior_scale
-                    )
-                    total_loss = losses["total"]
+                # with torch.cuda.amp.autocast(enabled=(device.type == "cuda")): # Removed AMP
+                losses = flow_matcher(
+                    batch=batch_dict,
+                    gt_latent=gt_latent,
+                    pose_gt=poses.detach(),
+                    mode="train",
+                    prior_scale=current_prior_scale
+                )
+                total_loss = losses["total"]
                 
-                # Check for NaN
-                if torch.isnan(total_loss):
-                    print(f"\n⚠️ NaN loss detected at epoch {epoch}, batch {n_batches}")
+                # Check for NaN immediately
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    print(f"\n⚠️ NaN/Inf loss at epoch {epoch+1}, batch {n_batches}. Skipping...")
                     optimizer.zero_grad()
                     continue
                 
-                # Backward
-                scaler.scale(total_loss).backward()
-                scaler.unscale_(optimizer)
+                # Backward (Standard FP32)
+                total_loss.backward()
+                
+                # scaler.scale(total_loss).backward() # Removed AMP
+                
+                # Unscale BEFORE clipping - Standard FP32 doesn't need unscale
+                # scaler.unscale_(optimizer) # Removed AMP
+                
                 torch.nn.utils.clip_grad_norm_(
                     flow_matcher.parameters(),
                     args.max_grad_norm
                 )
-                scaler.step(optimizer)
-                scaler.update()
+                
+                # Step
+                optimizer.step()
+                # scaler.step(optimizer) # Removed AMP
+                # scaler.update() # Removed AMP
                 
                 # Accumulate metrics
                 for k in metrics:
