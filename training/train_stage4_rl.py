@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
+# KHÔNG CẦN THIẾT LÚC NÀY
+
 """
 STAGE 4: REINFORCEMENT LEARNING FINE-TUNING
 Kỹ thuật: Reward-Weighted Regression (RWR) - Ổn định hơn PPO cho Flow Matching.
