@@ -186,6 +186,31 @@ def animate_poses(gt_path, recon_path, output_path):
     
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6), dpi=120)
     
+    # --- PLOTTING LOGIC FROM visualize_pose.py ---
+    
+    # Define Connections (Exact Match)
+    HAND_CONNECTIONS = [
+        (0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8),
+        (0, 9), (9, 10), (10, 11), (11, 12), (0, 13), (13, 14), (14, 15), (15, 16),
+        (0, 17), (17, 18), (18, 19), (19, 20)
+    ]
+    POSE_CONNECTIONS_UPPER_BODY = [
+        (0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8),
+        (9, 10), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16),
+        (11, 23), (12, 24), (23, 24)
+    ]
+    MOUTH_OUTER_LIP = list(zip(range(0, 11), range(1, 12))) + [(11, 0)]
+    MOUTH_INNER_LIP = list(zip(range(12, 19), range(13, 20))) + [(19, 12)]
+    MOUTH_CONNECTIONS_20 = MOUTH_OUTER_LIP + MOUTH_INNER_LIP
+
+    ALL_CONN = []
+    ALL_CONN.extend([{'indices': (s, e), 'offset': 0, 'color': 'gray', 'lw': 2} for (s, e) in POSE_CONNECTIONS_UPPER_BODY])
+    ALL_CONN.extend([{'indices': (s, e), 'offset': 33, 'color': 'blue', 'lw': 1.5} for (s, e) in HAND_CONNECTIONS])
+    ALL_CONN.append({'indices': (15, 0), 'offset': (0, 33), 'color': 'blue', 'lw': 2}) # Wrist L -> HandRoot L
+    ALL_CONN.extend([{'indices': (s, e), 'offset': 54, 'color': 'green', 'lw': 1.5} for (s, e) in HAND_CONNECTIONS])
+    ALL_CONN.append({'indices': (16, 0), 'offset': (0, 54), 'color': 'green', 'lw': 2}) # Wrist R -> HandRoot R
+    ALL_CONN.extend([{'indices': (s, e), 'offset': 75, 'color': 'red', 'lw': 1} for (s, e) in MOUTH_CONNECTIONS_20])
+
     def setup_ax(ax, title):
         ax.set_title(title, fontsize=14, fontweight='bold', pad=10)
         ax.invert_yaxis()
@@ -197,56 +222,43 @@ def animate_poses(gt_path, recon_path, output_path):
             spine.set_color('black')
         
         lines = []
-        # Draw ALL connections if possible
-        for item in ALL_CONNECTIONS:
-            # Skip mouth connections only if strictly < 90 points
-            if item['offset'] == 75 and gt_kps.shape[1] < 90:
+        for item in ALL_CONN:
+             # Skip mouth if missing
+            if item['offset'] == 75 and not has_mouth:
                 continue
-                
             line = Line2D([], [], color=item['color'], lw=item['lw'], solid_capstyle='round')
             ax.add_line(line)
             lines.append(line)
             
-        s_teal = ax.scatter([], [], s=15, c=COLOR_SIDE, zorder=5)
-        s_black = ax.scatter([], [], s=20, c=COLOR_TRUNK, zorder=5)
-        s_eyes = ax.scatter([], [], s=40, c=COLOR_TRUNK, zorder=6)
-        s_mouth = ax.scatter([], [], s=10, c=COLOR_MOUTH, zorder=6) # Always init
+        s_teal = ax.scatter([], [], s=15, c=COLOR_SIDE, zorder=5) # Hands
+        s_black = ax.scatter([], [], s=20, c=COLOR_TRUNK, zorder=5) # Body
+        s_mouth = ax.scatter([], [], s=10, c=COLOR_MOUTH, zorder=6)
         
-        return lines, [s_teal, s_black, s_eyes, s_mouth]
+        return lines, [s_teal, s_black, s_mouth]
 
     lines1, scatters1 = setup_ax(ax1, "GROUND TRUTH")
     lines2, scatters2 = setup_ax(ax2, "RECONSTRUCTED")
     
-    # Auto Zoom Logic - use first non-nan frame
-    # Try to find a frame with valid torso
-    valid_frame_idx = 0
-    for i in range(len(gt_kps)):
-        if not np.isnan(gt_kps[i, 11, :]).any():
-            valid_frame_idx = i
-            break
-            
-    torso_pts = gt_kps[valid_frame_idx, [11, 12, 23, 24], :]
+    # Zoom logic (Shared)
+    torso_pts = gt_kps[0, [11, 12, 23, 24], :] # Use first frame
     if not np.isnan(torso_pts).any():
         min_xy = np.nanmin(torso_pts, axis=0)
         max_xy = np.nanmax(torso_pts, axis=0)
         ctr = (min_xy + max_xy) / 2
         h = max_xy[1] - min_xy[1]
-        raw_r = h * 2.5 if h > 0.05 else 0.8 # Zoom out a bit more
-        r = max(raw_r, 0.4)
-        
+        raw_r = h * 3.5 if h > 0.05 else 0.8 # Wide zoom
+        r = max(raw_r, 0.45)
         for ax in [ax1, ax2]:
             ax.set_xlim(ctr[0] - r, ctr[0] + r)
             ax.set_ylim(ctr[1] + r, ctr[1] - r)
     else:
-        for ax in [ax1, ax2]:
-            ax.set_xlim(-0.8, 0.8); ax.set_ylim(0.8, -0.8)
+        for ax in [ax1, ax2]: ax.set_xlim(-0.8, 0.8); ax.set_ylim(0.8, -0.8)
 
     def update(frame):
         def update_plot(kps, lines, scatters):
             # Lines
             line_idx = 0
-            for item in ALL_CONNECTIONS:
-                # Same skip logic
+            for item in ALL_CONN:
                 if item['offset'] == 75 and kps.shape[1] < 90:
                     continue
                 
@@ -255,50 +267,31 @@ def animate_poses(gt_path, recon_path, output_path):
                 if isinstance(off, tuple): s, e = s+off[0], e+off[1]
                 else: s, e = s+off, e+off
                 
-                # Check bounds
                 if s < kps.shape[1] and e < kps.shape[1]:
                     p1, p2 = kps[frame, s], kps[frame, e]
                     if not (np.isnan(p1).any() or np.isnan(p2).any()):
                         lines[line_idx].set_data([p1[0], p2[0]], [p1[1], p2[1]])
                     else:
-                        lines[line_idx].set_data([], [])
+                         lines[line_idx].set_data([], [])
                 line_idx += 1
             
-            # Scatter
-            # Filter NaNs
+            # Scatters
             frame_kps = kps[frame]
             valid = ~np.isnan(frame_kps).any(axis=1)
-            
-            # Split by groups (heuristic based on visualize_pose.py)
-            # Body: 0-23 -> Black
-            # Hands: 33-54 (Left), 54-75 (Right) -> Teal
-            # Mouth: 75-95 -> Red
-            
             indices = np.arange(len(frame_kps))
             
-            # Teal (Hands)
-            # Include both hands: 33 to 75
-            mask_teal = valid & (indices >= 33) & (indices < 75)
-            scatters[0].set_offsets(frame_kps[mask_teal])
+            # Hands: 33-75
+            mask_hands = valid & (indices >= 33) & (indices < 75)
+            scatters[0].set_offsets(frame_kps[mask_hands])
             
-            # Black (Body + potential gap)
-            mask_black = valid & (indices < 33)
-            scatters[1].set_offsets(frame_kps[mask_black])
+            # Body: 0-23
+            mask_body = valid & (indices < 23)
+            scatters[1].set_offsets(frame_kps[mask_body])
             
-            # Eyes (indices 15, 16)
-            mask_eyes = np.zeros(len(frame_kps), dtype=bool)
-            if len(frame_kps) > 16:
-                mask_eyes[15] = True
-                mask_eyes[16] = True
-            scatters[2].set_offsets(frame_kps[mask_eyes & valid])
-            
-            # Mouth (indices >= 75)
-            mask_mouth = valid & (indices >= 75)
-            if has_mouth and scatters[3] is not None:
-                 scatters[3].set_offsets(frame_kps[mask_mouth])
-            else:
-                 if scatters[3] is not None:
-                     scatters[3].set_offsets(np.zeros((0, 2)))
+            # Mouth: >= 75
+            if has_mouth:
+                mask_mouth = valid & (indices >= 75)
+                scatters[2].set_offsets(frame_kps[mask_mouth])
 
         update_plot(gt_kps, lines1, scatters1)
         update_plot(recon_kps, lines2, scatters2)
