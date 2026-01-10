@@ -114,11 +114,20 @@ class DataProcessor:
 
 
 def animate_poses(gt_path, recon_path, output_path):
-    gt_data = np.load(gt_path)
-    recon_data = np.load(recon_path)
+    gt_data = np.load(gt_path, allow_pickle=True)
+    recon_data = np.load(recon_path, allow_pickle=True)
     
-    gt_kps = gt_data['keypoints']
-    recon_kps = recon_data['keypoints']
+    # .npy files return numpy arrays directly
+    # .npz files return NpzFile (dict-like) objects
+    if isinstance(gt_data, np.ndarray):
+        gt_kps = gt_data  # .npy file → direct array
+    else:
+        gt_kps = gt_data['keypoints']  # .npz file → extract keypoints
+        
+    if isinstance(recon_data, np.ndarray):
+        recon_kps = recon_data  # .npy file
+    else:
+        recon_kps = recon_data['keypoints']  # .npz file
     
     # Kiểm tra xem dữ liệu có đủ 95 điểm (có môi) hay không
     has_mouth = gt_kps.shape[1] >= 95
