@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-✅ FIXED:
-  - estimate_scale_factor uses .std() instead of .abs().quantile()
-  - Better checkpoint validation
-  - Proper optimizer initialization order
+✅ CRITICAL FIXES for NaN loss:
+  1. Much lower learning rate (1e-6)
+  2. Warmup scheduler
+  3. Better gradient clipping
+  4. Safer division operations
+  5. Add gradient norm logging
+  6. Disable sync_guidance initially
 """
 import os
 import sys
@@ -13,7 +16,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import numpy as np
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.tensorboard import SummaryWriter
 
 sys.path.append(os.getcwd())
@@ -21,6 +24,17 @@ sys.path.append(os.getcwd())
 from dataset import SignLanguageDataset, collate_fn
 from models.fml.autoencoder import UnifiedPoseAutoencoder
 from models.fml.latent_flow_matcher import LatentFlowMatcher
+
+
+def get_warmup_cosine_scheduler(optimizer, warmup_steps, total_steps, min_lr_ratio=0.1):
+    """Warmup + Cosine decay scheduler"""
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return max(min_lr_ratio, 0.5 * (1.0 + np.cos(np.pi * progress)))
+    
+    return LambdaLR(optimizer, lr_lambda)
 
 
 def safe_float(x):
@@ -49,9 +63,7 @@ def extract_poses(batch):
 
 def estimate_scale_factor(encoder, dataloader, device, max_samples=1024):
     """
-    ✅ FIXED: Use .std() instead of .abs().quantile()
-    
-    Estimates the scale of latent space for better numerical stability
+    ✅ IMPROVED: Use median + clipping for robustness
     """
     encoder.eval()
     latents = []
@@ -61,7 +73,6 @@ def estimate_scale_factor(encoder, dataloader, device, max_samples=1024):
     
     with torch.no_grad():
         for batch in dataloader:
-            # Move batch to device
             if isinstance(batch, dict):
                 for k, v in batch.items():
                     if isinstance(v, torch.Tensor):
@@ -73,8 +84,18 @@ def estimate_scale_factor(encoder, dataloader, device, max_samples=1024):
             if poses is None:
                 continue
             
+            # ✅ Check for bad data
+            if torch.isnan(poses).any() or torch.isinf(poses).any():
+                print("⚠️ Found NaN/Inf in poses, skipping batch")
+                continue
+            
             z = encoder.encode(poses)
-            # Flatten immediately to avoid shape mismatch (varying T)
+            
+            # ✅ Check encoded latents
+            if torch.isnan(z).any() or torch.isinf(z).any():
+                print("⚠️ Encoder produced NaN/Inf, skipping")
+                continue
+            
             latents.append(z.detach().cpu().flatten())
             
             seen += z.shape[0]
@@ -82,10 +103,9 @@ def estimate_scale_factor(encoder, dataloader, device, max_samples=1024):
                 break
     
     if not latents:
-        print("⚠️ No latents collected, using scale=1.0")
+        print("⚠️ No valid latents collected, using scale=1.0")
         return 1.0
     
-    # Concatenate 1D tensors
     latents = torch.cat(latents, dim=0)
     
     # Subsample if too large
@@ -94,23 +114,36 @@ def estimate_scale_factor(encoder, dataloader, device, max_samples=1024):
         step = latents.numel() // MAX_ELEMENTS
         latents = latents[::step]
     
-    # ✅ FIXED: Use std instead of abs().quantile()
-    scale = float(latents.std())
+    # ✅ Use percentile-based std for robustness
+    q25, q75 = torch.quantile(latents, torch.tensor([0.25, 0.75]))
+    iqr = q75 - q25
+    scale = iqr / 1.349  # IQR-based std estimate
     
-    print(f"   Latent stats: mean={latents.mean():.4f}, std={scale:.4f}")
-    print(f"   Using scale factor: {scale:.6f}")
+    # Fallback to regular std if IQR too small
+    if scale < 0.01:
+        scale = float(latents.std())
     
-    return max(scale, 1e-6)
+    scale = max(scale, 0.1)  # Minimum scale
+    
+    print(f"   Latent stats: mean={latents.mean():.4f}, std={latents.std():.4f}")
+    print(f"   IQR-based scale: {scale:.6f}")
+    
+    return scale
 
 
 def prepare_batch(batch, device):
-    """Prepare batch for training"""
+    """Prepare batch with validation"""
     if isinstance(batch, dict):
         for k, v in batch.items():
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(device)
         
         poses = extract_poses(batch)
+        
+        # ✅ Validate poses
+        if poses is not None:
+            if torch.isnan(poses).any() or torch.isinf(poses).any():
+                return None, None
         
         if "seq_lengths" not in batch and poses is not None:
             B, T, _ = poses.shape
@@ -123,6 +156,10 @@ def prepare_batch(batch, device):
             
         poses = batch[0].to(device)
         
+        # ✅ Validate
+        if torch.isnan(poses).any() or torch.isinf(poses).any():
+            return None, None
+            
         if len(batch) >= 4:
             seq_lens = batch[3].to(device)
         else:
@@ -151,6 +188,10 @@ def validate(model, ae, val_loader, device, latent_scale):
             
             gt_latent = ae.encode(poses) / latent_scale
             
+            # ✅ Check encoded latent
+            if torch.isnan(gt_latent).any() or torch.isinf(gt_latent).any():
+                continue
+            
             losses = model(
                 batch_dict, 
                 gt_latent, 
@@ -160,7 +201,9 @@ def validate(model, ae, val_loader, device, latent_scale):
             )
             
             for k in metrics:
-                metrics[k] += safe_float(losses.get(k, 0))
+                val = safe_float(losses.get(k, 0))
+                if not np.isnan(val) and not np.isinf(val):
+                    metrics[k] += val
             n += 1
             
         except Exception as e:
@@ -181,202 +224,136 @@ def parse_args():
     p.add_argument("--flow_ckpt", type=str, default=None)
     
     p.add_argument("--epochs", type=int, default=200)
-    p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--batch_size", type=int, default=16)  # ✅ Reduced batch size
+    p.add_argument("--lr", type=float, default=1e-6)  # ✅ Much lower LR
+    p.add_argument("--warmup_epochs", type=int, default=5)  # ✅ Warmup
     p.add_argument("--device", type=str, default="cuda")
-    p.add_argument("--max_grad_norm", type=float, default=1.0)
-    p.add_argument("--patience", type=int, default=20)
+    p.add_argument("--max_grad_norm", type=float, default=0.5)  # ✅ Stricter clipping
     
     p.add_argument("--latent_dim", type=int, default=256)
     p.add_argument("--hidden_dim", type=int, default=512)
-    p.add_argument("--ae_hidden_dim", type=int, default=512)
-    p.add_argument("--max_seq_len", type=int, default=400)
+    p.add_argument("--num_flow_layers", type=int, default=6)
+    p.add_argument("--num_prior_layers", type=int, default=4)
+    p.add_argument("--dropout", type=float, default=0.1)
     
-    p.add_argument("--W_SYNC", type=float, default=0.1)
-    p.add_argument("--W_LENGTH", type=float, default=0.01)
-    p.add_argument("--W_PRIOR", type=float, default=0.1)
-    p.add_argument("--prior_warmup_epochs", type=int, default=5)
+    p.add_argument("--use_ssm_prior", type=int, default=1)
+    p.add_argument("--use_sync_guidance", type=int, default=0)  # ✅ Disabled initially
+    
+    p.add_argument("--W_PRIOR", type=float, default=0.05)  # ✅ Reduced weight
+    p.add_argument("--W_SYNC", type=float, default=0.0)  # ✅ Start at 0
+    p.add_argument("--W_LENGTH", type=float, default=1.0)
+    
+    p.add_argument("--prior_anneal_epochs", type=int, default=50)
+    p.add_argument("--max_seq_len", type=int, default=400)
+    p.add_argument("--patience", type=int, default=20)
     
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     os.makedirs(args.save_dir, exist_ok=True)
-
-    print("="*70)
-    print("🚀 STAGE 2: LATENT FLOW MATCHER TRAINING")
-    print("="*70)
-    print(f"📁 Data: {args.data_dir}")
-    print(f"🤖 Autoencoder: {args.ae_ckpt}")
-    print(f"📦 Batch size: {args.batch_size}")
-    print(f"📏 Max seq len: {args.max_seq_len}")
-    print(f"💾 Save dir: {args.save_dir}")
-    print("="*70)
-
+    device = torch.device(args.device)
+    
+    print("=" * 70)
+    print("🚀 STAGE 2: LATENT FLOW MATCHING TRAINING (FIXED)")
+    print("=" * 70)
+    
     # Load datasets
-    print("\n⏳ Loading datasets...")
-    train_dataset = SignLanguageDataset(
-        data_dir=args.data_dir,
-        split="train",
-        max_seq_len=args.max_seq_len
-    )
-    
-    # Find validation split
-    val_dataset = None
-    for split in ["dev", "test", "val"]:
-        path = os.path.join(args.data_dir, split)
-        if os.path.exists(path):
-            val_dataset = SignLanguageDataset(
-                data_dir=args.data_dir,
-                split=split,
-                max_seq_len=args.max_seq_len
-            )
-            print(f"   ✅ Using '{split}' as validation set")
-            break
-    
-    if not val_dataset:
-        print("   ⚠️ No validation split found, splitting from training...")
-        full = len(train_dataset)
-        val_sz = int(full * 0.1)
-        train_dataset, val_dataset = torch.utils.data.random_split(
-            train_dataset, [full - val_sz, val_sz]
-        )
-    
-    print(f"   📊 Train: {len(train_dataset)} samples")
-    print(f"   📊 Val: {len(val_dataset)} samples")
+    print("\n📂 Loading datasets...")
+    train_ds = SignLanguageDataset(args.data_dir, split="train", max_seq_len=args.max_seq_len)
+    val_ds = SignLanguageDataset(args.data_dir, split="val", max_seq_len=args.max_seq_len)
     
     train_loader = DataLoader(
-        train_dataset,
+        train_ds, 
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=2,
         collate_fn=collate_fn,
-        drop_last=True,
-        pin_memory=True
+        num_workers=4
     )
     val_loader = DataLoader(
-        val_dataset,
+        val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=2,
         collate_fn=collate_fn,
-        pin_memory=True
+        num_workers=4
     )
-
-    # Load Autoencoder (frozen)
-    print("\n📦 Loading Autoencoder...")
-    ae = UnifiedPoseAutoencoder(
-        latent_dim=args.latent_dim,
-        hidden_dim=args.ae_hidden_dim
-    ).to(device)
     
-    ae_ckpt = torch.load(args.ae_ckpt, map_location=device)
-    ae.load_state_dict(ae_ckpt.get("model_state_dict", ae_ckpt), strict=False)
+    print(f"   Train: {len(train_ds)} samples")
+    print(f"   Val: {len(val_ds)} samples")
+    
+    # Load autoencoder
+    print(f"\n🔧 Loading autoencoder from: {args.ae_ckpt}")
+    ae = UnifiedPoseAutoencoder(latent_dim=args.latent_dim).to(device)
+    
+    ckpt = torch.load(args.ae_ckpt, map_location=device)
+    if "model_state_dict" in ckpt:
+        ae.load_state_dict(ckpt["model_state_dict"])
+    else:
+        ae.load_state_dict(ckpt)
+    
     ae.eval()
+    for p in ae.parameters():
+        p.requires_grad = False
     
-    for param in ae.parameters():
-        param.requires_grad = False
+    # Estimate latent scale
+    latent_scale = estimate_scale_factor(ae, train_loader, device)
+    print(f"   Latent scale factor: {latent_scale:.6f}")
     
-    print("   ✅ Autoencoder loaded (frozen)")
-    
-    # Initialize Flow Matcher
-    print("\n🔧 Initializing Flow Matcher...")
+    # Create flow matcher
+    print("\n🌊 Creating Flow Matcher...")
     flow_matcher = LatentFlowMatcher(
         latent_dim=args.latent_dim,
         hidden_dim=args.hidden_dim,
+        num_flow_layers=args.num_flow_layers,
+        num_prior_layers=args.num_prior_layers,
+        dropout=args.dropout,
+        use_ssm_prior=bool(args.use_ssm_prior),
+        use_sync_guidance=bool(args.use_sync_guidance),
+        W_PRIOR=args.W_PRIOR,
         W_SYNC=args.W_SYNC,
-        W_LENGTH=args.W_LENGTH,
-        W_PRIOR=args.W_PRIOR
+        W_LENGTH=args.W_LENGTH
     ).to(device)
     
-    total_params = sum(p.numel() for p in flow_matcher.parameters())
-    trainable_params = sum(p.numel() for p in flow_matcher.parameters() if p.requires_grad)
-    print(f"   📊 Total params: {total_params:,}")
-    print(f"   📊 Trainable params: {trainable_params:,}")
+    # Load checkpoint if resuming
+    start_epoch = 0
+    if args.flow_ckpt and os.path.exists(args.flow_ckpt):
+        print(f"   Loading checkpoint: {args.flow_ckpt}")
+        ckpt = torch.load(args.flow_ckpt, map_location=device)
+        flow_matcher.load_state_dict(ckpt["model_state_dict"])
+        start_epoch = ckpt.get("epoch", 0)
     
-    # ✅ Initialize optimizer BEFORE loading checkpoint
+    # ✅ Optimizer with weight decay
     optimizer = torch.optim.AdamW(
         flow_matcher.parameters(),
         lr=args.lr,
-        weight_decay=1e-6
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=1e-4  # ✅ Add weight decay
     )
     
-    # Resume or estimate scale
-    start_epoch = 0
-    best_val_loss = float('inf')
-    latent_scale = 1.0
-    patience_counter = 0
+    # ✅ Warmup scheduler
+    total_steps = len(train_loader) * args.epochs
+    warmup_steps = len(train_loader) * args.warmup_epochs
+    scheduler = get_warmup_cosine_scheduler(optimizer, warmup_steps, total_steps)
     
-    if args.flow_ckpt and os.path.exists(args.flow_ckpt):
-        print(f"\n📄 Resuming from: {args.flow_ckpt}")
-        ckpt = torch.load(args.flow_ckpt, map_location=device)
-        
-        flow_matcher.load_state_dict(ckpt['model_state_dict'], strict=False)
-        
-        if 'optimizer_state_dict' in ckpt:
-            try:
-                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-                print("   ✅ Optimizer state loaded")
-            except Exception as e:
-                print(f"   ⚠️ Could not load optimizer state: {e}")
-        
-        start_epoch = ckpt.get("epoch", 0)
-        latent_scale = float(ckpt.get("latent_scale_factor", 1.0))
-        best_val_loss = float(ckpt.get("val_loss", float('inf')))
-        
-        # ✅ Validation
-        if latent_scale == 1.0 and 'latent_scale_factor' not in ckpt:
-            print("   ⚠️ WARNING: latent_scale_factor not in checkpoint!")
-            print("   ⚠️ Re-estimating scale factor...")
-            latent_scale = estimate_scale_factor(ae, train_loader, device)
-        
-        print(f"   ✅ Resumed from epoch {start_epoch}")
-        print(f"   📏 Latent scale: {latent_scale:.6f}")
-        print(f"   📉 Best val loss: {best_val_loss:.4f}")
-    else:
-        print("\n📊 Estimating latent scale factor...")
-        latent_scale = estimate_scale_factor(ae, train_loader, device)
-    
-    print(f"\n📏 Final latent scale: {latent_scale:.6f}")
-    
-    # Scheduler
-    scheduler = CosineAnnealingWarmRestarts(
-        optimizer,
-        T_0=50,
-        T_mult=2,
-        eta_min=1e-7
-    )
-    
-    if start_epoch > 0:
-        for _ in range(start_epoch):
-            scheduler.step()
-    
-    # Training setup
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
     writer = SummaryWriter(log_dir=os.path.join(args.save_dir, "logs"))
     
-    PRIOR_WARMUP_EPOCHS = args.prior_warmup_epochs
+    best_val_loss = float("inf")
+    patience_counter = 0
     
-    print("\n" + "="*70)
-    print("🏋️ STARTING TRAINING")
-    print("="*70)
+    print("\n" + "=" * 70)
+    print("🎯 TRAINING START")
+    print("=" * 70)
     
     for epoch in range(start_epoch, args.epochs):
         flow_matcher.train()
-        ae.eval()
         
-        # Prior warmup
-        current_prior_scale = 0.0 if epoch < PRIOR_WARMUP_EPOCHS else 1.0
+        # ✅ Prior annealing
+        progress = min(1.0, epoch / args.prior_anneal_epochs)
+        current_prior_scale = progress
         
-        metrics = {
-            "total": 0.0,
-            "flow": 0.0,
-            "length": 0.0,
-            "sync": 0.0,
-            "prior": 0.0
-        }
+        metrics = {"total": 0.0, "flow": 0.0, "prior": 0.0, "sync": 0.0, "length": 0.0}
         n_batches = 0
         
         pbar = tqdm(
@@ -390,75 +367,90 @@ def main():
                 if poses is None:
                     continue
                 
-                # Encode to latent and scale
+                # Encode to latent
                 with torch.no_grad():
                     gt_latent = ae.encode(poses) / latent_scale
                 
-                # ✅ Classifier-Free Guidance (CFG) Dropout (SOTA improvement)
-                # With probability p=0.15, replace text features with zeros
-                # This enables unconditional generation for CFG at inference
-                cfg_dropout_prob = 0.15
-                if np.random.rand() < cfg_dropout_prob:
-                    # Create null embeddings
-                    if 'text_tokens' in batch_dict:
-                        # Zero out text tokens and attention mask
-                        batch_dict = {
-                            'text_tokens': torch.zeros_like(batch_dict['text_tokens']),
-                            'attention_mask': torch.zeros_like(batch_dict['attention_mask']),
-                            'seq_lengths': batch_dict['seq_lengths']
-                        }
+                # ✅ Validate latent
+                if torch.isnan(gt_latent).any() or torch.isinf(gt_latent).any():
+                    print(f"\n⚠️ NaN/Inf in latent encoding, skipping batch")
+                    continue
                 
                 optimizer.zero_grad()
                 
-                with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
-                    losses = flow_matcher(
-                        batch=batch_dict,
-                        gt_latent=gt_latent,
-                        pose_gt=poses.detach(),
-                        mode="train",
-                        prior_scale=current_prior_scale
-                    )
-                    total_loss = losses["total"]
+                # Forward
+                losses = flow_matcher(
+                    batch=batch_dict,
+                    gt_latent=gt_latent,
+                    pose_gt=poses.detach(),
+                    mode="train",
+                    prior_scale=current_prior_scale
+                )
+                total_loss = losses["total"]
                 
-                # Check for NaN
-                if torch.isnan(total_loss):
-                    print(f"\n⚠️ NaN loss detected at epoch {epoch}, batch {n_batches}")
+                # ✅ Check for NaN
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    print(f"\n⚠️ NaN/Inf loss at epoch {epoch+1}, batch {n_batches}")
+                    print(f"   Flow loss: {losses['flow'].item():.6f}")
+                    print(f"   Prior loss: {losses['prior'].item():.6f}")
+                    print(f"   Sync loss: {losses['sync'].item():.6f}")
+                    print(f"   Length loss: {losses['length'].item():.6f}")
                     optimizer.zero_grad()
                     continue
                 
                 # Backward
-                scaler.scale(total_loss).backward()
-                scaler.unscale_(optimizer)
+                total_loss.backward()
+                
+                # ✅ Log gradient norms
+                total_norm = 0.0
+                for p in flow_matcher.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                total_norm = total_norm ** 0.5
+                
+                # ✅ Gradient clipping
                 torch.nn.utils.clip_grad_norm_(
                     flow_matcher.parameters(),
                     args.max_grad_norm
                 )
-                scaler.step(optimizer)
-                scaler.update()
+                
+                optimizer.step()
+                scheduler.step()
                 
                 # Accumulate metrics
                 for k in metrics:
-                    metrics[k] += safe_float(losses.get(k, 0))
+                    val = safe_float(losses.get(k, 0))
+                    if not np.isnan(val) and not np.isinf(val):
+                        metrics[k] += val
+                
                 n_batches += 1
+                
+                # ✅ Log gradient norm every 10 batches
+                if n_batches % 10 == 0:
+                    writer.add_scalar("Train/grad_norm", total_norm, epoch * len(train_loader) + n_batches)
                 
                 pbar.set_postfix({
                     'Loss': f"{metrics['total']/n_batches:.4f}",
-                    'Flow': f"{metrics['flow']/n_batches:.3f}"
+                    'Flow': f"{metrics['flow']/n_batches:.3f}",
+                    'GradNorm': f"{total_norm:.2f}"
                 })
                 
             except Exception as e:
                 print(f"\n❌ Error in batch: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
         
         if n_batches == 0:
             print(f"⚠️ No valid batches in epoch {epoch+1}")
             continue
         
-        # Log to tensorboard
+        # Log metrics
         for k in metrics:
             writer.add_scalar(f"Train/{k}", metrics[k]/n_batches, epoch)
         
-        # Validation
+        # Print summary
         print(f"\n📊 Epoch {epoch+1}/{args.epochs} Summary:")
         print(f"   Train Loss: {metrics['total']/n_batches:.4f}")
         print(f"   Flow: {metrics['flow']/n_batches:.4f}")
@@ -466,13 +458,14 @@ def main():
         print(f"   Sync: {metrics['sync']/n_batches:.4f}")
         print(f"   Length: {metrics['length']/n_batches:.4f}")
         
+        # Validation
         val_res = validate(flow_matcher, ae, val_loader, device, latent_scale)
         
         if val_res:
             writer.add_scalar("Val/Total", val_res['total'], epoch)
             print(f"   Val Loss: {val_res['total']:.4f}")
             
-            # Save best model
+            # Save best
             if val_res['total'] < best_val_loss:
                 best_val_loss = val_res['total']
                 patience_counter = 0
@@ -481,6 +474,7 @@ def main():
                     "epoch": epoch + 1,
                     "model_state_dict": flow_matcher.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "latent_scale_factor": latent_scale,
                     "val_loss": best_val_loss,
                     "max_seq_len": args.max_seq_len,
@@ -493,7 +487,7 @@ def main():
                 print(f"   ⏳ Patience: {patience_counter}/{args.patience}")
                 
                 if patience_counter >= args.patience:
-                    print("\n⏹️ Early stopping triggered!")
+                    print("\nℹ️ Early stopping triggered!")
                     break
         
         # Periodic checkpoint
@@ -505,8 +499,6 @@ def main():
                 "latent_scale_factor": latent_scale,
                 "max_seq_len": args.max_seq_len
             }, os.path.join(args.save_dir, f"ckpt_epoch_{epoch+1}.pt"))
-        
-        scheduler.step()
     
     writer.close()
     
