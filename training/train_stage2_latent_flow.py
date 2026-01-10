@@ -232,18 +232,20 @@ def parse_args():
     
     p.add_argument("--latent_dim", type=int, default=256)
     p.add_argument("--hidden_dim", type=int, default=512)
+    p.add_argument("--ae_hidden_dim", type=int, default=512)  # ✅ Restored
     p.add_argument("--num_flow_layers", type=int, default=6)
     p.add_argument("--num_prior_layers", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.1)
     
     p.add_argument("--use_ssm_prior", type=int, default=1)
-    p.add_argument("--use_sync_guidance", type=int, default=0)  # ✅ Disabled initially
+    p.add_argument("--use_sync_guidance", type=int, default=0)
     
-    p.add_argument("--W_PRIOR", type=float, default=0.05)  # ✅ Reduced weight
-    p.add_argument("--W_SYNC", type=float, default=0.0)  # ✅ Start at 0
+    p.add_argument("--W_PRIOR", type=float, default=0.05)
+    p.add_argument("--W_SYNC", type=float, default=0.0)
     p.add_argument("--W_LENGTH", type=float, default=1.0)
     
     p.add_argument("--prior_anneal_epochs", type=int, default=50)
+    p.add_argument("--prior_warmup_epochs", type=int, default=5)  # ✅ Restored (ignored/deprecated)
     p.add_argument("--max_seq_len", type=int, default=400)
     p.add_argument("--patience", type=int, default=20)
     
@@ -284,7 +286,10 @@ def main():
     
     # Load autoencoder
     print(f"\n🔧 Loading autoencoder from: {args.ae_ckpt}")
-    ae = UnifiedPoseAutoencoder(latent_dim=args.latent_dim).to(device)
+    ae = UnifiedPoseAutoencoder(
+        latent_dim=args.latent_dim,
+        hidden_dim=args.ae_hidden_dim  # ✅ Use restored arg
+    ).to(device)
     
     ckpt = torch.load(args.ae_ckpt, map_location=device)
     if "model_state_dict" in ckpt:
