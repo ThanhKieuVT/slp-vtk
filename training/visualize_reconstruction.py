@@ -184,28 +184,14 @@ def animate_poses(gt_path, recon_path, output_path):
     lines1, scatters1 = setup_ax(ax1, "GROUND TRUTH")
     lines2, scatters2 = setup_ax(ax2, "RECONSTRUCTED")
     
-    # Auto zoom based on torso
-    valid_frame_idx = 0
-    for i in range(len(gt_kps)):
-        if not np.isnan(gt_kps[i, 11, :]).any():
-            valid_frame_idx = i
-            break
+    # Fixed zoom - MUCH LARGER to fill frame
+    # After stabilization at neck, pose is centered at (0,0)
+    # Use fixed view that fills the frame nicely
+    r = 0.35  # Smaller radius = BIGGER pose
     
-    torso_pts = gt_kps[valid_frame_idx, [11, 12, 23, 24], :]
-    if not np.isnan(torso_pts).any():
-        min_xy = np.nanmin(torso_pts, axis=0)
-        max_xy = np.nanmax(torso_pts, axis=0)
-        ctr = (min_xy + max_xy) / 2
-        h = max_xy[1] - min_xy[1]
-        r = max(h * 2.5 if h > 0.05 else 0.8, 0.4)
-        
-        for ax in [ax1, ax2]:
-            ax.set_xlim(ctr[0] - r, ctr[0] + r)
-            ax.set_ylim(ctr[1] + r, ctr[1] - r)
-    else:
-        for ax in [ax1, ax2]:
-            ax.set_xlim(-0.8, 0.8)
-            ax.set_ylim(0.8, -0.8)
+    for ax in [ax1, ax2]:
+        ax.set_xlim(-r, r)
+        ax.set_ylim(r, -r)  # Inverted Y
     
     def update(frame):
         def update_plot(kps, lines, scatters):
