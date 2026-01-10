@@ -137,15 +137,22 @@ def animate_poses(gt_path, recon_path, output_path):
         # 2. Check dimensions
         if kps.ndim == 2:
             T, D = kps.shape
-            # Case A: 214 dim (Face + Body + Hands) -> [T, 75, 2] (Body+Hands only)
+            
+            # Case A: 214 dim (Standard OpenPose 137-point flattened? No, 214 usually means specific subset)
+            # Assuming standard OpenPose Body25 (25) + 2xHand(21) + Face(70) = 137 points -> 274 dim?
+            # BUT user has 214 dim. 
+            # Let's inspect the usual subsets.
+            # 214 / 2 = 107 points.
+            # Likely: Body (subset) + Hands + Face (subset)
+            
+            # CRITICAL: Do NOT crop if 214. Keep as is for now, reshape to [T, 107, 2]
             if D == 214:
-                # 0-150 is Body+Hands (75 points * 2)
-                # 150-214 is Face/Mouth (removed)
-                kps = kps[:, :150]
-                kps = kps.reshape(T, 75, 2)
-            # Case B: 150 dim (Body + Hands only) -> [T, 75, 2]
+                kps = kps.reshape(T, 107, 2)
+                
+            # Case B: 150 dim (Body + Hands) -> 75 points
             elif D == 150:
                  kps = kps.reshape(T, 75, 2)
+                 
             # Case C: Other dims -> Unknown, try reshape to [T, N, 2]
             elif D % 2 == 0:
                  kps = kps.reshape(T, D//2, 2)
@@ -154,6 +161,13 @@ def animate_poses(gt_path, recon_path, output_path):
 
     gt_kps = to_standard_format(gt_data)
     recon_kps = to_standard_format(recon_data)
+    
+    # 3. Define Topology based on detected shape
+    # If 107 points (from 214 dim) -> Likely Body + Hands + Face
+    # Body: 0-10? Hands: ? Mouth: ?
+    # Let's use a generic visualizer that connects close points if topology is unknown
+    pass # Topology handling is done in draw_pose
+
     
     # Kiểm tra xem dữ liệu có đủ 95 điểm (có môi) hay không
     has_mouth = gt_kps.shape[1] >= 95
@@ -181,9 +195,10 @@ def animate_poses(gt_path, recon_path, output_path):
             spine.set_color('black')
         
         lines = []
+        # Draw ALL connections if possible
         for item in ALL_CONNECTIONS:
-            # Check nếu là môi (offset 75) mà dữ liệu không đủ thì skip
-            if item['offset'] == 75 and not has_mouth:
+            # Skip mouth connections only if strictly < 90 points
+            if item['offset'] == 75 and gt_kps.shape[1] < 90:
                 continue
                 
             line = Line2D([], [], color=item['color'], lw=item['lw'], solid_capstyle='round')
@@ -193,42 +208,44 @@ def animate_poses(gt_path, recon_path, output_path):
         s_teal = ax.scatter([], [], s=15, c=COLOR_SIDE, zorder=5)
         s_black = ax.scatter([], [], s=20, c=COLOR_TRUNK, zorder=5)
         s_eyes = ax.scatter([], [], s=40, c=COLOR_TRUNK, zorder=6)
-        
-        # Thêm scatter cho môi nếu có
-        s_mouth = None
-        if has_mouth:
-            s_mouth = ax.scatter([], [], s=10, c=COLOR_MOUTH, zorder=6)
+        s_mouth = ax.scatter([], [], s=10, c=COLOR_MOUTH, zorder=6) # Always init
         
         return lines, [s_teal, s_black, s_eyes, s_mouth]
 
     lines1, scatters1 = setup_ax(ax1, "GROUND TRUTH")
     lines2, scatters2 = setup_ax(ax2, "RECONSTRUCTED")
     
-    # Auto Zoom Logic
-    torso_pts = gt_kps[:, [11, 12, 23, 24], :]
-    # Chỉ lấy các điểm không phải NaN
-    valid_mask = ~np.isnan(torso_pts).any(axis=2)
-    valid_torso = torso_pts[valid_mask]
-    
-    if len(valid_torso) > 0:
-        min_xy = np.nanmin(valid_torso, axis=0)
-        max_xy = np.nanmax(valid_torso, axis=0)
+    # Auto Zoom Logic - use first non-nan frame
+    # Try to find a frame with valid torso
+    valid_frame_idx = 0
+    for i in range(len(gt_kps)):
+        if not np.isnan(gt_kps[i, 11, :]).any():
+            valid_frame_idx = i
+            break
+            
+    torso_pts = gt_kps[valid_frame_idx, [11, 12, 23, 24], :]
+    if not np.isnan(torso_pts).any():
+        min_xy = np.nanmin(torso_pts, axis=0)
+        max_xy = np.nanmax(torso_pts, axis=0)
         ctr = (min_xy + max_xy) / 2
         h = max_xy[1] - min_xy[1]
-        r = h * 1.5 if h > 0.1 else 0.5
+        raw_r = h * 2.5 if h > 0.05 else 0.8 # Zoom out a bit more
+        r = max(raw_r, 0.4)
+        
         for ax in [ax1, ax2]:
             ax.set_xlim(ctr[0] - r, ctr[0] + r)
             ax.set_ylim(ctr[1] + r, ctr[1] - r)
     else:
         for ax in [ax1, ax2]:
-            ax.set_xlim(-1, 1); ax.set_ylim(1, -1)
+            ax.set_xlim(-0.8, 0.8); ax.set_ylim(0.8, -0.8)
 
     def update(frame):
         def update_plot(kps, lines, scatters):
             # Lines
             line_idx = 0
             for item in ALL_CONNECTIONS:
-                if item['offset'] == 75 and not has_mouth:
+                # Same skip logic
+                if item['offset'] == 75 and kps.shape[1] < 90:
                     continue
                 
                 s, e = item['indices']
@@ -236,42 +253,50 @@ def animate_poses(gt_path, recon_path, output_path):
                 if isinstance(off, tuple): s, e = s+off[0], e+off[1]
                 else: s, e = s+off, e+off
                 
-                if s >= kps.shape[0] or e >= kps.shape[0]: 
-                    line_idx += 1
-                    continue
-                
-                p1, p2 = kps[s], kps[e]
-                # Chỉ vẽ nếu cả 2 điểm không phải là NaN
-                if not np.isnan(p1).any() and not np.isnan(p2).any():
-                    lines[line_idx].set_data([p1[0], p2[0]], [p1[1], p2[1]])
-                else:
-                    lines[line_idx].set_data([], [])
+                # Check bounds
+                if s < kps.shape[1] and e < kps.shape[1]:
+                    p1, p2 = kps[frame, s], kps[frame, e]
+                    if not (np.isnan(p1).any() or np.isnan(p2).any()):
+                        lines[line_idx].set_data([p1[0], p2[0]], [p1[1], p2[1]])
+                    else:
+                        lines[line_idx].set_data([], [])
                 line_idx += 1
             
-            # Scatters helper
-            def set_valid_offsets(scatter_obj, indices):
-                if scatter_obj is None: return
-                pts = kps[indices]
-                # Lọc bỏ NaN
-                valid = ~np.isnan(pts).any(axis=1)
-                scatter_obj.set_offsets(pts[valid])
-
-            set_valid_offsets(scatters[0], IDX_TEAL)
-            set_valid_offsets(scatters[1], IDX_BLACK)
-            set_valid_offsets(scatters[2], IDX_EYES)
+            # Scatter
+            # Filter NaNs
+            frame_kps = kps[frame]
+            valid = ~np.isnan(frame_kps).any(axis=1)
             
-            if has_mouth and scatters[3] is not None:
-                # Môi là từ 75 đến 94
-                idx_mouth = list(range(75, 95))
-                set_valid_offsets(scatters[3], idx_mouth)
+            # Split by groups (heuristic)
+            # Teal: indices > 24 (Hands/Arms)
+            # Black: indices <= 24 (Head/Torso/Legs)
             
-            return lines + [s for s in scatters if s is not None]
+            # Teal (Hands)
+            mask_teal = valid & (np.arange(len(frame_kps)) > 24) & (np.arange(len(frame_kps)) < 67) # Upper limit for hands?
+            if kps.shape[1] > 90: # If face exists, exclude face from teal
+                 mask_teal = mask_teal & (np.arange(len(frame_kps)) < 70)
+                 
+            scatters[0].set_offsets(frame_kps[mask_teal])
+            
+            # Black (Body)
+            mask_black = valid & (np.arange(len(frame_kps)) <= 24)
+            scatters[1].set_offsets(frame_kps[mask_black])
+            
+            # Eyes (15, 16)
+            mask_eyes = valid & np.isin(np.arange(len(frame_kps)), [15, 16])
+            scatters[2].set_offsets(frame_kps[mask_eyes])
+            
+            # Mouth (indices > 70 generally)
+            if kps.shape[1] > 90:
+                mask_mouth = valid & (np.arange(len(frame_kps)) >= 70)
+                scatters[3].set_offsets(frame_kps[mask_mouth])
+            else:
+                 scatters[3].set_offsets(np.zeros((0, 2)))
 
-        artists = []
-        artists += update_plot(gt_kps[frame], lines1, scatters1)
-        artists += update_plot(recon_kps[frame], lines2, scatters2)
+        update_plot(gt_kps, lines1, scatters1)
+        update_plot(recon_kps, lines2, scatters2)
         fig.suptitle(f'Frame {frame} / {T}', fontsize=12)
-        return artists
+        return lines1 + scatters1 + lines2 + scatters2
 
     print(f"🎬 Generating Animation ({T} frames)...")
     ani = animation.FuncAnimation(fig, update, frames=T, blit=True, interval=40)
@@ -280,6 +305,8 @@ def animate_poses(gt_path, recon_path, output_path):
         print(f"✅ Video saved: {output_path}")
     except Exception as e:
         print(f"⚠️ Error: {e}")
+
+
 
 def main():
     parser = argparse.ArgumentParser()
