@@ -23,7 +23,10 @@ HAND_CONNECTIONS = [
 ]
 
 # Face connections (simple)
-FACE_PAIRS = [(0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8), (9, 10)]
+FACE_PAIRS = [(0, 1), (1, 2), (2, 3), (3, 7), (0, 4), (4, 5), (5, 6), (6, 8)]
+
+# Mouth connection (RED)
+MOUTH_PAIR = (9, 10)  # Mouth left-right
 
 # Build connection list
 ALL_CONNECTIONS = []
@@ -157,7 +160,8 @@ def animate_poses(gt_path, recon_path, output_path):
     gt_kps = gt_kps[:T]
     recon_kps = recon_kps[:T]
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6), dpi=120)
+    # Single square frame for each pose
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 12), dpi=120)
     
     def setup_ax(ax, title):
         ax.set_title(title, fontsize=14, fontweight='bold', pad=10)
