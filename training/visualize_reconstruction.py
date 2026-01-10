@@ -65,38 +65,27 @@ class DataProcessor:
         T = kps_seq.shape[0]
         kps_clean = kps_seq.copy()
         
-        # 1. Interpolation & NaN Handling
+        # 1. Interpolation & NaN Handling (RESTORED FOR SMOOTHNESS)
         for i in range(kps_clean.shape[1]):
             for c in range(2):
                 signal = kps_clean[:, i, c]
                 # Coi các điểm xấp xỉ 0 là bị mất (NaN) để Matplotlib không vẽ
-                signal[np.abs(signal) < 0.001] = np.nan
+                # Tăng ngưỡng lên 0.1 để lọc noise tốt hơn (khớp với visualize_pose.py)
+                signal[np.abs(signal) < 0.1] = np.nan
                 
-                # Nội suy để lấp khoảng trống
+                # Nội suy để lấp khoảng trống (Linear)
                 series = pd.Series(signal)
                 series = series.interpolate(method='linear', limit_direction='both')
                 
-                # KHÔNG fillna(0) nữa. Nếu vẫn còn NaN (đầu/cuối video), để nguyên là NaN.
-                # Matplotlib sẽ tự động bỏ qua không vẽ điểm NaN -> Môi sẽ không bị bay về (0,0)
                 kps_clean[:, i, c] = series.to_numpy()
 
-        # 2. "Hàn" khớp cổ tay (Wrist Gluing) - DISABLED FOR DEBUG
-        # Gán tọa độ gốc bàn tay (Hand Root) bằng đúng tọa độ cổ tay (Wrist)
-        # Left: Wrist=15, HandRoot=33
+        # 2. "Hàn" khớp cổ tay (Wrist Gluing) - DISABLED (User feedback: weird joints)
         # kps_clean[:, 33, :] = kps_clean[:, 15, :] 
-        # Right: Wrist=16, HandRoot=54
         # kps_clean[:, 54, :] = kps_clean[:, 16, :]
 
-        # 3. Stabilization (Center Neck at 0,0) - DISABLED FOR DEBUG
+        # 3. Stabilization (Center Neck at 0,0) - DISABLED (Match visualize_pose.py)
         # shoulder_L = kps_clean[:, 11, :]
-        # shoulder_R = kps_clean[:, 12, :]
-        # neck_center = (shoulder_L + shoulder_R) / 2 # [T, 2]
         
-        # Trừ tâm (nếu điểm là NaN, kết quả vẫn là NaN -> Tốt)
-        # stabilized_kps = kps_clean - neck_center[:, np.newaxis, :]
-        
-        # 4. Smoothing (Savgol)
-        # final_kps = stabilized_kps.copy()
         final_kps = kps_clean.copy() # Skip stabilization
         window = 15
         poly = 3
@@ -204,21 +193,24 @@ def animate_poses(gt_path, recon_path, output_path):
     MOUTH_CONNECTIONS_20 = MOUTH_OUTER_LIP + MOUTH_INNER_LIP
 
     ALL_CONN = []
-    ALL_CONN.extend([{'indices': (s, e), 'offset': 0, 'color': 'gray', 'lw': 2} for (s, e) in POSE_CONNECTIONS_UPPER_BODY])
-    ALL_CONN.extend([{'indices': (s, e), 'offset': 33, 'color': 'blue', 'lw': 1.5} for (s, e) in HAND_CONNECTIONS])
-    ALL_CONN.append({'indices': (15, 0), 'offset': (0, 33), 'color': 'blue', 'lw': 2}) # Wrist L -> HandRoot L
-    ALL_CONN.extend([{'indices': (s, e), 'offset': 54, 'color': 'green', 'lw': 1.5} for (s, e) in HAND_CONNECTIONS])
-    ALL_CONN.append({'indices': (16, 0), 'offset': (0, 54), 'color': 'green', 'lw': 2}) # Wrist R -> HandRoot R
-    ALL_CONN.extend([{'indices': (s, e), 'offset': 75, 'color': 'red', 'lw': 1} for (s, e) in MOUTH_CONNECTIONS_20])
+    # Make Body lines BLACK and THICKER (was gray/2)
+    ALL_CONN.extend([{'indices': (s, e), 'offset': 0, 'color': 'black', 'lw': 3} for (s, e) in POSE_CONNECTIONS_UPPER_BODY])
+    # Keep Hands Blue/Green but slightly thicker
+    ALL_CONN.extend([{'indices': (s, e), 'offset': 33, 'color': 'teal', 'lw': 2} for (s, e) in HAND_CONNECTIONS])
+    ALL_CONN.append({'indices': (15, 0), 'offset': (0, 33), 'color': 'teal', 'lw': 2.5}) 
+    ALL_CONN.extend([{'indices': (s, e), 'offset': 54, 'color': 'darkgreen', 'lw': 2} for (s, e) in HAND_CONNECTIONS])
+    ALL_CONN.append({'indices': (16, 0), 'offset': (0, 54), 'color': 'darkgreen', 'lw': 2.5}) 
+    # Mouth
+    ALL_CONN.extend([{'indices': (s, e), 'offset': 75, 'color': 'black', 'lw': 1.5} for (s, e) in MOUTH_CONNECTIONS_20])
 
     def setup_ax(ax, title):
-        ax.set_title(title, fontsize=14, fontweight='bold', pad=10)
+        ax.set_title(title, fontsize=16, fontweight='bold', pad=12)
         ax.invert_yaxis()
         ax.set_aspect('equal')
         ax.set_xticks([])
         ax.set_yticks([])
         for spine in ax.spines.values():
-            spine.set_visible(True)
+            spine.set_linewidth(2)
             spine.set_color('black')
         
         lines = []
@@ -230,29 +222,33 @@ def animate_poses(gt_path, recon_path, output_path):
             ax.add_line(line)
             lines.append(line)
             
-        s_teal = ax.scatter([], [], s=15, c=COLOR_SIDE, zorder=5) # Hands
-        s_black = ax.scatter([], [], s=20, c=COLOR_TRUNK, zorder=5) # Body
-        s_mouth = ax.scatter([], [], s=10, c=COLOR_MOUTH, zorder=6)
+        # Increase Scatter Sizes
+        s_teal = ax.scatter([], [], s=25, c=COLOR_SIDE, zorder=5) # Hands
+        s_black = ax.scatter([], [], s=35, c='black', zorder=5) # Body (Force black color)
+        s_mouth = ax.scatter([], [], s=15, c=COLOR_MOUTH, zorder=6)
         
         return lines, [s_teal, s_black, s_mouth]
 
     lines1, scatters1 = setup_ax(ax1, "GROUND TRUTH")
     lines2, scatters2 = setup_ax(ax2, "RECONSTRUCTED")
     
-    # Zoom logic (Shared)
+    # Zoom logic (TIGHTER)
     torso_pts = gt_kps[0, [11, 12, 23, 24], :] # Use first frame
     if not np.isnan(torso_pts).any():
         min_xy = np.nanmin(torso_pts, axis=0)
         max_xy = np.nanmax(torso_pts, axis=0)
         ctr = (min_xy + max_xy) / 2
         h = max_xy[1] - min_xy[1]
-        raw_r = h * 3.5 if h > 0.05 else 0.8 # Wide zoom
-        r = max(raw_r, 0.45)
+        
+        # TIGHTER ZOOM: 2.0x height instead of 3.5x
+        raw_r = h * 2.0 if h > 0.05 else 0.6 
+        r = max(raw_r, 0.35) 
+        
         for ax in [ax1, ax2]:
             ax.set_xlim(ctr[0] - r, ctr[0] + r)
             ax.set_ylim(ctr[1] + r, ctr[1] - r)
     else:
-        for ax in [ax1, ax2]: ax.set_xlim(-0.8, 0.8); ax.set_ylim(0.8, -0.8)
+        for ax in [ax1, ax2]: ax.set_xlim(-0.6, 0.6); ax.set_ylim(0.6, -0.6)
 
     def update(frame):
         def update_plot(kps, lines, scatters):
