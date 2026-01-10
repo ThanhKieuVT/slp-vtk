@@ -80,23 +80,24 @@ class DataProcessor:
                 # Matplotlib sẽ tự động bỏ qua không vẽ điểm NaN -> Môi sẽ không bị bay về (0,0)
                 kps_clean[:, i, c] = series.to_numpy()
 
-        # 2. "Hàn" khớp cổ tay (Wrist Gluing)
+        # 2. "Hàn" khớp cổ tay (Wrist Gluing) - DISABLED FOR DEBUG
         # Gán tọa độ gốc bàn tay (Hand Root) bằng đúng tọa độ cổ tay (Wrist)
         # Left: Wrist=15, HandRoot=33
-        kps_clean[:, 33, :] = kps_clean[:, 15, :] 
+        # kps_clean[:, 33, :] = kps_clean[:, 15, :] 
         # Right: Wrist=16, HandRoot=54
-        kps_clean[:, 54, :] = kps_clean[:, 16, :]
+        # kps_clean[:, 54, :] = kps_clean[:, 16, :]
 
-        # 3. Stabilization (Center Neck at 0,0)
-        shoulder_L = kps_clean[:, 11, :]
-        shoulder_R = kps_clean[:, 12, :]
-        neck_center = (shoulder_L + shoulder_R) / 2 # [T, 2]
+        # 3. Stabilization (Center Neck at 0,0) - DISABLED FOR DEBUG
+        # shoulder_L = kps_clean[:, 11, :]
+        # shoulder_R = kps_clean[:, 12, :]
+        # neck_center = (shoulder_L + shoulder_R) / 2 # [T, 2]
         
         # Trừ tâm (nếu điểm là NaN, kết quả vẫn là NaN -> Tốt)
-        stabilized_kps = kps_clean - neck_center[:, np.newaxis, :]
+        # stabilized_kps = kps_clean - neck_center[:, np.newaxis, :]
         
         # 4. Smoothing (Savgol)
-        final_kps = stabilized_kps.copy()
+        # final_kps = stabilized_kps.copy()
+        final_kps = kps_clean.copy() # Skip stabilization
         window = 15
         poly = 3
         
@@ -138,18 +139,21 @@ def animate_poses(gt_path, recon_path, output_path):
         if kps.ndim == 2:
             T, D = kps.shape
             
-            # Case A: 214 dim (Standard OpenPose 137-point flattened? No, 214 usually means specific subset)
-            # Assuming standard OpenPose Body25 (25) + 2xHand(21) + Face(70) = 137 points -> 274 dim?
-            # BUT user has 214 dim. 
-            # Let's inspect the usual subsets.
-            # 214 / 2 = 107 points.
-            # Likely: Body (subset) + Hands + Face (subset)
-            
-            # CRITICAL: Do NOT crop if 214. Keep as is for now, reshape to [T, 107, 2]
+            # Case A: 214 dim -> Specific format from 'visualize_pose.py'
+            # 0-150: Body + Hands (75 points)
+            # 150-174: Discarded
+            # 174-214: Mouth (20 points)
             if D == 214:
-                kps = kps.reshape(T, 107, 2)
+                manual_150 = kps[:, :150]
+                manual_kps = manual_150.reshape(T, 75, 2)
                 
-            # Case B: 150 dim (Body + Hands) -> 75 points
+                mouth_40 = kps[:, 174:]
+                mouth_kps = mouth_40.reshape(T, 20, 2)
+                
+                # Combine to 95 points
+                kps = np.concatenate([manual_kps, mouth_kps], axis=1)
+                
+            # Case B: 150 dim (Body + Hands only) -> 75 points
             elif D == 150:
                  kps = kps.reshape(T, 75, 2)
                  
@@ -162,11 +166,9 @@ def animate_poses(gt_path, recon_path, output_path):
     gt_kps = to_standard_format(gt_data)
     recon_kps = to_standard_format(recon_data)
     
-    # 3. Define Topology based on detected shape
-    # If 107 points (from 214 dim) -> Likely Body + Hands + Face
-    # Body: 0-10? Hands: ? Mouth: ?
-    # Let's use a generic visualizer that connects close points if topology is unknown
-    pass # Topology handling is done in draw_pose
+    # Debug info
+    print(f"Loaded GT shape: {gt_kps.shape}")
+    print(f"Loaded Recon shape: {recon_kps.shape}")
 
     
     # Kiểm tra xem dữ liệu có đủ 95 điểm (có môi) hay không
@@ -267,31 +269,36 @@ def animate_poses(gt_path, recon_path, output_path):
             frame_kps = kps[frame]
             valid = ~np.isnan(frame_kps).any(axis=1)
             
-            # Split by groups (heuristic)
-            # Teal: indices > 24 (Hands/Arms)
-            # Black: indices <= 24 (Head/Torso/Legs)
+            # Split by groups (heuristic based on visualize_pose.py)
+            # Body: 0-23 -> Black
+            # Hands: 33-54 (Left), 54-75 (Right) -> Teal
+            # Mouth: 75-95 -> Red
+            
+            indices = np.arange(len(frame_kps))
             
             # Teal (Hands)
-            mask_teal = valid & (np.arange(len(frame_kps)) > 24) & (np.arange(len(frame_kps)) < 67) # Upper limit for hands?
-            if kps.shape[1] > 90: # If face exists, exclude face from teal
-                 mask_teal = mask_teal & (np.arange(len(frame_kps)) < 70)
-                 
+            # Include both hands: 33 to 75
+            mask_teal = valid & (indices >= 33) & (indices < 75)
             scatters[0].set_offsets(frame_kps[mask_teal])
             
-            # Black (Body)
-            mask_black = valid & (np.arange(len(frame_kps)) <= 24)
+            # Black (Body + potential gap)
+            mask_black = valid & (indices < 33)
             scatters[1].set_offsets(frame_kps[mask_black])
             
-            # Eyes (15, 16)
-            mask_eyes = valid & np.isin(np.arange(len(frame_kps)), [15, 16])
-            scatters[2].set_offsets(frame_kps[mask_eyes])
+            # Eyes (indices 15, 16)
+            mask_eyes = np.zeros(len(frame_kps), dtype=bool)
+            if len(frame_kps) > 16:
+                mask_eyes[15] = True
+                mask_eyes[16] = True
+            scatters[2].set_offsets(frame_kps[mask_eyes & valid])
             
-            # Mouth (indices > 70 generally)
-            if kps.shape[1] > 90:
-                mask_mouth = valid & (np.arange(len(frame_kps)) >= 70)
-                scatters[3].set_offsets(frame_kps[mask_mouth])
+            # Mouth (indices >= 75)
+            mask_mouth = valid & (indices >= 75)
+            if has_mouth and scatters[3] is not None:
+                 scatters[3].set_offsets(frame_kps[mask_mouth])
             else:
-                 scatters[3].set_offsets(np.zeros((0, 2)))
+                 if scatters[3] is not None:
+                     scatters[3].set_offsets(np.zeros((0, 2)))
 
         update_plot(gt_kps, lines1, scatters1)
         update_plot(recon_kps, lines2, scatters2)
