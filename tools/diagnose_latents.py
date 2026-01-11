@@ -30,7 +30,12 @@ def main():
     
     # Load dataset
     print("📂 Loading dataset...")
-    dataset = SignLanguageDataset(args.data_dir, split='train', max_seq_len=400)
+    dataset = SignLanguageDataset(
+        args.data_dir, 
+        split='train', 
+        max_seq_len=400,
+        normalize=False  # ✅ Skip normalization for diagnostic
+    )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
     print(f"   Loaded {len(dataset)} samples\n")
     
