@@ -264,7 +264,7 @@ def main():
     # Load datasets
     print("\n📂 Loading datasets...")
     train_ds = SignLanguageDataset(args.data_dir, split="train", max_seq_len=args.max_seq_len)
-    val_ds = SignLanguageDataset(args.data_dir, split="val", max_seq_len=args.max_seq_len)
+    val_ds = SignLanguageDataset(args.data_dir, split="dev", max_seq_len=args.max_seq_len)  # ✅ Changed to 'dev'
     
     train_loader = DataLoader(
         train_ds, 
