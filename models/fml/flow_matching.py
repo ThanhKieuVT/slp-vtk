@@ -26,24 +26,44 @@ class FlowMatchingScheduler:
         return z_t, v_gt, x0
 
 class FlowMatchingLoss(nn.Module):
-    """Normalized Flow Matching Loss"""
-    def __init__(self):
+    """Normalized Flow Matching Loss with NaN protection"""
+    def __init__(self, eps=1e-8):
         super().__init__()
+        self.eps = eps
     
     def forward(self, v_pred, v_gt, mask=None):
+        # ✅ Input validation
+        if torch.isnan(v_pred).any() or torch.isinf(v_pred).any():
+            print(f"⚠️ NaN/Inf in v_pred input to FlowMatchingLoss!")
+            v_pred = torch.nan_to_num(v_pred, nan=0.0, posinf=10.0, neginf=-10.0)
+        
+        if torch.isnan(v_gt).any() or torch.isinf(v_gt).any():
+            print(f"⚠️ NaN/Inf in v_gt input to FlowMatchingLoss!")
+            v_gt = torch.nan_to_num(v_gt, nan=0.0, posinf=10.0, neginf=-10.0)
+        
+        # Compute squared error
         loss = (v_pred - v_gt) ** 2
         
         if mask is not None:
             # Mask: True=Valid, False=Padding
-            loss = loss * mask.unsqueeze(-1).float()
-            # ✅ FIX: Ensure proper scalar division
-            num_valid_positions = mask.sum().float()  # Convert to float
+            mask_float = mask.unsqueeze(-1).float()
+            loss = loss * mask_float
+            
+            # ✅ CRITICAL FIX: Prevent division by zero with larger epsilon
+            num_valid_positions = mask.sum().float().clamp(min=1.0)  # At least 1
             num_features = float(v_pred.shape[-1])
-            num_elements = num_valid_positions * num_features
-            # Clamp with epsilon to prevent division by near-zero
-            return loss.sum() / num_elements.clamp(min=1e-6)
+            num_elements = (num_valid_positions * num_features).clamp(min=self.eps)
+            
+            result = loss.sum() / num_elements
         else:
-            return loss.mean()
+            result = loss.mean()
+        
+        # ✅ Final NaN check
+        if torch.isnan(result) or torch.isinf(result):
+            print(f"⚠️ NaN/Inf in final loss! Returning 0.0")
+            return torch.tensor(0.0, device=v_pred.device, requires_grad=True)
+        
+        return result
 
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
@@ -152,4 +172,11 @@ class FlowMatchingBlock(nn.Module):
                 key_padding_mask=torch_text_mask 
             )
             
-        return self.output_proj(x)
+            # ✅ Clamp intermediate activations to prevent explosion
+            x = torch.clamp(x, -100.0, 100.0)
+        
+        # Output projection with clamping
+        output = self.output_proj(x)
+        output = torch.clamp(output, -10.0, 10.0)  # Prevent extreme velocity values
+        
+        return output
