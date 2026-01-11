@@ -36,8 +36,12 @@ class FlowMatchingLoss(nn.Module):
         if mask is not None:
             # Mask: True=Valid, False=Padding
             loss = loss * mask.unsqueeze(-1).float()
-            num_elements = mask.sum() * v_pred.shape[-1]
-            return loss.sum() / num_elements.clamp(min=1)
+            # ✅ FIX: Ensure proper scalar division
+            num_valid_positions = mask.sum().float()  # Convert to float
+            num_features = float(v_pred.shape[-1])
+            num_elements = num_valid_positions * num_features
+            # Clamp with epsilon to prevent division by near-zero
+            return loss.sum() / num_elements.clamp(min=1e-6)
         else:
             return loss.mean()
 
